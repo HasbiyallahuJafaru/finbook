@@ -17,13 +17,14 @@ _Last updated: 2026-11-15_
 - First commit `ea9373f` on main; remote `origin` = github.com/HasbiyallahuJafaru/finbook. Push pending (user runs `git push -u origin main`; no network in Claude session). `pnpm-workspace.yaml` and root `package.json` in place.
 - `packages/money` written and green: parseRate, convert (half-up), allocateEqual (remainder on first car), add/sub; 10k-conversion property test; 100% branch coverage. Uses node:test + Node 24 TypeScript stripping, zero dependencies (`pnpm --filter @app/money test`). Not yet wired to the toolchain below.
 - Turborepo + TypeScript + shared tsconfig; strict type-aware ESLint (`eslint.config.mjs`) bans parseFloat, Number(), Math.round/floor/ceil/trunc, toFixed and non-null assertions (tests exempt from the Number/promise rules). `pnpm lint`, `pnpm typecheck`, `pnpm test` all green for @app/money.
+- CI: `.github/workflows/ci.yml` (frozen install, lint, typecheck, test, build on push to main and PRs; pnpm/setup pinned by SHA, checkout v7). Not yet run on GitHub: it needs the push.
 - ADRs 0003 (scaled-bigint rates), 0004 (Drizzle), 0005 (TypeScript pinned to ~6.0.3 because typescript-eslint doesn't support 7 yet) written.
 
 ## Next
 
 1. Create apps/api (NestJS), apps/worker, apps/web (Next.js on Cloudflare) skeletons, checking latest versions first. Money keeps node:test (decided).
 2. `packages/money` still lacks: weighted-average pool maths (phase 2), currency exponent handling beyond 2-decimal currencies.
-3. CI: lint, typecheck, test, build.
+3. Confirm CI is green on GitHub after the first push; add the Testcontainers integration step when `packages/db` lands.
 4. Deploy targets (need accounts/env vars from the user): Clerk, Sentry, Cloudflare (vinext compatibility check, OpenNext fallback), Railway (api, worker, Postgres, Redis).
 
 ## Open decisions / blockers
