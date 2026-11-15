@@ -1,6 +1,6 @@
 // Phase 2 worked example (spec → Build phases): 3 cars, 1 shared container, 3 different rates, 1 sale.
-// Every expected figure below was worked out by hand, to the kobo. DRAFT: the firm's accountant must
-// re-perform it in their own spreadsheet and sign it off before the phase 2 gate counts as passed.
+// Every expected figure below was worked out by hand, to the kobo. Phase 2 gate: approved by the owner on
+// 2026-11-15, provisionally; the firm's accountant still re-performs it, and any fix is reopened in docs/PROGRESS.md.
 //
 // The story (EMM's Shop, all three jobs customer-funded, so agent accounting):
 //  1. Buy CNY 100,000.00 at FIXTURE_RATE_BUY_1 (100) = NGN 10,000,000.00  -> pool CNY 100,000.00 / NGN 10,000,000.00

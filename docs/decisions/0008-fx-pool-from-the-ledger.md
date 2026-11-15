@@ -1,6 +1,6 @@
 # 0008 — The foreign-currency pool is derived from the ledger
 
-- Status: proposed (needs the owner's confirmation: it departs from the spec's `fx_pools` table)
+- Status: accepted (owner, 2026-11-15; provisional, to be reviewed with the accountant). Clients see the spot basis, not the pool: ADR 0009.
 - Date: 2026-11-15
 
 ## Decision

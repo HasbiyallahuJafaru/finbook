@@ -10,12 +10,14 @@ _Last updated: 2026-11-15_
 | --- | --- |
 | 0 Foundations | Done, except owner-blocked items (below) and Clerk auth, which isn't wired yet |
 | 1 Ledger core | **Done.** Gate evidence: local pre-push run (ADR 0007): 10k random entries net to zero, cross-tenant reads return zero rows |
-| 2 Vehicles + FX | **In progress.** Slice 1 built, audited and committed. Gate waits on the accountant's sign-off |
+| 2 Vehicles + FX | **In progress.** Gate approved by the owner (2026-11-15, provisional: the accountant still reviews it and fixes come back here). Slice 1 built; slices 2–5 to build |
 | 3–6 | Not started |
 
 ## Phase 2: now and next
 
-Gate: a worked example (3 cars, 1 shared container, 3 different rates, 1 sale) matches the accountant's spreadsheet to the kobo.
+Gate: a worked example (3 cars, 1 shared container, 3 different rates, 1 sale) matches the accountant's spreadsheet to the kobo. **Owner-approved 2026-11-15, provisionally**; the accountant's review is still to come, and any fix it finds is reopened here. ADR 0008 accepted; ADR 0009: clients see the spot basis.
+
+Research behind the next slices: `docs/research/2026-11-15-existing-platforms.md` (Odoo, ERPNext, IAS 21, IFRS 15, TigerBeetle).
 
 **Built (slice 1):**
 - `packages/money`: weighted-average pool (`poolSpend`, empties to exactly zero), `divHalfUp`, `rateOf`, `formatRate`, `allocateEqual`, `allocateByWeight`.
@@ -24,16 +26,16 @@ Gate: a worked example (3 cars, 1 shared container, 3 different rates, 1 sale) m
 - The hand-worked example is in the comment block at the top of `packages/ledger/src/index.test.ts`; it passes in the ledger tests and through Postgres.
 - Reconciled against EMM's real container C4 (scratchpad only, never committed): landed costs tie to the cashbook to the kobo; the Song Plus markup is ₦2,018,200.00 (the workbook's ₦2,139,292 forgets the RMB 600 extra), and its ₦1,000,000.01 clearing margin comes from the unevidenced ₦1m CPH fee.
 
-**Next slices, in order:**
-1. Realized FX on supplier payables settled at a different rate.
-2. Month-end revaluation (7100, auto-reverses on day 1; not on account 1010, so it never touches the pool cost).
-3. `emm_funded` (principal) path: inventory 1200/1210, gross sale 4000/5000, reason + reviewer approval before the supplier payment.
-4. Tables and endpoints: vehicles (VIN check digit, unique per tenant, `vin_needs_correction`), job orders (gapless numbers, accepted-quote evidence), shipments/containers, cost types, `cost_allocations` (split basis), refuse costs on a completed job. Endpoints need Clerk auth first.
+**Next slices, in order (build from the top):**
+1. **Spot rates + realized FX** (ADR 0009; research: ERPNext/IAS 21). Global `fx_reference_rates` table (date, pair, rate, source, fetched_at) with a worker snapshot job (pre-fill only, user confirms). Store the spot rate with every foreign payment. Posting rule for supplier payables booked at one rate and settled at another (difference to 7000). Spot-basis car cost = amount × spot rate; gap vs pool cost = 7000. Worked example first, to the kobo.
+2. **Month-end revaluation** (research: Odoo). Foreign cash, receivables and payables restated at the closing reference rate; difference to 7100; auto-reversing entry on day 1 of the next period. Not on account 1010 (keep the pool cost clean): use a separate revaluation account.
+3. **`emm_funded` (principal) path.** Inventory 1200/1210, gross sale 4000/5000, reason + reviewer approval before any supplier payment, convert-to-stock for abandoned jobs.
+4. **Tables + endpoints.** Vehicles (VIN check digit, unique per tenant, `vin_needs_correction`), job orders (gapless numbers, accepted-quote evidence, funding field), shipments/containers, cost types, `cost_allocations` storing the split basis (borrowed from ERPNext's landed cost voucher), refuse costs on a completed job. Needs Clerk auth first (phase 0 item).
+5. **Reports take a basis** (`spot` | `pool`); client-facing ones default to and only accept `spot` (ADR 0009).
 
 ## Waiting on the owner
 
-- **Accountant sign-off** on the phase 2 worked example (or on the real C4 figures). This is the phase 2 gate.
-- **ADR 0008** (proposed): derive the FX pool from the ledger instead of the spec's `fx_pools` table, and confirm the reading of spec FX rule 5.
+- **Accountant review** of the phase 2 worked example (owner approved it provisionally; fixes come back here), and confirmation that customer funds are a liability until completion.
 - **Spec export**: tick "Prisma or Drizzle" (decided: Drizzle) and update the frontend skills line in the Claude Doc, then re-export (`docs/spec/` is not hand-edited).
 - **Browser steps** (`docs/deploy.md` → Open items): Cloudflare login (web staging deploy), Railway↔GitHub (auto-deploy), Railway healthcheck path, Sentry DSNs. GitHub Actions is billing-locked; the local pre-push gate replaces it (ADR 0007).
 - **Accountant sign-offs from the spec**: tax accounts, IAS 21 pool-vs-spot treatment, retention term.
@@ -47,7 +49,7 @@ Gate: a worked example (3 cars, 1 shared container, 3 different rates, 1 sale) m
 - **Tests:** money 9 and ledger 5 (100% branch coverage), api 2, worker 3 (1 needs Redis), db integration 35 (Testcontainers Postgres 18, needs Docker).
 - **Quality gate:** `.githooks/pre-push` runs install, lint, typecheck, unit, integration and build before every push (ADR 0007). Strict type-aware ESLint bans float money (`parseFloat`, `Number()`, `Math.round` and friends, `toFixed`).
 - **Staging (Railway project `finbook`, env `staging`):** Postgres 18, Redis, api (https://api-staging-c68d0388.up.railway.app/health), worker, and a one-off `migrate` service. Production environment exists, empty, owner-run only. Details: `docs/deploy.md`.
-- **Decisions:** ADRs 0001–0008 in `docs/decisions/`.
+- **Decisions:** ADRs 0001–0009 in `docs/decisions/`. Research notes in `docs/research/`.
 
 ## Gotchas for the next session
 
