@@ -19,6 +19,7 @@ Staging services:
 | Redis | Railway template | n/a | n/a | private only |
 | api | `railway up` from local tree | `RAILPACK_BUILD_CMD=pnpm turbo run build --filter=@app/api` | `RAILPACK_START_CMD=pnpm --filter @app/api start` | https://api-staging-c68d0388.up.railway.app (`/health` → `{"status":"ok"}`) |
 | worker | `railway up` from local tree | `RAILPACK_BUILD_CMD=pnpm turbo run build --filter=@app/worker` | `RAILPACK_START_CMD=pnpm --filter @app/worker start` | none (no HTTP) |
+| migrate | `railway up` from local tree; runs once and stops | `RAILPACK_BUILD_CMD=true` | `RAILPACK_START_CMD=pnpm db:migrate` | none |
 
 Staging variables (values never printed or committed):
 
@@ -27,7 +28,9 @@ Staging variables (values never printed or committed):
 | `REDIS_URL` | yes | yes | `${{Redis.REDIS_URL}}` reference |
 | `SENTRY_ENVIRONMENT` | yes | yes | `staging` |
 | `SENTRY_DSN` | not yet | not yet | needs a Sentry project |
-| `DATABASE_URL` | phase 1 | phase 1 | `${{Postgres.DATABASE_URL}}` reference |
+| `DATABASE_URL` (api only) | yes | no | `postgresql://finbook_api:${{migrate.FINBOOK_API_DB_PASSWORD}}@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}` (non-superuser login, ADR 0006) |
+| `DATABASE_OWNER_URL` (migrate only) | no | no | `${{Postgres.DATABASE_URL}}`: the owner; never on api or worker |
+| `FINBOOK_API_DB_PASSWORD` (migrate only) | no | no | random, generated locally and piped in with `--stdin`; never printed |
 
 Build and start commands are set as Railpack variables because the installed Railway CLI (5.41.2) silently ignores `railway environment edit --service-config`. Node 24 comes from `engines` in the root `package.json`.
 
@@ -45,6 +48,7 @@ Build and start commands are set as Railpack variables because the installed Rai
 ```
 railway up -s api -e staging --detach
 railway up -s worker -e staging --detach
+railway up -s migrate -e staging --detach   # after any new migration; logs end with "migrations applied"
 railway service status -s api -e staging
 pnpm --filter @app/web exec vinext-cloudflare deploy      # after `pnpm --filter @app/web exec cf login`
 ```
