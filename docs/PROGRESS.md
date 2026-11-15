@@ -6,12 +6,12 @@ _Last updated: 2026-11-15_
 
 ## Start here (next session)
 
-1. **Re-run the ledger-auditor** on slice 2 (spot rates + realized FX: `packages/ledger`, `packages/db/migrations/0005_spot_rates.sql`, `apps/worker/src/rates.ts`). Two passes failed and were fixed; the third pass was still running when the session ended, so its result is unknown. Migration 0005 is committed, so any fix goes in a new migration (0006).
-2. **Staging is behind:** apply 0005 and switch on the rate snapshot:
+1. **Fix the pass-3 audit findings first:** `docs/audits/2026-11-15-phase2-slice2-pass3.md` (verdict FAIL: NGN lines bypass the pool/payable guards; an invoiced car can still be paid twice by three side doors). Migration 0005 is committed, so the fixes go in **0006**, each with a test that fails without it. Then run the ledger-auditor again.
+2. **Then staging** (it has 0000–0004; apply 0005 and 0006 together) and switch on the rate snapshot:
    - generate a password and pipe it in: `railway variable set -e staging -s migrate --skip-deploys --stdin FINBOOK_RATES_DB_PASSWORD`, then `railway up -s migrate -e staging --detach` (logs end with "migrations applied");
    - on the worker: `RATES_DATABASE_URL=postgresql://finbook_rates:${{migrate.FINBOOK_RATES_DB_PASSWORD}}@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}`, then `railway up -s worker -e staging --detach`;
    - the first snapshot runs at the next 10:30 Lagos; check `fx_reference_rates` has cbn and market rows.
-3. **Owner question still open:** build a clickable design prototype with sample data (no backend) to see the UI now, or carry on with the backend (month-end revaluation next)? The real web app is still a placeholder page.
+3. **Owner decisions open:** evidence mandatory vs "evidence pending" (see the audit doc). And: build a clickable design prototype with sample data (no backend) to see the UI now, or carry on with the backend (month-end revaluation next)? The real web app is still a placeholder page.
 
 ## Where we are
 
