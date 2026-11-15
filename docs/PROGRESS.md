@@ -6,7 +6,7 @@ _Last updated: 2026-11-15_
 
 ## Current phase
 
-**Phase 1 — Ledger core** (in progress). Gate: 10k random entries keep the trial balance at zero; a cross-tenant read returns zero rows. **Gate test passes locally** (`pnpm test:integration`, 31 tests, Testcontainers Postgres 18). Both reviews (ledger-auditor, security-reviewer) failed the first version; every finding is fixed in migrations 0002/0003 with a test each (ADR 0006 revised). Migrations 0000–0003 applied to staging Postgres via the one-off `migrate` service (2026-11-15). Remaining for the gate: CI green on GitHub (billing lock).
+**Phase 1 — Ledger core** (in progress). Gate: 10k random entries keep the trial balance at zero; a cross-tenant read returns zero rows. **Gate test passes locally** (`pnpm test:integration`, 31 tests, Testcontainers Postgres 18). Both reviews (ledger-auditor, security-reviewer) failed the first version; every finding is fixed in migrations 0002/0003 with a test each (ADR 0006 revised). Migrations 0000–0003 applied to staging Postgres via the one-off `migrate` service (2026-11-15). CI replaced by a local pre-push gate (ADR 0007, `.githooks/pre-push`); the gate's evidence is that hook's green run.
 
 **Phase 0** is done except owner-blocked items: web staging deploy (Cloudflare login), CI (GitHub billing lock), Railway↔GitHub, Sentry DSNs (see `docs/deploy.md` → Open items).
 

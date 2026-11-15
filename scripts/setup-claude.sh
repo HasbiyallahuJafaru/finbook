@@ -34,3 +34,6 @@ Done. Next:
      (docs in docs/ are sent to the Claude API for extraction; code stays local)
   3. Check graphify-out/GRAPH_REPORT.md exists, then start work.
 MSG
+
+# Local CI gate before every push (ADR 0007)
+git config core.hooksPath .githooks
