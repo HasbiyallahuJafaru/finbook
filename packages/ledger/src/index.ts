@@ -85,7 +85,7 @@ function poolOut(e: { pool: Pool; currency: string; amountMinor: bigint; spot: S
   const spot = spotOf(e.spot, e.rateNote);
   const { costNgn, pool } = poolSpend(e.pool, e.amountMinor);
   // ponytail: a pool left holding currency with no NGN cost (rounding at extreme rates) refuses payments. 1010 takes no NGN
-  // lines (migration 0006), so clearing it waits for the month-end revaluation account (next slice).
+  // lines (migration 0006) and revaluation only moves 1019, so clearing it needs its own entry type; add one if it ever happens.
   if (costNgn === 0n) throw new Error('pool payment rounds to zero kobo');
   return {
     pool,
@@ -240,4 +240,40 @@ export function completeClearingJob(e: Job & { landingChargeNgn: bigint; history
       ...ngn('4200', -(e.landingChargeNgn - p.costNgn), car),
     ],
   };
+}
+
+/** One monetary balance restated at month-end: the pool (1010) or the foreign supplier payables (2000), in one currency. */
+export type RevaluationItem = {
+  item: 'pool' | 'payables';
+  currency: string;
+  /** Foreign amount held (pool) or owed (payables) on the period's last day, read from the ledger. */
+  balanceMinor: bigint;
+  /** NGN it is carried at: cost on 1010 or booked on 2000, plus any revaluation still standing on 1019 or 2009. */
+  carryingNgn: bigint;
+  /** The CBN closing rate (latest revision, on or before the last day); the database checks it (migration 0007). */
+  closingRate: bigint;
+};
+
+/**
+ * Month-end revaluation (spec FX rule 6, ADR 0011): each item restated at the closing rate, the difference in 7100
+ * Unrealized FX. The adjustment sits on 1019 (pool) and 2009 (payables), never on 1010 or 2000, so pool and payable
+ * costs stay what was paid. `rows` is the evidence the database stores and re-performs; `reversal` posts on day 1 of the
+ * next period. A gain on the pool, or a fall in what is owed, is a credit to 7100.
+ */
+export function revalue(items: readonly RevaluationItem[]): { lines: Line[]; reversal: Line[]; rows: (RevaluationItem & { closingNgn: bigint })[] } {
+  const seen = new Set<string>();
+  const rows = items.map((i) => {
+    if (i.currency === 'NGN') throw new Error('NGN is not revalued');
+    if (i.balanceMinor < 0n) throw new Error(`the ${i.currency} ${i.item} balance cannot be negative`);
+    positive(i.closingRate, 'closing rate');
+    const key = `${i.currency} ${i.item}`;
+    if (seen.has(key)) throw new Error(`the ${key} is listed twice`);
+    seen.add(key);
+    return { ...i, closingNgn: convert(i.balanceMinor, i.closingRate) };
+  });
+  const lines = rows.flatMap((r) => {
+    const diff = r.closingNgn - r.carryingNgn;
+    return r.item === 'pool' ? [...ngn('1019', diff), ...ngn('7100', -diff)] : [...ngn('7100', diff), ...ngn('2009', -diff)];
+  });
+  return { lines, reversal: lines.map((l) => ({ ...l, debit: l.credit, credit: l.debit })), rows };
 }

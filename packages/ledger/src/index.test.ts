@@ -26,7 +26,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { convert, parseRate, type Pool } from '@app/money';
 import {
-  buyCurrency, completeAgentJob, completeClearingJob, customerReceipt, jobPosition, payFromPool, payPayableFromPool, sharedCost, spotCarCost, supplierInvoice, type Line,
+  buyCurrency, completeAgentJob, completeClearingJob, customerReceipt, jobPosition, payFromPool, payPayableFromPool, revalue, sharedCost, spotCarCost, supplierInvoice, type Line,
 } from './index.ts';
 
 const FIXTURE_RATE_BUY_1 = parseRate('100.000000');
@@ -259,4 +259,41 @@ test('spot basis: each foreign cost at the spot rate on its own transaction day'
   const manual = payFromPool({ pool: { balanceMinor: 100n, costNgn: 10_000n }, currency: 'CNY', amountMinor: 100n, vehicleId: 'M', spot: { rate: parseRate('99.000000'), source: 'manual' } /* fixture */, rateNote: 'BDC receipt, CBN rate not yet published' });
   const [, poolLine] = manual.lines;
   assert.deepEqual([poolLine?.spotSource, poolLine?.rateNote], ['manual', 'BDC receipt, CBN rate not yet published']);
+});
+
+// Month-end revaluation (spec FX rule 6, ADR 0011). At the end of the worked example the pool holds CNY 30,000.00 at
+// NGN 3,200,000.00, and supplier S is owed CNY 20,000.00 for car D, booked at 105 = NGN 2,100,000.00. The closing CBN
+// rate is FIXTURE_RATE_CLOSE (112):
+//   pool     30,000.00 x 112 = NGN 3,360,000.00, carrying 3,200,000.00 -> gain 160,000.00: Dr 1019 / Cr 7100
+//   payables 20,000.00 x 112 = NGN 2,240,000.00, carrying 2,100,000.00 -> loss 140,000.00: Dr 7100 / Cr 2009
+//   net unrealized FX (7100): gain NGN 20,000.00. The reversal on day 1 of the next period is the exact mirror.
+// The pool (1010) and payables (2000) keep their cost: the adjustment lives on 1019 and 2009 only.
+const FIXTURE_RATE_CLOSE = parseRate('112.000000');
+
+test('worked example: month-end revaluation restates the pool and payables at the closing rate, to the kobo', () => {
+  const r = revalue([
+    { item: 'pool', currency: 'CNY', balanceMinor: 3_000_000n, carryingNgn: 320_000_000n, closingRate: FIXTURE_RATE_CLOSE },
+    { item: 'payables', currency: 'CNY', balanceMinor: 2_000_000n, carryingNgn: 210_000_000n, closingRate: FIXTURE_RATE_CLOSE },
+  ]);
+  assert.deepEqual(only(r.lines), [['1019', 16_000_000n, 0n, null], ['7100', 0n, 16_000_000n, null], ['7100', 14_000_000n, 0n, null], ['2009', 0n, 14_000_000n, null]]);
+  assert.ok(r.lines.every((l) => l.currency === 'NGN'));
+  assert.ok(balanced(r.lines));
+  assert.deepEqual(balances(r.lines), { '1019': 16_000_000n, '7100': -2_000_000n, '2009': -14_000_000n });
+  assert.deepEqual(r.rows.map((x) => x.closingNgn), [336_000_000n, 224_000_000n]);
+  assert.deepEqual(balances([...r.lines, ...r.reversal]), { '1019': 0n, '7100': 0n, '2009': 0n }, 'the day-1 reversal undoes it exactly');
+});
+
+test('revaluation: losses on the pool, gains on payables, nothing to post when carrying equals closing; bad input refused', () => {
+  const r = revalue([
+    { item: 'pool', currency: 'USD', balanceMinor: 100n, carryingNgn: 200_000n, closingRate: parseRate('1500.000000') }, // fixture: 1.00 USD carried at 2,000.00, closes at 1,500.00
+    { item: 'payables', currency: 'USD', balanceMinor: 100n, carryingNgn: 200_000n, closingRate: parseRate('1500.000000') },
+    { item: 'pool', currency: 'CNY', balanceMinor: 100n, carryingNgn: 11_200n, closingRate: FIXTURE_RATE_CLOSE }, // no change, no lines
+  ]);
+  assert.deepEqual(only(r.lines), [['1019', 0n, 50_000n, null], ['7100', 50_000n, 0n, null], ['7100', 0n, 50_000n, null], ['2009', 50_000n, 0n, null]]);
+  assert.equal(r.rows.length, 3, 'every item is recorded, even with no difference');
+  const item = { item: 'pool' as const, currency: 'CNY', balanceMinor: 1n, carryingNgn: 0n, closingRate: FIXTURE_RATE_CLOSE };
+  assert.throws(() => revalue([{ ...item, currency: 'NGN' }]), /NGN is not revalued/);
+  assert.throws(() => revalue([{ ...item, balanceMinor: -1n }]), /cannot be negative/);
+  assert.throws(() => revalue([{ ...item, closingRate: 0n }]), /closing rate must be positive/);
+  assert.throws(() => revalue([item, item]), /CNY pool is listed twice/);
 });

@@ -174,3 +174,35 @@ export const fxReferenceRates = pgTable('fx_reference_rates', {
   // cbn: CBN central rate, the reference (revaluation, spot pre-fill, exceptions). market: mid-market feed, pre-fills rate paid only. ADR 0010.
   check('fx_reference_rates_source', sql`${t.source} in ('cbn', 'market')`),
 ]);
+
+/**
+ * Month-end revaluation evidence (spec FX rule 6, ADR 0011): one row per currency and item (the pool on 1010, foreign
+ * payables on 2000) on a revaluation entry, with the balance, the carrying amount and the exact reference rate used,
+ * so an auditor can re-perform the figure. Append-only; the database re-computes every row at commit (migration 0007).
+ */
+export const fxRevaluations = pgTable('fx_revaluations', {
+  id: id(),
+  tenantId: tenantId(),
+  entryId: uuid('entry_id').notNull(),
+  item: text('item').notNull(),
+  currency: char('currency', { length: 3 }).notNull().references(() => currencies.code),
+  balanceMinor: bigint('balance_minor', { mode: 'bigint' }).notNull(),
+  carryingNgn: bigint('carrying_ngn', { mode: 'bigint' }).notNull(),
+  rateDate: date('rate_date').notNull(),
+  rateSource: text('rate_source').notNull().default('cbn'),
+  rateRevision: smallint('rate_revision').notNull(),
+  rate: numeric('rate', { precision: 18, scale: 6 }).notNull(),
+  closingNgn: bigint('closing_ngn', { mode: 'bigint' }).notNull(),
+  createdAt: createdAt(),
+}, (t) => [
+  unique('fx_revaluations_one_per_item').on(t.entryId, t.item, t.currency),
+  foreignKey({ name: 'fx_revaluations_entry', columns: [t.tenantId, t.entryId], foreignColumns: [journalEntries.tenantId, journalEntries.id] }),
+  foreignKey({ name: 'fx_revaluations_reference', columns: [t.rateDate, t.currency, t.rateSource, t.rateRevision],
+    foreignColumns: [fxReferenceRates.rateDate, fxReferenceRates.currency, fxReferenceRates.source, fxReferenceRates.revision] }),
+  index('fx_revaluations_tenant_currency').on(t.tenantId, t.currency),
+  check('fx_revaluations_item', sql`${t.item} in ('pool', 'payables')`),
+  check('fx_revaluations_not_ngn', sql`${t.currency} <> 'NGN'`),
+  check('fx_revaluations_cbn', sql`${t.rateSource} = 'cbn'`),
+  check('fx_revaluations_balance', sql`${t.balanceMinor} >= 0`),
+  check('fx_revaluations_closing', sql`${t.closingNgn} = round(${t.balanceMinor} * ${t.rate})`),
+]);

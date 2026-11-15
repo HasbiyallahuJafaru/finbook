@@ -5,8 +5,10 @@ import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import pg from 'pg';
-import { convert, parseRate, RATE_SCALE } from '@app/money';
-import { buyCurrency, completeAgentJob, customerReceipt, payFromPool, payPayableFromPool, sharedCost, supplierInvoice, type Line as LedgerLine } from '@app/ledger';
+import { convert, formatRate, parseRate, RATE_SCALE } from '@app/money';
+import {
+  buyCurrency, completeAgentJob, customerReceipt, payFromPool, payPayableFromPool, revalue, sharedCost, supplierInvoice, type Line as LedgerLine, type RevaluationItem,
+} from '@app/ledger';
 import { migrate, withTenant, type Actor, type Tx } from '../src/index.ts';
 
 type Line = {
@@ -84,7 +86,8 @@ async function freshTenant(name: string): Promise<{ id: string; period: string }
   const period = await tx(id, async (t) => {
     for (const [code, type, currency] of [['1000', 'asset', null], ['1010', 'asset', null], ['1020', 'asset', 'CNY'], ['2000', 'liability', null], ['3000', 'equity', null],
       ['4000', 'income', null], ['5000', 'expense', null], ['6000', 'expense', null], ['7000', 'income', null],
-      ['1100', 'asset', null], ['1150', 'asset', null], ['2150', 'liability', null], ['4100', 'income', null], ['4200', 'income', null]] as const) {
+      ['1100', 'asset', null], ['1150', 'asset', null], ['2150', 'liability', null], ['4100', 'income', null], ['4200', 'income', null],
+      ['1019', 'asset', null], ['2009', 'liability', null], ['7100', 'income', null]] as const) {
       ids[code] = await one(t.client, 'INSERT INTO accounts (tenant_id, code, name, type, currency) VALUES ($1, $2, $3, $4, $5) RETURNING id',
         [id, code, `Account ${code}`, type, currency]);
     }
@@ -299,7 +302,7 @@ describe('foreign currency lines', () => {
     periodId: periodA, date: '2026-01-20',
     lines: [{ account: '1010', debit: ngn, currency: 'CNY', amountMinor, rate, rateSource: 'bank_receipt', ...extra }, { account: '1000', credit: ngn }],
   });
-  const usd = (extra: Partial<Line>) => fx(100n, FIXTURE_RATE_USD, 1_00_000n, { currency: 'USD', account: '1000', ...extra });
+  const usd = (extra: Partial<Line>) => fx(100n, FIXTURE_RATE_USD, 1_00_000n, { currency: 'USD', ...extra }); // USD into the pool (1010)
 
   test('worked example: an exact tie rounds half-up (CNY 0.05 x 0.500000 = NGN 0.025, posted as 3 kobo, not 2)', async () => {
     await post(tenantA, fx(5n, FIXTURE_RATE_HALF, 3n));
@@ -389,19 +392,25 @@ describe('phase 2: posting rules through the database', () => {
   const customer = (v: string) => `019a0000-0000-7000-8000-0000000000c${v.toLowerCase()}`;
   const job = (v: string) => ({ vehicleId: v, counterpartyId: v });
 
-  /** Persist one posting-rule result as one journal entry (what the API will do). */
-  const postLines = (tenant: string, period: string, lines: LedgerLine[], opts: { date?: string; reverses?: string; beforeCommit?: (c: pg.ClientBase) => Promise<unknown> } = {}) => tx(tenant, async (t) => {
+  type PostOpts = { date?: string; reverses?: string | null; sourceType?: string };
+  /** Insert one posting-rule result as one journal entry, inside an open transaction (what the API will do). */
+  const insertPosting = async (c: pg.ClientBase, tenant: string, period: string, lines: LedgerLine[], opts: PostOpts = {}) => {
     const ids = accounts[tenant] ?? {};
-    const entryId = await one(t.client,
-      'INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, reverses_entry_id) VALUES ($1, $2, $3, \'posting rule\', \'test\', uuidv7(), $4, $5) RETURNING id',
-      [tenant, period, opts.date ?? '2026-01-10', `pr-${String(++keySeq)}`, opts.reverses ?? null]);
+    const entryId = await one(c,
+      'INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, reverses_entry_id) VALUES ($1, $2, $3, \'posting rule\', $4, uuidv7(), $5, $6) RETURNING id',
+      [tenant, period, opts.date ?? '2026-01-10', opts.sourceType ?? 'test', `pr-${String(++keySeq)}`, opts.reverses ?? null]);
     for (const l of lines) {
-      await t.client.query(
+      await c.query(
         `INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, spot_rate, spot_source, rate_note, vehicle_id, counterparty_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
         [tenant, entryId, ids[l.account], l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null, l.spotRate ?? null, l.spotSource ?? null, l.rateNote ?? null,
           l.vehicleId ? car[l.vehicleId] : null, l.counterpartyId ? (l.counterpartyId.length === 36 ? l.counterpartyId : customer(l.counterpartyId)) : null]);
     }
+    return entryId;
+  };
+  /** Persist one posting-rule result as one journal entry, in its own transaction. */
+  const postLines = (tenant: string, period: string, lines: LedgerLine[], opts: PostOpts & { beforeCommit?: (c: pg.ClientBase) => Promise<unknown> } = {}) => tx(tenant, async (t) => {
+    const entryId = await insertPosting(t.client, tenant, period, lines, opts);
     await opts.beforeCommit?.(t.client);
     return entryId;
   });
@@ -641,6 +650,189 @@ describe('phase 2: posting rules through the database', () => {
     const pay = (v: string) => payFromPool({ pool: stale, currency: 'CNY', amountMinor: 10_000_000n, vehicleId: v, spot: SPOT_CBN }).lines;
     await assert.rejects(race(id, period, pay('A'), pay('B')), /pool overspent/);
     assert.deepEqual(await poolOf(id), { balanceMinor: 5_000_000n, costNgn: 533_333_333n });
+  });
+
+  // Month-end revaluation (spec FX rule 6, ADR 0011), worked by hand. Pool CNY 150,000.00 carried at NGN 16,000,000.00;
+  // supplier S owed CNY 20,000.00 for car A, booked at 105 = NGN 2,100,000.00. Closing CBN rate on 2026-01-30:
+  // FIXTURE_RATE_CLOSE (112).
+  //   pool     150,000.00 x 112 = NGN 16,800,000.00 -> gain 800,000.00: Dr 1019 / Cr 7100
+  //   payables  20,000.00 x 112 = NGN  2,240,000.00 -> loss 140,000.00: Dr 7100 / Cr 2009
+  //   net 7100: gain NGN 660,000.00 on 2026-01-31, reversed on 2026-02-01.
+  const FIXTURE_RATE_CLOSE = '112.000000';
+  const CLOSE = { date: '2026-01-30', revision: 1 };
+  const closingRates = async () => {
+    await owner("INSERT INTO fx_reference_rates (rate_date, currency, rate, source) VALUES ('2026-01-30', 'CNY', $1, 'cbn') ON CONFLICT DO NOTHING", [FIXTURE_RATE_CLOSE]);
+  };
+  const february = (tenant: string) => tx(tenant, (t) => one(t.client, "INSERT INTO periods (tenant_id, starts_on, ends_on) VALUES ($1, '2026-02-01', '2026-02-28') RETURNING id", [tenant]));
+  const item = (kind: RevaluationItem['item'], balanceMinor: bigint, carryingNgn: bigint, rate = FIXTURE_RATE_CLOSE): RevaluationItem =>
+    ({ item: kind, currency: 'CNY', balanceMinor, carryingNgn, closingRate: parseRate(rate) });
+  /** Revalue as the API will: the entry, its evidence rows and its day-1 reversal, in one transaction. */
+  const postRevaluation = (tenant: string, jan: string, feb: string, items: RevaluationItem[],
+    opts: { rate?: { date: string; revision: number }; date?: string; reversalDate?: string | null; lines?: LedgerLine[] } = {}) => tx(tenant, async (t) => {
+    const r = revalue(items);
+    const lines = opts.lines ?? r.lines;
+    const entryId = await insertPosting(t.client, tenant, jan, lines, { date: opts.date ?? '2026-01-31', sourceType: 'fx_revaluation' });
+    const rate = opts.rate ?? CLOSE;
+    for (const row of r.rows) {
+      await t.client.query(
+        'INSERT INTO fx_revaluations (tenant_id, entry_id, item, currency, balance_minor, carrying_ngn, rate_date, rate_revision, rate, closing_ngn) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
+        [tenant, entryId, row.item, row.currency, row.balanceMinor, row.carryingNgn, rate.date, rate.revision, formatRate(row.closingRate), row.closingNgn]);
+    }
+    if (opts.reversalDate !== null) {
+      await insertPosting(t.client, tenant, feb, lines.map((l) => ({ ...l, debit: l.credit, credit: l.debit })),
+        { date: opts.reversalDate ?? '2026-02-01', sourceType: 'fx_revaluation', reverses: entryId });
+    }
+    return entryId;
+  });
+  const netAsOf = (tenant: string, date: string) => tx(tenant, async (t) => Object.fromEntries((await t.client.query<{ code: string; net: string }>(
+    'SELECT a.code, sum(l.debit_ngn - l.credit_ngn)::text AS net FROM journal_lines l JOIN accounts a ON a.id = l.account_id JOIN journal_entries e ON e.id = l.entry_id WHERE e.entry_date <= $1 AND a.code IN (\'1019\', \'2009\', \'7100\') GROUP BY a.code',
+    [date])).rows.map((r) => [r.code, BigInt(r.net)])));
+  const invoiced = async (name: string) => {
+    const t = await funded(name);
+    await postLines(t.id, t.period, supplierInvoice({ ...bill, currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN }));
+    await closingRates();
+    return { ...t, feb: await february(t.id) };
+  };
+
+  test('worked example: month-end revaluation through the database, reversed on day 1, to the kobo', async () => {
+    const { id, period, feb } = await invoiced('Revaluation');
+    const items = [item('pool', 15_000_000n, 1_600_000_000n), item('payables', 2_000_000n, 210_000_000n)];
+    await postRevaluation(id, period, feb, items);
+    assert.deepEqual(await netAsOf(id, '2026-01-31'), { '1019': 80_000_000n, '2009': -14_000_000n, '7100': -66_000_000n }, 'gain NGN 660,000.00 at January close');
+    assert.deepEqual(await netAsOf(id, '2026-02-01'), { '1019': 0n, '2009': 0n, '7100': 0n }, 'reversed on 1 February');
+    assert.deepEqual(await poolOf(id), { balanceMinor: 15_000_000n, costNgn: 1_600_000_000n }, 'the pool keeps its cost');
+    assert.equal(await tx(id, async (t) => (await t.client.query('SELECT 1 FROM fx_revaluations')).rowCount), 2);
+    const tb = await trialBalance(id);
+    assert.equal(tb.dr - tb.cr, 0n);
+    assert.deepEqual(await chainBreaks(id), []);
+    // Evidence can't be added to a posted revaluation, or changed.
+    const entryId = await tx(id, async (t) => (await t.client.query<{ entry_id: string }>('SELECT entry_id FROM fx_revaluations LIMIT 1')).rows[0]?.entry_id ?? '');
+    await assert.rejects(tx(id, (t) => t.client.query(
+      "INSERT INTO fx_revaluations (tenant_id, entry_id, item, currency, balance_minor, carrying_ngn, rate_date, rate_revision, rate, closing_ngn) VALUES ($1, $2, 'pool', 'USD', 0, 0, '2026-01-30', 1, '1.000000', 0)", [id, entryId])), /already posted/);
+    await assert.rejects(owner('UPDATE fx_revaluations SET carrying_ngn = 0'), /append-only/);
+    // Another tenant sees none of it, and can't write any of it.
+    assert.equal(await tx(tenantB, async (t) => (await t.client.query('SELECT 1 FROM fx_revaluations')).rowCount), 0);
+    const evidence = (tenant: string, entry: string) =>
+      "INSERT INTO fx_revaluations (tenant_id, entry_id, item, currency, balance_minor, carrying_ngn, rate_date, rate_revision, rate, closing_ngn) VALUES ('" + tenant + "', '" + entry + "', 'pool', 'USD', 0, 0, '2026-01-30', 1, '1.000000', 0)";
+    await assert.rejects(tx(tenantB, (t) => t.client.query(evidence(id, entryId))), /belongs to a revaluation entry/); // as A's tenant: RLS hides A's entry, so no oracle
+    await assert.rejects(tx(tenantB, (t) => t.client.query(evidence(tenantB, entryId))), /belongs to a revaluation entry/); // A's entry, B's tenant
+    // Evidence only goes on an open revaluation entry: not on an ordinary entry, nor on the reversal.
+    const reversalId = await tx(id, async (t) => (await t.client.query<{ id: string }>('SELECT id FROM journal_entries WHERE reverses_entry_id = $1', [entryId])).rows[0]?.id ?? '');
+    await assert.rejects(tx(id, async (t) => {
+      const plain = await insertPosting(t.client, id, period, [{ account: '1000', debit: 1n, credit: 0n, currency: 'NGN', amountMinor: 1n }, { account: '3000', debit: 0n, credit: 1n, currency: 'NGN', amountMinor: 1n }]);
+      await t.client.query(evidence(id, plain));
+    }), /belongs to a revaluation entry/);
+    await assert.rejects(tx(id, (t) => t.client.query(evidence(id, reversalId))), /belongs to a revaluation entry/);
+  });
+
+  test('a revaluation must match the ledger, use the latest CBN rate, be dated month-end and reverse on day 1', async () => {
+    const { id, period, feb } = await invoiced('Revaluation guards');
+    const good = [item('pool', 15_000_000n, 1_600_000_000n), item('payables', 2_000_000n, 210_000_000n)];
+    const [pool, payables] = good;
+    if (!pool || !payables) throw new Error('two items');
+    await assert.rejects(postRevaluation(id, period, feb, [{ ...pool, carryingNgn: 1_500_000_000n }, payables]), /CNY pool on 2026-01-31: the ledger has balance 15000000 carried at 1600000000/);
+    await assert.rejects(postRevaluation(id, period, feb, [pool]), /CNY payables on 2026-01-31: the ledger has balance 2000000 carried at 210000000 kobo, the evidence says none/);
+    await assert.rejects(postRevaluation(id, period, feb, good.map((i) => ({ ...i, closingRate: parseRate('111.000000') }))), /closing rate must be the latest CBN rate on or before 2026-01-31/); // fixture: a chosen rate
+    await assert.rejects(postRevaluation(id, period, feb, good.map((i) => ({ ...i, closingRate: parseRate(FIXTURE_RATE_SPOT) })), { rate: { date: '2026-01-08', revision: 1 } }),
+      /latest is 2026-01-30, revision 1/); // an older CBN rate
+    await assert.rejects(postRevaluation(id, period, feb, good, { reversalDate: null }), /posts with its reversal dated 2026-02-01/);
+    await assert.rejects(postRevaluation(id, period, feb, good, { reversalDate: '2026-02-02' }), /posts with its reversal dated 2026-02-01/);
+    await assert.rejects(postRevaluation(id, period, feb, good, { date: '2026-01-30' }), /dated its period's last day \(2026-01-31\)/);
+    const r = revalue(good);
+    await assert.rejects(postRevaluation(id, period, feb, good, { lines: r.lines.map((l) => (l.account === '2009' ? { ...l, account: '6000' } : l)) }), /posts only to 1019, 2009 and 7100/);
+    // 1019 and 2009 hold revaluation only.
+    await assert.rejects(postLines(id, period, [{ account: '1019', debit: 100n, credit: 0n, currency: 'NGN', amountMinor: 100n }, { account: '7100', debit: 0n, credit: 100n, currency: 'NGN', amountMinor: 100n }]),
+      /1019 and 2009 hold month-end revaluation only/);
+    await postRevaluation(id, period, feb, good);
+  });
+
+  const periodFor = (tenant: string, starts: string, ends: string) =>
+    tx(tenant, (t) => one(t.client, 'INSERT INTO periods (tenant_id, starts_on, ends_on) VALUES ($1, $2, $3) RETURNING id', [tenant, starts, ends]));
+
+  test('revaluation guards that only bite in their own case (ledger audit of 0007)', async () => {
+    const { id, period, feb } = await invoiced('Revaluation edges');
+    const good = [item('pool', 15_000_000n, 1_600_000_000n), item('payables', 2_000_000n, 210_000_000n)];
+    // Evidence right, but an extra NGN 1,000,000.00 "gain" on 1019: the movement check refuses it.
+    const fake: LedgerLine[] = [{ account: '1019', debit: 100_000_000n, credit: 0n, currency: 'NGN', amountMinor: 100_000_000n }, { account: '7100', debit: 0n, credit: 100_000_000n, currency: 'NGN', amountMinor: 100_000_000n }];
+    await assert.rejects(postRevaluation(id, period, feb, good, { lines: [...revalue(good).lines, ...fake] }), /1019 must move by the pool's restated difference/);
+    // Evidence for something the ledger doesn't hold (no USD payables here, so a CNY row for a second supplier-less item is refused).
+    const { id: bare, period: barePeriod } = await funded('Revaluation bare');
+    const bareFeb = await february(bare);
+    await assert.rejects(postRevaluation(bare, barePeriod, bareFeb, [item('pool', 15_000_000n, 1_600_000_000n), item('payables', 0n, 0n)]),
+      /CNY payables on 2026-01-31: the ledger has balance none carried at none kobo, the evidence says 0 at 0/);
+    // The direct calls are closed: the app can't run a check itself (it would take another tenant's lock).
+    await assert.rejects(tx(id, (t) => t.client.query('SELECT assert_fx_revaluation(e) FROM journal_entries e LIMIT 1')), /permission denied for function assert_fx_revaluation/);
+    await assert.rejects(tx(id, (t) => t.client.query('SELECT assert_foreign_entry(e) FROM journal_entries e LIMIT 1')), /permission denied for function assert_foreign_entry/);
+    // Foreign money on another balance-sheet account would never be revalued: refused. A foreign expense line is fine.
+    await assert.rejects(post(id, { periodId: period, date: '2026-01-20', lines: [{ account: '1000', debit: 1_00_000n, currency: 'USD', amountMinor: 100n, rate: FIXTURE_RATE_USD, rateSource: 'bank_receipt' }, { account: '3000', credit: 1_00_000n }] }),
+      /a USD line cannot post to 1000: foreign money on the balance sheet lives on the pool \(1010\) or foreign payables \(2000\)/);
+    await post(id, { periodId: period, date: '2026-01-20', lines: [{ account: '6000', debit: 1_00_000n, currency: 'USD', amountMinor: 100n, rate: FIXTURE_RATE_USD, rateSource: 'bank_receipt' }, { account: '1000', credit: 1_00_000n }] });
+  });
+
+  test('February\'s revaluation ignores January\'s once reversed; the CBN rate may be 7 days old, not 8', async () => {
+    const { id, period, feb } = await invoiced('Revaluation months');
+    await postRevaluation(id, period, feb, [item('pool', 15_000_000n, 1_600_000_000n), item('payables', 2_000_000n, 210_000_000n)]);
+    const mar = await periodFor(id, '2026-03-01', '2026-03-31');
+    const apr = await periodFor(id, '2026-04-01', '2026-04-30');
+    // February 28: January's NGN 800,000.00 was reversed on 1 February, so the pool is carried at cost again (16,000,000.00).
+    await owner("INSERT INTO fx_reference_rates (rate_date, currency, rate, source) VALUES ('2026-02-27', 'CNY', '113.000000', 'cbn') ON CONFLICT DO NOTHING"); // fixture
+    const febItems = (poolCarrying: bigint) => [item('pool', 15_000_000n, poolCarrying, '113.000000'), item('payables', 2_000_000n, 210_000_000n, '113.000000')];
+    const febRun = { rate: { date: '2026-02-27', revision: 1 }, date: '2026-02-28', reversalDate: '2026-03-01' };
+    await assert.rejects(postRevaluation(id, feb, mar, febItems(1_680_000_000n), febRun), /carried at 1600000000 kobo, the evidence says 15000000 at 1680000000/);
+    await postRevaluation(id, feb, mar, febItems(1_600_000_000n), febRun);
+    // March 31: the only CBN rate is 8 days old (23 March): refused. One 7 days old (24 March) is accepted.
+    await owner("INSERT INTO fx_reference_rates (rate_date, currency, rate, source) VALUES ('2026-03-23', 'CNY', '114.000000', 'cbn') ON CONFLICT DO NOTHING"); // fixture
+    const marItems = (rate: string) => [item('pool', 15_000_000n, 1_600_000_000n, rate), item('payables', 2_000_000n, 210_000_000n, rate)];
+    await assert.rejects(postRevaluation(id, mar, apr, marItems('114.000000'), { rate: { date: '2026-03-23', revision: 1 }, date: '2026-03-31', reversalDate: '2026-04-01' }),
+      /latest is none, revision none/);
+    await owner("INSERT INTO fx_reference_rates (rate_date, currency, rate, source) VALUES ('2026-03-24', 'CNY', '115.000000', 'cbn') ON CONFLICT DO NOTHING"); // fixture
+    await postRevaluation(id, mar, apr, marItems('115.000000'), { rate: { date: '2026-03-24', revision: 1 }, date: '2026-03-31', reversalDate: '2026-04-01' });
+    assert.deepEqual(await netAsOf(id, '2026-04-01'), { '1019': 0n, '2009': 0n, '7100': 0n }, 'every month reversed');
+  });
+
+  test('a pool emptied between two runs clears what the first run left on 1019', async () => {
+    const { id, period, feb } = await invoiced('Revaluation emptied');
+    await postRevaluation(id, period, feb, [item('pool', 15_000_000n, 1_600_000_000n), item('payables', 2_000_000n, 210_000_000n)]);
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 15_000_000n, vehicleId: 'B', spot: SPOT_CBN }).lines, { date: '2026-01-15' });
+    assert.deepEqual(await poolOf(id), { balanceMinor: 0n, costNgn: 0n });
+    // Pool: nothing held, carried at the NGN 800,000.00 still standing -> the rerun takes it off 1019.
+    await postRevaluation(id, period, feb, [item('pool', 0n, 80_000_000n), item('payables', 2_000_000n, 224_000_000n)]);
+    assert.deepEqual(await netAsOf(id, '2026-01-31'), { '1019': 0n, '2009': -14_000_000n, '7100': 14_000_000n });
+  });
+
+  test('the commit-time checks cannot be run early and then dodged by adding lines (security review)', async () => {
+    const { id, period } = await invoiced('Early check');
+    // The whole-entry checks run inside the hash-writing trigger, the only deferred trigger on entries. A separate one could be
+    // fired early (SET CONSTRAINTS, no privilege needed) while the entry is clean and then dodged by adding lines.
+    const deferred = await owner<{ tgname: string }>("SELECT tgname FROM pg_trigger WHERE tgrelid = 'journal_entries'::regclass AND tgdeferrable ORDER BY tgname");
+    assert.deepEqual(deferred.rows.map((r) => r.tgname), ['journal_entries_post']);
+    // Firing everything early hashes the clean entry, so the 1019 balance planted afterwards is refused.
+    await assert.rejects(tx(id, async (t) => {
+      const ngnLine = (account: string, debit: bigint, credit: bigint): LedgerLine => ({ account, debit, credit, currency: 'NGN', amountMinor: debit + credit });
+      const entryId = await insertPosting(t.client, id, period, [ngnLine('1000', 100n, 0n), ngnLine('3000', 0n, 100n)]);
+      await t.client.query('SET CONSTRAINTS ALL IMMEDIATE');
+      for (const l of [ngnLine('1019', 100n, 0n), ngnLine('7100', 0n, 100n)]) {
+        await t.client.query('INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+          [id, entryId, accounts[id]?.[l.account], l.debit, l.credit, l.currency, l.amountMinor]);
+      }
+    }), /already posted; lines cannot be added/);
+  });
+
+  test('a second revaluation for the same day only adds what changed since the first', async () => {
+    const { id, period, feb } = await invoiced('Revaluation rerun');
+    await postRevaluation(id, period, feb, [item('pool', 15_000_000n, 1_600_000_000n), item('payables', 2_000_000n, 210_000_000n)]);
+    // A pool payment backdated into January after the first run: CNY 10,000.00 at 16,000,000.00 x 10/150 = NGN 1,066,666.67,
+    // leaving CNY 140,000.00 at NGN 14,933,333.33. With the NGN 800,000.00 standing on 1019 it is carried at 15,733,333.33;
+    // 140,000.00 x 112 = 15,680,000.00, so the rerun posts -53,333.33 (Cr 1019 / Dr 7100). Payables carried at 2,240,000.00: no change.
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'B', spot: SPOT_CBN }).lines, { date: '2026-01-15' });
+    assert.deepEqual(await poolOf(id), { balanceMinor: 14_000_000n, costNgn: 1_493_333_333n });
+    const rerun = [item('pool', 14_000_000n, 1_573_333_333n), item('payables', 2_000_000n, 224_000_000n)];
+    assert.deepEqual(revalue(rerun).lines.map((l) => [l.account, l.debit, l.credit]), [['1019', 0n, 5_333_333n], ['7100', 5_333_333n, 0n]]);
+    await assert.rejects(postRevaluation(id, period, feb, [item('pool', 14_000_000n, 1_493_333_333n), item('payables', 2_000_000n, 224_000_000n)]),
+      /carried at 1573333333/); // ignoring what the first run left on 1019 is refused
+    await postRevaluation(id, period, feb, rerun);
+    assert.deepEqual(await netAsOf(id, '2026-01-31'), { '1019': 74_666_667n, '2009': -14_000_000n, '7100': -60_666_667n }, '1019 = 15,680,000.00 - 14,933,333.33');
+    assert.deepEqual(await netAsOf(id, '2026-02-01'), { '1019': 0n, '2009': 0n, '7100': 0n });
   });
 
   test('an invoice and a direct pool payment for the same car at the same moment cannot both post (either order)', async () => {
