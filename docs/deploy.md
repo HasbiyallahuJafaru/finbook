@@ -1,40 +1,68 @@
-# Deploy runbook (phase 0)
+# Infrastructure and deploy runbook
 
-Claude sessions never deploy (CLAUDE.md, `settings.json` deny rules). You run these. Do staging first; production only after staging is healthy.
+Claude may build and deploy **staging** (CLAUDE.md → Infrastructure and deploys). **Production is user-run only**, from the steps at the bottom.
 
-## Railway (api, worker, Redis; Postgres arrives in phase 1)
+## What exists (2026-11-15)
 
-One Railway project per environment (`finbook-staging`, `finbook-prod`). Shared pnpm monorepo, so no root directory: set commands per service. Railway's config-as-code is deprecated, so use service settings (or `railway environment edit --service-config`).
+### Railway project `finbook` (workspace: hasbiyallahujafaru's Projects)
 
-| Service | Source | Build command | Start command | Healthcheck | Watch paths |
-| --- | --- | --- | --- | --- | --- |
-| redis | Railway Redis template | n/a | n/a | n/a | n/a |
-| api | this repo | `pnpm turbo run build --filter=@app/api` | `pnpm --filter @app/api start` | `/health` | `/apps/api/**`, `/packages/**` |
-| worker | this repo | `pnpm turbo run build --filter=@app/worker` | `pnpm --filter @app/worker start` | none (no HTTP) | `/apps/worker/**`, `/packages/**` |
+| Environment | State |
+| --- | --- |
+| `staging` | Postgres, Redis, `api`, `worker`: all running |
+| `production` | Created by Railway by default. Empty. User-run only. |
 
-Variables (set in Railway, never in the repo):
+Staging services:
+
+| Service | Source | Build (Railpack variable) | Start (Railpack variable) | Public URL |
+| --- | --- | --- | --- | --- |
+| Postgres | Railway template | n/a | n/a | private only |
+| Redis | Railway template | n/a | n/a | private only |
+| api | `railway up` from local tree | `RAILPACK_BUILD_CMD=pnpm turbo run build --filter=@app/api` | `RAILPACK_START_CMD=pnpm --filter @app/api start` | https://api-staging-c68d0388.up.railway.app (`/health` → `{"status":"ok"}`) |
+| worker | `railway up` from local tree | `RAILPACK_BUILD_CMD=pnpm turbo run build --filter=@app/worker` | `RAILPACK_START_CMD=pnpm --filter @app/worker start` | none (no HTTP) |
+
+Staging variables (values never printed or committed):
 
 | Variable | api | worker | Value |
 | --- | --- | --- | --- |
-| `REDIS_URL` | yes | yes | reference the Redis service: `${{Redis.REDIS_URL}}` |
-| `SENTRY_DSN` | yes | yes | from the Sentry project (separate project per app is fine) |
-| `SENTRY_ENVIRONMENT` | yes | yes | `staging` or `production` |
+| `REDIS_URL` | yes | yes | `${{Redis.REDIS_URL}}` reference |
+| `SENTRY_ENVIRONMENT` | yes | yes | `staging` |
+| `SENTRY_DSN` | not yet | not yet | needs a Sentry project |
+| `DATABASE_URL` | phase 1 | phase 1 | `${{Postgres.DATABASE_URL}}` reference |
 
-`PORT` is injected by Railway; the api already reads it. Node 24 comes from `engines` in the root `package.json`.
+Build and start commands are set as Railpack variables because the installed Railway CLI (5.41.2) silently ignores `railway environment edit --service-config`. Node 24 comes from `engines` in the root `package.json`.
 
-Check: `curl https://<api-domain>/health` returns `{"status":"ok"}`; the worker log shows it connected to Redis with no errors.
+### Cloudflare
 
-## Cloudflare (web)
+| Worker | State |
+| --- | --- |
+| `finbook-web-staging` | Not deployed yet: the Cloudflare login on this machine has expired. Dry run passes. |
+| `finbook-web` (production) | User-run only. |
+
+`apps/web/cloudflare.config.ts` deploys to `finbook-web-staging` unless `CF_WORKER_NAME` is set, so an accidental deploy can only hit staging.
+
+## Staging: redeploy
 
 ```
-pnpm --filter @app/web build
-pnpm --filter @app/web deploy      # vinext-cloudflare deploy; needs `cf` / wrangler login on your machine
+railway up -s api -e staging --detach
+railway up -s worker -e staging --detach
+railway service status -s api -e staging
+pnpm --filter @app/web exec vinext-cloudflare deploy      # after `pnpm --filter @app/web exec cf login`
 ```
 
-Worker name is `finbook-web` (`apps/web/cloudflare.config.ts`). The page is a placeholder until Clerk and the API client land.
+## Open items (need the owner, in a browser)
 
-## Not set up yet
+1. **Cloudflare login:** run `pnpm --filter @app/web exec cf login` in a terminal (it opens a browser). Then Claude deploys `finbook-web-staging`.
+2. **Railway ↔ GitHub:** Railway → Account → Integrations → GitHub, give the Railway app access to `HasbiyallahuJafaru/finbook`. Then connect `api` and `worker` to the repo (branch `main`) with watch paths `/apps/api/**` + `/packages/**` and `/apps/worker/**` + `/packages/**`, so pushes auto-deploy staging.
+3. **API healthcheck:** Railway → api (staging) → Settings → Healthcheck path `/health`.
+4. **GitHub billing lock:** blocks CI (Actions jobs don't start).
+5. **Sentry:** create projects for api, worker, web; give Claude the staging DSNs to set as variables.
 
-- Sentry in web (see docs/PROGRESS.md).
-- Postgres, Clerk keys, R2 buckets: phase 1+.
-- Custom domains and a staging/production split for the web Worker.
+## Production (user-run)
+
+Do this only after staging is green and CI passes on `main`.
+
+1. In Railway, switch to the `production` environment of `finbook`. Add Postgres and Redis; add `api` and `worker` services with the same build/start variables as staging, and `SENTRY_ENVIRONMENT=production`, `REDIS_URL=${{Redis.REDIS_URL}}`.
+2. `railway up -s api -e production --detach` and the same for `worker` (or connect GitHub with a production branch).
+3. `railway domain -s api -e production`, then check `/health`.
+4. Web: `CF_WORKER_NAME=finbook-web pnpm --filter @app/web exec vinext-cloudflare deploy`.
+5. Custom domains and DNS: decide with the team first.
