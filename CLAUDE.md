@@ -101,14 +101,16 @@ The Flutter app (phase 6) will be another API client, so every rule must live in
 
 ```
 pnpm install
-pnpm dev                     # all apps
+pnpm dev                     # apps that have a dev script (web on :3001)
 pnpm lint | pnpm typecheck | pnpm test | pnpm build
-pnpm test:integration        # Testcontainers Postgres — needs Docker
-pnpm db:migrate              # local only
-pnpm db:new <name>           # new forward-only migration
-pnpm openapi                 # regenerate spec + typed web client
+pnpm test:integration        # Testcontainers Postgres 18 — needs Docker
+pnpm db:generate             # migration from changes to packages/db/src/schema.ts
+pnpm db:new <verb_noun>      # empty forward-only SQL migration (triggers, policies, grants)
+pnpm db:migrate              # needs DATABASE_OWNER_URL; local, or staging via the Railway `migrate` service
 pnpm --filter <pkg> <script> # scope to one package
 ```
+
+Not built yet: `pnpm openapi` (arrives with `packages/contracts` and the first real endpoints).
 
 **Infrastructure and deploys (owner-authorized 2026-11-15, staging only):** Claude may create and deploy Railway, Cloudflare, Postgres and Redis resources for the **staging** environment. **Production is never touched from a Claude session**: no deploys, variables, migrations, seeds or SQL against it. The user runs production from `docs/deploy.md`. Rules:
 - Work only in the `staging` Railway environment and the `finbook-web-staging` Worker. If a command could target production (no environment flag, or the linked environment isn't staging), check first with `railway status`.
@@ -123,7 +125,7 @@ pnpm --filter <pkg> <script> # scope to one package
 - **Latest versions:** check the registry for the latest stable version before adding or referencing any package or model. Never pin a version from memory.
 - **Ledger or FX change:** use the `ledger-change` skill. Write the worked-example test first, to the kobo.
 - **New endpoint:** use the `new-endpoint` skill. **Schema change:** use the `db-migration` skill.
-- **Before every commit:** the `verify` skill runs. Do not commit with red checks.
+- **Before every commit:** the `verify` skill runs. Do not commit with red checks. **Before every push:** `.githooks/pre-push` runs the full CI steps and blocks on red (ADR 0007; GitHub Actions is billing-locked). Never push with `--no-verify`.
 - **Review:** after changes to `packages/ledger`, `packages/money`, posting, reports or permissions, run the `ledger-auditor` subagent. After auth, RLS or document access changes, run the `security-reviewer` subagent.
 - **Frontend:** use the `design-taste-frontend`, `frontend-design` and `ui-ux-pro-max` skills with shadcn/ui. Ponytail does not apply to `apps/web` or `packages/ui`. Tabular figures, right-aligned amounts, ₦ and ¥ always shown, negatives in parentheses on reports, every total clickable down to its journal lines. WCAG AA, down to 360 px.
 - **Backend:** use the `ponytail` skill (see Build approach).

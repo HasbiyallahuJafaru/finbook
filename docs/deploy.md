@@ -4,6 +4,8 @@ Claude may build and deploy **staging** (CLAUDE.md → Infrastructure and deploy
 
 ## What exists (2026-11-15)
 
+Staging Postgres has migrations 0000–0004 applied (last run 2026-11-15, via the `migrate` service).
+
 ### Railway project `finbook` (workspace: hasbiyallahujafaru's Projects)
 
 | Environment | State |

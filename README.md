@@ -84,7 +84,7 @@ flowchart LR
 | `apps/worker` | Slow work: PDF reports, email, exchange-rate snapshots, backups and nightly exception reports. |
 | `packages/money` | Exact money and FX arithmetic: integer amounts, decimal-string rates, half-up rounding, exact allocation. |
 | `packages/db` | Schema, forward-only migrations, row-level security and the database-enforced ledger rules. |
-| `packages/ledger` | Posting rules that turn business events into balanced journal lines. *(planned)* |
+| `packages/ledger` | Posting rules that turn business events into balanced journal lines: customer receipts, currency purchases, supplier payments from the FX pool, container costs and job completion. |
 | `packages/contracts` | Shared request and response schemas, the source of the OpenAPI spec. *(planned)* |
 | `packages/reports` | Report queries and PDF templates. *(planned)* |
 | `packages/ui` | Design tokens and shared components, also exported for the mobile app. *(planned)* |
@@ -138,7 +138,7 @@ To run the apps locally, see the commands in each app's `package.json`. The work
 
 ## Contributing
 
-FinBook is built in phases, and each phase is finished only when its acceptance test passes. Before you start, read `docs/PROGRESS.md` for the current phase and the engineering rules in `CLAUDE.md`. Every change runs lint, type checks, unit and integration tests and a build in CI, and changes to money, the ledger, reports or permissions get an independent review.
+FinBook is built in phases, and each phase is finished only when its acceptance test passes. Before you start, read `docs/PROGRESS.md` for the current phase and the engineering rules in `CLAUDE.md`. Every push runs lint, type checks, unit and integration tests and a build through the pre-push gate (`.githooks/pre-push`; enable it with `git config core.hooksPath .githooks`), and changes to money, the ledger, reports or permissions get an independent review.
 
 ## License
 

@@ -1,59 +1,59 @@
 # Progress and handover
 
-Read this first in every new session. Update it before you stop: current phase, what was done, what's next, open questions. Keep it short; history lives in git, decisions in `docs/decisions/`.
+Read this first in every new session. Update it before you stop: current phase, what's built, what's next, open questions. Keep it a snapshot of now, not a diary; history lives in git, decisions in `docs/decisions/`.
 
 _Last updated: 2026-11-15_
 
-## Current phase
+## Where we are
 
-**Phase 2 — Vehicles + FX** (in progress). Gate: a worked example (3 cars, 1 shared container, 3 different rates, 1 sale) matches the accountant's spreadsheet to the kobo.
+| Phase | State |
+| --- | --- |
+| 0 Foundations | Done, except owner-blocked items (below) and Clerk auth, which isn't wired yet |
+| 1 Ledger core | **Done.** Gate evidence: local pre-push run (ADR 0007): 10k random entries net to zero, cross-tenant reads return zero rows |
+| 2 Vehicles + FX | **In progress.** Slice 1 built, audited and committed. Gate waits on the accountant's sign-off |
+| 3–6 | Not started |
 
-- Done (slice 1; ledger-auditor: pass with notes, every finding fixed with a test): `packages/money` pool/rate/weighted-allocation maths; `packages/ledger` posting rules for the customer-funded flow (receipt, buy currency, pay supplier from the pool, shared/per-car costs, agent-job and clearing-job completion); migration 0004 (`pool_average` rate source); the hand-worked example passes in `packages/ledger` and posts cleanly through Postgres. The DB re-computes every pool payment under the tenant lock (no forged cost, no overspend, no race); completion derives costs and funds held from the car's ledger history; receipts and receivables name car and customer. Also reconciled against the real C4 container from EMM's workbook (scratchpad only, not committed): landed costs tie to the cashbook to the kobo. ADR 0008 (pool derived from the ledger, no `fx_pools` table) needs the owner's OK.
-- **Gate blocker:** the accountant must re-perform the worked example (comment block at the top of `packages/ledger/src/index.test.ts`) and sign it off.
-- Still open from the audit (needs the vehicle/job tables): refuse cost postings to a completed job; record the allocation basis per split (`cost_allocations`).
-- Next slices: realized FX on payables, month-end revaluation (7100, auto-reverse), emm_funded (principal) path with approval, then the tables and API endpoints (vehicles with VIN check, job orders with gapless numbers and accepted-quote evidence, shipments, cost types) — the API endpoints need Clerk auth first (phase 0 item still open).
+## Phase 2: now and next
 
-**Phase 1 — Ledger core: done** (2026-11-15). Gate evidence: the local pre-push run (ADR 0007) — 31 integration tests incl. 10k entries netting to zero and zero-row cross-tenant reads; migrations applied to staging.
+Gate: a worked example (3 cars, 1 shared container, 3 different rates, 1 sale) matches the accountant's spreadsheet to the kobo.
 
-**Phase 0** is done except owner-blocked items: web staging deploy (Cloudflare login), Railway↔GitHub, Sentry DSNs (see `docs/deploy.md` → Open items). Clerk auth is not wired yet.
+**Built (slice 1):**
+- `packages/money`: weighted-average pool (`poolSpend`, empties to exactly zero), `divHalfUp`, `rateOf`, `formatRate`, `allocateEqual`, `allocateByWeight`.
+- `packages/ledger`: posting rules for the customer-funded (agent) flow: customer receipt, buy currency into the pool, pay supplier from the pool, shared and per-car costs, agent-job and clearing-job completion. Completion derives costs and funds held from the car's own ledger history; receipts and receivables name the car and customer.
+- Migration 0004: `pool_average` rate source; the DB re-computes every pool payment under the tenant lock (no forged cost, no overspend, no race); reversals mirror rate source, car and customer. Applied to staging.
+- The hand-worked example is in the comment block at the top of `packages/ledger/src/index.test.ts`; it passes in the ledger tests and through Postgres.
+- Reconciled against EMM's real container C4 (scratchpad only, never committed): landed costs tie to the cashbook to the kobo; the Song Plus markup is ₦2,018,200.00 (the workbook's ₦2,139,292 forgets the RMB 600 extra), and its ₦1,000,000.01 clearing margin comes from the unevidenced ₦1m CPH fee.
 
-## Done
+**Next slices, in order:**
+1. Realized FX on supplier payables settled at a different rate.
+2. Month-end revaluation (7100, auto-reverses on day 1; not on account 1010, so it never touches the pool cost).
+3. `emm_funded` (principal) path: inventory 1200/1210, gross sale 4000/5000, reason + reviewer approval before the supplier payment.
+4. Tables and endpoints: vehicles (VIN check digit, unique per tenant, `vin_needs_correction`), job orders (gapless numbers, accepted-quote evidence), shipments/containers, cost types, `cost_allocations` (split basis), refuse costs on a completed job. Endpoints need Clerk auth first.
 
-- Repo docs in place: `CLAUDE.md`, spec, client review, ADR 0001 (agent accounting per job), ADR 0002 (FX actual vs quote rate).
-- Claude tooling: hooks (`.claude/hooks`), skills (db-migration, ledger-change, new-endpoint, phase-gate, verify), agents (ledger-auditor, security-reviewer).
-- Build approach set in `CLAUDE.md`: Ponytail for backend; `design-taste-frontend`, `frontend-design`, `ui-ux-pro-max` for frontend.
-- Graphify graph built (`graphify-out/`, 151 nodes, 11 communities). It covers code and docs, not the build itself. It does not replace this file: it maps what exists, this file says where we are and what's next.
-- First commit `ea9373f` on main; remote `origin` = github.com/HasbiyallahuJafaru/finbook. Push pending (user runs `git push -u origin main`; no network in Claude session). `pnpm-workspace.yaml` and root `package.json` in place.
-- `packages/money` written and green: parseRate, convert (half-up), allocateEqual (remainder on first car), add/sub; 10k-conversion property test; 100% branch coverage. Uses node:test + Node 24 TypeScript stripping, zero dependencies (`pnpm --filter @app/money test`). Not yet wired to the toolchain below.
-- Turborepo + TypeScript + shared tsconfig; strict type-aware ESLint (`eslint.config.mjs`) bans parseFloat, Number(), Math.round/floor/ceil/trunc, toFixed and non-null assertions (tests exempt from the Number/promise rules). `pnpm lint`, `pnpm typecheck`, `pnpm test` all green for @app/money.
-- CI: `.github/workflows/ci.yml` (frozen install, lint, typecheck, test, build on push to main and PRs; pnpm/setup pinned by SHA, checkout v7). Not yet run on GitHub: it needs the push.
-- `apps/api`: NestJS 12 (ESM, nodenext, decorators via tsc) with a public `GET /health`; test compiles with tsc then runs on node:test (Vitest can't emit decorator metadata). No auth, tenancy, DB or Sentry yet. `node apps/api/dist/main.js` listens on `PORT` (default 3000), 0.0.0.0.
-- `apps/worker`: NestJS standalone + BullMQ (`@nestjs/bullmq`), one `system` queue with a `ping` job, requires `REDIS_URL`. Unit tests green; the real-Redis round-trip test is skipped locally (Docker wasn't running) and runs in CI against a `redis:8-alpine` service. `msgpackr-extract` build script explicitly denied in `pnpm-workspace.yaml` (optional native accelerator).
-- `apps/web`: Next.js 16 + React 19 App Router running on Cloudflare Workers through vinext (Cloudflare's recommended path; `vinext check` = 100% compatible; OpenNext fallback not needed). One placeholder page. `dev` = `vite dev` on :3001, `build` = `vite build` (output `.cloudflare/output`). Init choices: no CDN cache, no KV data cache, no image optimization (add later if needed). `workerd` install script denied in `pnpm-workspace.yaml`: build works without it, but local `vite dev`/`preview` may need it approved (`pnpm approve-builds workerd`). Not deployed yet (needs the Cloudflare account). No Clerk, Tailwind, shadcn or design system yet.
-- Sentry in `apps/api` and `apps/worker` (`@sentry/nestjs` 11.12): `src/instrument.ts` loaded by `node --import ./dist/instrument.js` (ESM), DSN/environment from `SENTRY_DSN` / `SENTRY_ENVIRONMENT` (no DSN = disabled). API has `SentryModule` + `SentryGlobalFilter`; BullMQ processor errors are auto-captured by the SDK. Unverified against a real Sentry project (needs a DSN). Known: Nest logs a harmless-looking warning that `SentryGlobalFilter` has no decorator metadata at index [0]; unhandled errors still return 500 (tested). Revisit if error responses misbehave.
-- **Staging is live on Railway** (project `finbook`, env `staging`): Postgres, Redis, api (https://api-staging-c68d0388.up.railway.app/health → ok), worker (connected to Redis). Details and open items in `docs/deploy.md`. Policy: Claude does staging infra; production is user-run only (CLAUDE.md, settings.json deny rules).
-- Web staging Worker `finbook-web-staging` not deployed: Cloudflare login expired (user must run `pnpm --filter @app/web exec cf login`). Dry run passes.
-- `packages/db` (phase 1): Drizzle schema (`src/schema.ts`) + migrations `0000_init` (tables) and `0001_ledger_guarantees` (hand-written: RLS, `finbook_app` role, append-only triggers, period lock, deferred balance check, hash chain, `ledger_chain_breaks()`). `withTenant(apiPool, {tenantId, userId}, fn)` is the only way app code touches tenant data; the API logs in as `finbook_api` (non-superuser), migrations use the owner URL. 31 integration tests incl. the 10k fuzz gate and one per review finding. Open limit: chain tampering by a DB superuser needs an off-site anchor (backup manifest, phase 5). ADR 0006 explains the design. Not yet: `firm_access`, gapless numbers, period reopen, backup bundle versioning, packages/ledger posting rules (phase 2).
-- ADRs 0003 (scaled-bigint rates), 0004 (Drizzle), 0005 (TypeScript pinned to ~6.0.3 because typescript-eslint doesn't support 7 yet) written.
+## Waiting on the owner
 
-## Next
+- **Accountant sign-off** on the phase 2 worked example (or on the real C4 figures). This is the phase 2 gate.
+- **ADR 0008** (proposed): derive the FX pool from the ledger instead of the spec's `fx_pools` table, and confirm the reading of spec FX rule 5.
+- **Spec export**: tick "Prisma or Drizzle" (decided: Drizzle) and update the frontend skills line in the Claude Doc, then re-export (`docs/spec/` is not hand-edited).
+- **Browser steps** (`docs/deploy.md` → Open items): Cloudflare login (web staging deploy), Railway↔GitHub (auto-deploy), Railway healthcheck path, Sentry DSNs. GitHub Actions is billing-locked; the local pre-push gate replaces it (ADR 0007).
+- **Accountant sign-offs from the spec**: tax accounts, IAS 21 pool-vs-spot treatment, retention term.
+- The client workbook `EMM'S SHOP LEDGER.xlsx` sits in the repo root (git- and graphify-ignored). Move it out of the project folder.
 
-1. Phase 0 remainder: deploy web staging after the user logs in to Cloudflare; owner browser steps in `docs/deploy.md` → Open items (Railway↔GitHub, healthcheck path, GitHub billing, Sentry DSNs); Sentry in web (blocked: Sentry's Cloudflare Vite plugin needs a wrangler config, but vinext uses `cloudflare.config.ts`; options: `instrumentation.ts` hook supported by vinext, or a wrangler config. Needs a docs-backed decision); tenant id + request id tags on Sentry events once auth/request-ids exist (phase 1); Cloudflare + Railway deploys (need user accounts and env vars); confirm CI green after the first push; verify `vite dev` works locally (may need workerd approved).
-2. Then phase 1 prerequisites: Clerk JWT guard and tenancy in the api, `packages/db` (Drizzle), contracts, OpenAPI. Money keeps node:test (decided).
-2. `packages/money` still lacks: weighted-average pool maths (phase 2), currency exponent handling beyond 2-decimal currencies.
-3. Confirm CI is green on GitHub after the first push (including the worker's Redis test, never run locally); add the Testcontainers integration step when `packages/db` lands.
-4. Deploy targets (need accounts/env vars from the user): Clerk, Sentry, Cloudflare (vinext compatibility check, OpenNext fallback), Railway (api, worker, Postgres, Redis).
+## What exists
 
-## Open decisions / blockers
+- **Apps:** `apps/api` (NestJS 12, `GET /health`, Sentry), `apps/worker` (NestJS + BullMQ, `system` queue with a `ping` job, Sentry), `apps/web` (Next.js 16 on Cloudflare Workers via vinext, placeholder page). No auth or business endpoints yet.
+- **Packages:** `money`, `ledger`, `db` (Drizzle schema; migrations 0000–0004; `withTenant()`; `migrate()`).
+- **Database guarantees** (ADR 0006): API logs in as `finbook_api` (non-superuser) and runs as `finbook_app` under forced RLS; owner URL only for migrations. Balance at commit, append-only ledger and audit log, period lock, reversals mirror exactly, accounts frozen once posted to, FX checks, DB-stamped actor and time, audit rows, per-tenant hash chain with `ledger_chain_breaks()`. Known limit: chain tampering by a DB superuser needs an off-site anchor (backup manifest, phase 5).
+- **Tests:** money 9 and ledger 5 (100% branch coverage), api 2, worker 3 (1 needs Redis), db integration 35 (Testcontainers Postgres 18, needs Docker).
+- **Quality gate:** `.githooks/pre-push` runs install, lint, typecheck, unit, integration and build before every push (ADR 0007). Strict type-aware ESLint bans float money (`parseFloat`, `Number()`, `Math.round` and friends, `toFixed`).
+- **Staging (Railway project `finbook`, env `staging`):** Postgres 18, Redis, api (https://api-staging-c68d0388.up.railway.app/health), worker, and a one-off `migrate` service. Production environment exists, empty, owner-run only. Details: `docs/deploy.md`.
+- **Decisions:** ADRs 0001–0008 in `docs/decisions/`.
 
-- Network note: `pnpm add` and `pnpm view` work in the Claude session; `npm view` and curl hang. Use pnpm for registry lookups.
-- Push to GitHub still pending (user runs `git push -u origin main`).
+## Gotchas for the next session
 
-- Decided 2026-11-15: Drizzle (ADR 0004); FX rates as scaled bigint, no decimal lib (ADR 0003). Tick "Prisma or Drizzle" in the Claude Doc spec and re-export.
-- Spec line "Build standard" still names hasbiy-ui / impeccable / uiuxpromax / awesome-design.md; CLAUDE.md now names design-taste-frontend / frontend-design / ui-ux-pro-max. Spec is exported from the Claude Doc — update it there and re-export.
-- Live FX rate provider, pricing model, statutory FX treatment for clients (spec → Open decisions).
-- Accountant sign-offs: tax accounts, IAS 21 pool-vs-spot, retention term.
-
-## Session notes
-
-- (append one line per session: date, what changed, anything the next session must know)
+- `npm view` and curl hang in the Claude session; use `pnpm view` for registry lookups and the web fetch tool for docs.
+- The installed Railway CLI (5.41.2) ignores `railway environment edit --service-config`; build and start commands are set as `RAILPACK_*` variables.
+- Turborepo can restore stale `dist/` from cache; if a test runs twice, delete the app's `dist/` and run with `--force`.
+- TypeScript is pinned to `~6.0.3` until typescript-eslint supports 7 (ADR 0005).
+- Install scripts are denied by default in `pnpm-workspace.yaml` (`allowBuilds`); approve one only if something breaks without it.
+- Claude cannot read `fixtures/private/` (deny rule). Real client data never goes into committed code.
