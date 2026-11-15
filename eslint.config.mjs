@@ -17,7 +17,7 @@ export default tseslint.config(
   ...tseslint.configs.strictTypeChecked,
   {
     languageOptions: { parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname } },
-    rules: { ...noFloatMoney, '@typescript-eslint/no-non-null-assertion': 'error' },
+    rules: { ...noFloatMoney, '@typescript-eslint/no-non-null-assertion': 'error', '@typescript-eslint/no-extraneous-class': ['error', { allowWithDecorator: true }] },
   },
   // tests may use Number() for loop counts and PRNG plumbing, never for money amounts
   {
