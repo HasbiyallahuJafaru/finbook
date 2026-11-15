@@ -110,7 +110,12 @@ pnpm openapi                 # regenerate spec + typed web client
 pnpm --filter <pkg> <script> # scope to one package
 ```
 
-Never run migrations, seeds or deploys against staging or production from a Claude session.
+**Infrastructure and deploys (owner-authorized 2026-11-15, staging only):** Claude may create and deploy Railway, Cloudflare, Postgres and Redis resources for the **staging** environment. **Production is never touched from a Claude session**: no deploys, variables, migrations, seeds or SQL against it. The user runs production from `docs/deploy.md`. Rules:
+- Work only in the `staging` Railway environment and the `finbook-web-staging` Worker. If a command could target production (no environment flag, or the linked environment isn't staging), check first with `railway status`.
+- Never print, log or commit secret values. Set variables with `railway variable set`; never read them back (`railway variables`, `--json`, `--kv` and `railway run` are denied).
+- Migrations run on staging only, and forward-only. No seeds or manual SQL with real client data.
+- Every infra change is recorded in `docs/deploy.md` (what exists, how to recreate it) and `docs/PROGRESS.md`.
+- Stop and ask before anything that spends money beyond the base plan, deletes a resource, or changes a domain or DNS.
 
 ## How to work
 

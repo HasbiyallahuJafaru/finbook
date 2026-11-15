@@ -10,7 +10,11 @@
       "Bash(git log*)",
       "Bash(git show*)",
       "Bash(docker ps*)",
-      "Bash(python3 .claude/hooks/*)"
+      "Bash(python3 .claude/hooks/*)",
+      "Bash(railway status*)",
+      "Bash(railway whoami*)",
+      "Bash(railway list*)",
+      "Bash(railway logs*)"
     ],
     "ask": [
       "Bash(git push*)",
@@ -34,18 +38,21 @@
       "Read(./bundles/**)",
       "Bash(cat *.env*)",
       "Bash(printenv*)",
-      "Bash(railway up*)",
       "Bash(railway run*)",
-      "Bash(railway deploy*)",
-      "Bash(railway variables*)",
-      "Bash(wrangler deploy*)",
-      "Bash(npx wrangler deploy*)",
-      "Bash(pnpm wrangler deploy*)",
       "Bash(git push --force*)",
       "Bash(git push -f*)",
       "Bash(*prisma migrate reset*)",
       "Bash(*drizzle-kit push*)",
-      "Bash(rm -rf /*)"
+      "Bash(rm -rf /*)",
+      "Bash(railway variables)",
+      "Bash(railway variables --json*)",
+      "Bash(railway variables --kv*)",
+      "Bash(railway * --environment production*)",
+      "Bash(railway * -e production*)",
+      "Bash(railway environment production*)",
+      "Bash(railway environment prod*)",
+      "Bash(wrangler deploy*--env production*)",
+      "Bash(*finbook-web-production*)"
     ]
   },
   "hooks": {

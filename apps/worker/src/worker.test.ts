@@ -6,15 +6,16 @@ import { getQueueToken } from '@nestjs/bullmq';
 import { Queue, QueueEvents } from 'bullmq';
 import type { Job } from 'bullmq';
 import { AppModule } from './app.module.js';
-import { connectionFromUrl } from './redis.js';
+import { redisClient } from './redis.js';
 import { SystemProcessor } from './system.processor.js';
 
-test('connectionFromUrl parses host, port, auth and tls', () => {
-  assert.deepEqual(connectionFromUrl('redis://localhost'), { host: 'localhost', port: 6379 });
-  assert.deepEqual(connectionFromUrl('rediss://u:p%40ss@cache.example:6380'), {
-    host: 'cache.example', port: 6380, username: 'u', password: 'p@ss', tls: {},
-  });
-  assert.throws(() => connectionFromUrl('http://x'));
+test('redisClient reads host, port and password from the URL and sets the BullMQ options', () => {
+  const r = redisClient('redis://:p%40ss@cache.example:6380', { lazyConnect: true });
+  assert.equal(r.options.host, 'cache.example');
+  assert.equal(r.options.port, 6380);
+  assert.equal(r.options.password, 'p@ss');
+  assert.equal(r.options.maxRetriesPerRequest, null);
+  assert.equal(r.options.family, 0);
 });
 
 test('SystemProcessor answers ping and rejects unknown jobs', async () => {
@@ -26,7 +27,7 @@ test('SystemProcessor answers ping and rejects unknown jobs', async () => {
 // Real Redis: set REDIS_URL (CI provides a service container; locally `docker run -p 6379:6379 redis`).
 test('ping job round-trips through Redis', { skip: !process.env.REDIS_URL }, async () => {
   const app = await NestFactory.createApplicationContext(AppModule, { logger: false });
-  const events = new QueueEvents('system', { connection: connectionFromUrl(process.env.REDIS_URL ?? '') });
+  const events = new QueueEvents('system', { connection: redisClient(process.env.REDIS_URL ?? '') });
   try {
     const queue = app.get<Queue>(getQueueToken('system'));
     const job = await queue.add('ping', {});
