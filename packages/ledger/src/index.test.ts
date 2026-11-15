@@ -26,7 +26,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { convert, parseRate, type Pool } from '@app/money';
 import {
-  buyCurrency, completeAgentJob, completeClearingJob, customerReceipt, jobPosition, payFromPool, payPayableFromPool, revalue, sharedCost, spotCarCost, supplierInvoice, type Line,
+  arriveInYard, buyCurrency, completeAgentJob, completeClearingJob, convertToStock, customerReceipt, jobPosition, payFromPool, payPayableFromPool, revalue, sellStockCar,
+  refundStockDeposit, sharedCost, spotCarCost, stockDeposit, supplierInvoice, type Line,
 } from './index.ts';
 
 const FIXTURE_RATE_BUY_1 = parseRate('100.000000');
@@ -296,4 +297,99 @@ test('revaluation: losses on the pool, gains on payables, nothing to post when c
   assert.throws(() => revalue([{ ...item, balanceMinor: -1n }]), /cannot be negative/);
   assert.throws(() => revalue([{ ...item, closingRate: 0n }]), /closing rate must be positive/);
   assert.throws(() => revalue([item, item]), /CNY pool is listed twice/);
+});
+
+// EMM-funded stock (principal accounting, ADR 0001, ADR 0012), worked by hand. Pool CNY 150,000.00 at NGN 16,000,000.00.
+//  1. EMM pays the China supplier CNY 30,000.00 for car S from the pool: 16,000,000.00 x 30/150 = NGN 3,200,000.00 -> Dr 1200 S
+//  2. Form M for car S, NGN 500,000.00 paid in cash                                                      -> Dr 1200 S
+//  3. Car S reaches the yard: its NGN 3,700,000.00 in transit moves to 1210
+//  4. A buyer pays a deposit of NGN 2,000,000.00 (2100, customer deposits)
+//  5. Sold for NGN 4,500,000.00: Dr 2100 2,000,000.00 + Dr 1100 2,500,000.00 / Cr 4000 4,500,000.00 (gross),
+//     and the full landed cost Dr 5000 / Cr 1210 3,700,000.00 -> gross profit NGN 800,000.00, all inventory cleared.
+// Convert to stock (owner 2026-11-15: an abandoned job's customer funds are refunded, never forfeited): job A had
+// NGN 4,266,666.67 + 1,316,666.67 = 5,583,333.34 capitalized in 1150 and NGN 6,000,000.00 held in 2150 ->
+// Dr 1200 A / Cr 1150 A 5,583,333.34, and Dr 2150 / Cr 1000 6,000,000.00 back to the customer.
+const stockPool = { balanceMinor: 15_000_000n, costNgn: 1_600_000_000n };
+const buyer = { vehicleId: 'S', counterpartyId: 'buyer-S' };
+// More paid back to a customer than was held for them (a mistake the rule must refuse to build on).
+const ngnRefund = (v: string, amount: bigint): Line[] => [
+  { account: '2150', debit: amount, credit: 0n, currency: 'NGN', amountMinor: amount, vehicleId: v, counterpartyId: `customer-${v}` },
+  { account: '1000', debit: 0n, credit: amount, currency: 'NGN', amountMinor: amount },
+];
+
+test('worked example: an EMM-funded stock car from purchase to gross sale, to the kobo', () => {
+  const entries: Line[][] = [];
+  entries.push(payFromPool({ pool: stockPool, currency: 'CNY', amountMinor: 3_000_000n, vehicleId: 'S', spot: SPOT_CBN, funding: 'emm_funded' }).lines);
+  entries.push(sharedCost({ amountNgn: 50_000_000n, vehicleIds: ['S'], funding: 'emm_funded' }));
+  assert.deepEqual(only(entries.flat().filter((l) => l.account === '1200')), [['1200', 320_000_000n, 0n, 'S'], ['1200', 50_000_000n, 0n, 'S']]);
+  entries.push(arriveInYard({ vehicleId: 'S', history: entries.flat() }));
+  assert.deepEqual(only(entries[2] ?? []), [['1210', 370_000_000n, 0n, 'S'], ['1200', 0n, 370_000_000n, 'S']]);
+  entries.push(stockDeposit({ ...buyer, amountNgn: 200_000_000n }));
+  const sale = sellStockCar({ ...buyer, priceNgn: 450_000_000n, history: entries.flat() });
+  assert.deepEqual(only(sale), [['2100', 200_000_000n, 0n, 'S'], ['1100', 250_000_000n, 0n, 'S'], ['4000', 0n, 450_000_000n, 'S'], ['5000', 370_000_000n, 0n, 'S'], ['1210', 0n, 370_000_000n, 'S']]);
+  entries.push(sale);
+  assert.ok(entries.every(balanced));
+  const b = balances(entries.flat());
+  assert.deepEqual([b['1200'], b['1210'], b['2100'], b['1100'], b['4000'], b['5000']], [0n, 0n, 0n, 250_000_000n, -450_000_000n, 370_000_000n]);
+  assert.equal(-(b['4000'] ?? 0n) - (b['5000'] ?? 0n), 80_000_000n, 'gross profit NGN 800,000.00');
+  assert.equal(entries.flat().filter((l) => ['1150', '2150', '4100', '4200'].includes(l.account)).length, 0, 'no agent accounts touched');
+});
+
+test('EMM-funded guards: in transit, nothing to move, deposits over the price; supplier invoices capitalize to 1200 too', () => {
+  const paid = payFromPool({ pool: stockPool, currency: 'CNY', amountMinor: 3_000_000n, vehicleId: 'S', spot: SPOT_CBN, funding: 'emm_funded' }).lines;
+  assert.throws(() => sellStockCar({ ...buyer, priceNgn: 450_000_000n, history: paid }), /still in transit/);
+  assert.throws(() => arriveInYard({ vehicleId: 'S', history: [] }), /in-transit cost must be positive/);
+  const inYard = [...paid, ...arriveInYard({ vehicleId: 'S', history: paid })];
+  assert.throws(() => sellStockCar({ ...buyer, priceNgn: 0n, history: inYard }), /price must be positive/);
+  assert.throws(() => sellStockCar({ ...buyer, priceNgn: 450_000_000n, history: [] }), /cost in the yard must be positive/);
+  assert.throws(() => sellStockCar({ ...buyer, priceNgn: 100_000_000n, history: [...inYard, ...stockDeposit({ ...buyer, amountNgn: 200_000_000n })] }), /deposits exceed the price/);
+  assert.throws(() => stockDeposit({ ...buyer, amountNgn: 0n }), /deposit must be positive/);
+  const invoice = supplierInvoice({ ...supplier, vehicleId: 'S', currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN, funding: 'emm_funded' });
+  assert.deepEqual(only(invoice)[0], ['1200', 210_000_000n, 0n, 'S']);
+  // A sale with no deposit is all receivable.
+  assert.deepEqual(only(sellStockCar({ ...buyer, priceNgn: 450_000_000n, history: inYard })).slice(0, 2), [['1100', 450_000_000n, 0n, 'S'], ['4000', 0n, 450_000_000n, 'S']]);
+});
+
+test('convert to stock: the abandoned job\'s cost becomes inventory and the customer is repaid in full', () => {
+  const history: Line[] = [
+    ...customerReceipt({ ...job('A'), amountNgn: 600_000_000n }),
+    ...payFromPool({ pool: stockPool, currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines,
+    ...sharedCost({ amountNgn: 131_666_667n, vehicleIds: ['A'] }),
+  ];
+  const c = convertToStock({ ...job('A'), history });
+  assert.deepEqual(only(c), [['1200', 558_333_334n, 0n, 'A'], ['1150', 0n, 558_333_334n, 'A'], ['2150', 600_000_000n, 0n, 'A'], ['1000', 0n, 600_000_000n, null]]);
+  assert.ok(balanced(c));
+  const after = balances([...history, ...c]);
+  assert.deepEqual([after['1150'], after['2150'], after['1200']], [0n, 0n, 558_333_334n]);
+  // Nothing held yet (the customer hadn't paid): only the cost moves.
+  const unpaid = history.filter((l) => l.account !== '2150' && !(l.account === '1000' && l.debit > 0n));
+  assert.deepEqual(only(convertToStock({ ...job('A'), history: unpaid })).map((r) => r[0]), ['1200', '1150']);
+  assert.throws(() => convertToStock({ ...job('A'), history: customerReceipt({ ...job('A'), amountNgn: 1n }) }), /job cost must be positive/);
+  assert.throws(() => convertToStock({ ...job('A'), history: [...history, ...ngnRefund('A', 700_000_000n)] }), /negative/);
+});
+
+test('a car is a job or stock, never both; deposits belong to their buyer and can be refunded', () => {
+  const paid = payFromPool({ pool: stockPool, currency: 'CNY', amountMinor: 3_000_000n, vehicleId: 'S', spot: SPOT_CBN, funding: 'emm_funded' }).lines;
+  const quote = { currency: 'CNY', sellingMinor: 3_500_000n, rate: FIXTURE_RATE_QUOTE, landingChargeNgn: 0n };
+  assert.throws(() => completeAgentJob({ ...buyer, quote, history: paid }), /this car is EMM stock/);
+  assert.throws(() => completeClearingJob({ ...buyer, landingChargeNgn: 1n, history: paid }), /this car is EMM stock/);
+  assert.throws(() => convertToStock({ ...buyer, history: paid }), /this car is EMM stock/);
+  // A completed agent job can't be converted afterwards (it would be sold twice).
+  const jobA = [...customerReceipt({ ...job('A'), amountNgn: 600_000_000n }), ...payFromPool({ pool: stockPool, currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines];
+  const done = completeAgentJob({ ...job('A'), quote: quoteA, history: jobA }).lines;
+  assert.throws(() => convertToStock({ ...job('A'), history: [...jobA, ...done, ...sharedCost({ amountNgn: 1n, vehicleIds: ['A'] })] }), /already completed/);
+  // Buyer B1 put down a deposit and walked away; B2 buys: B1's deposit isn't B2's, and B1 gets theirs back.
+  const inYard = [...paid, ...arriveInYard({ vehicleId: 'S', history: paid })];
+  const b1 = { vehicleId: 'S', counterpartyId: 'buyer-1' };
+  const withB1 = [...inYard, ...stockDeposit({ ...b1, amountNgn: 200_000_000n })];
+  assert.deepEqual(only(sellStockCar({ ...buyer, priceNgn: 450_000_000n, history: withB1 })).slice(0, 2), [['1100', 450_000_000n, 0n, 'S'], ['4000', 0n, 450_000_000n, 'S']]);
+  assert.deepEqual(only(refundStockDeposit({ ...b1, amountNgn: 200_000_000n, history: withB1 })), [['2100', 200_000_000n, 0n, 'S'], ['1000', 0n, 200_000_000n, null]]);
+  assert.throws(() => refundStockDeposit({ ...b1, amountNgn: 200_000_001n, history: withB1 }), /refund exceeds what this buyer paid/);
+  assert.throws(() => refundStockDeposit({ ...buyer, amountNgn: 1n, history: withB1 }), /refund exceeds what this buyer paid/);
+  assert.throws(() => refundStockDeposit({ ...b1, amountNgn: 0n, history: withB1 }), /refund must be positive/);
+});
+
+test('a clearing-only job is the customer\'s own car: it cannot become stock', () => {
+  const clearing = [...customerReceipt({ ...job('K'), amountNgn: 200_000_000n }), ...sharedCost({ amountNgn: 150_000_000n, vehicleIds: ['K'] })];
+  assert.throws(() => convertToStock({ ...job('K'), history: clearing }), /clearing-only job is the customer's own car/);
 });

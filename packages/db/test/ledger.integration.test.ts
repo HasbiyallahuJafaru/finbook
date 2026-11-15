@@ -7,7 +7,9 @@ import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testconta
 import pg from 'pg';
 import { convert, formatRate, parseRate, RATE_SCALE } from '@app/money';
 import {
-  buyCurrency, completeAgentJob, customerReceipt, payFromPool, payPayableFromPool, revalue, sharedCost, supplierInvoice, type Line as LedgerLine, type RevaluationItem,
+  arriveInYard, buyCurrency, completeAgentJob, convertToStock, customerReceipt, payFromPool, payPayableFromPool, refundStockDeposit, revalue, sellStockCar, sharedCost, stockDeposit,
+  supplierInvoice,
+  type Line as LedgerLine, type RevaluationItem,
 } from '@app/ledger';
 import { migrate, withTenant, type Actor, type Tx } from '../src/index.ts';
 
@@ -87,7 +89,8 @@ async function freshTenant(name: string): Promise<{ id: string; period: string }
     for (const [code, type, currency] of [['1000', 'asset', null], ['1010', 'asset', null], ['1020', 'asset', 'CNY'], ['2000', 'liability', null], ['3000', 'equity', null],
       ['4000', 'income', null], ['5000', 'expense', null], ['6000', 'expense', null], ['7000', 'income', null],
       ['1100', 'asset', null], ['1150', 'asset', null], ['2150', 'liability', null], ['4100', 'income', null], ['4200', 'income', null],
-      ['1019', 'asset', null], ['2009', 'liability', null], ['7100', 'income', null]] as const) {
+      ['1019', 'asset', null], ['2009', 'liability', null], ['7100', 'income', null],
+      ['1200', 'asset', null], ['1210', 'asset', null], ['2100', 'liability', null]] as const) {
       ids[code] = await one(t.client, 'INSERT INTO accounts (tenant_id, code, name, type, currency) VALUES ($1, $2, $3, $4, $5) RETURNING id',
         [id, code, `Account ${code}`, type, currency]);
     }
@@ -746,6 +749,200 @@ describe('phase 2: posting rules through the database', () => {
     await postRevaluation(id, period, feb, good);
   });
 
+  /** One car's ledger history, read back from the database (what the API will hand the posting rules). */
+  const customerKey = Object.fromEntries(['A', 'B', 'C'].map((k) => [customer(k), k]));
+  const historyOf = (tenant: string, v: string) => tx(tenant, async (t) => (await t.client.query<{ code: string; debit_ngn: string; credit_ngn: string; currency: string; amount_minor: string; counterparty_id: string | null }>(
+    'SELECT a.code, l.debit_ngn, l.credit_ngn, l.currency, l.amount_minor, l.counterparty_id FROM journal_lines l JOIN accounts a ON a.id = l.account_id WHERE l.vehicle_id = $1', [car[v]])).rows
+    .map((r): LedgerLine => ({ account: r.code, debit: BigInt(r.debit_ngn), credit: BigInt(r.credit_ngn), currency: r.currency.trim(), amountMinor: BigInt(r.amount_minor), vehicleId: v,
+      ...(r.counterparty_id && { counterpartyId: customerKey[r.counterparty_id] ?? r.counterparty_id }) })));
+  const ngnOn = (account: string, signed: bigint, vehicleId?: string, counterpartyId?: string): LedgerLine => ({
+    account, debit: signed > 0n ? signed : 0n, credit: signed < 0n ? -signed : 0n, currency: 'NGN', amountMinor: signed < 0n ? -signed : signed,
+    ...(vehicleId && { vehicleId }), ...(counterpartyId && { counterpartyId }),
+  });
+  const swap = (lines: LedgerLine[]) => lines.map((l) => ({ ...l, debit: l.credit, credit: l.debit }));
+
+  test('a car is a customer-funded job or EMM stock, never both (ledger audit of 0008)', async () => {
+    const { id, period } = await funded('Job or stock');
+    // Job A: the customer pays, EMM pays the supplier; its completion is worked out now, before anything else happens.
+    await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 600_000_000n }));
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
+    const completion = completeAgentJob({ ...job('A'), quote: { currency: 'CNY', sellingMinor: 4_500_000n, rate: parseRate('110.000000'), landingChargeNgn: 0n }, history: await historyOf(id, 'A') }).lines; // FIXTURE_RATE_QUOTE
+    // Posting it as stock straight away is refused; converting first is the way.
+    await assert.rejects(postLines(id, period, sharedCost({ amountNgn: 1_000n, vehicleIds: ['A'], funding: 'emm_funded' })), /customer-funded job: convert it to stock before/);
+    const conversion = convertToStock({ ...job('A'), history: await historyOf(id, 'A') });
+    await assert.rejects(postLines(id, period, conversion.filter((l) => l.account !== '2150' && l.account !== '1000')), /repays the customer's whole funds held/); // no refund: a forfeit
+    await assert.rejects(postLines(id, period, conversion.map((l) => (l.account === '1200' || l.account === '1150' ? { ...l, debit: l.debit / 2n, credit: l.credit / 2n, amountMinor: l.amountMinor / 2n } : l))),
+      /moves the job's whole cost/); // half the cost
+    await postLines(id, period, conversion);
+    // Now stock: the agent completion worked out earlier is refused, and so is any agent cost.
+    await assert.rejects(postLines(id, period, completion), /job costs \(1150\).*never cross zero/); // its 1150 moved to stock
+    await assert.rejects(postLines(id, period, sharedCost({ amountNgn: 1_000n, vehicleIds: ['A'] })), /EMM stock \(EMM-funded or converted\): it takes no customer-funded postings/);
+    // One payment split across both sides for car B: refused.
+    const split = payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'B', spot: SPOT_CBN }).lines
+      .flatMap((l) => (l.account === '1150' ? [{ ...l, debit: l.debit / 2n, amountMinor: l.amountMinor / 2n }, { ...l, account: '1200', debit: l.debit - l.debit / 2n, amountMinor: l.amountMinor - l.amountMinor / 2n }] : [l]));
+    await assert.rejects(postLines(id, period, split), /never both in one entry/);
+    // A completed job can't be converted afterwards, even with a late cost to move.
+    await postLines(id, period, customerReceipt({ ...job('B'), amountNgn: 100_000_000n }));
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'B', spot: SPOT_CBN }).lines);
+    await postLines(id, period, completeAgentJob({ ...job('B'), quote: { currency: 'CNY', sellingMinor: 1_100_000n, rate: parseRate('110.000000'), landingChargeNgn: 0n }, history: await historyOf(id, 'B') }).lines);
+    await postLines(id, period, sharedCost({ amountNgn: 1n, vehicleIds: ['B'] }));
+    await assert.rejects(postLines(id, period, [ngnOn('1200', 1n, 'B'), ngnOn('1150', -1n, 'B')]), /only an open customer-funded job/);
+  });
+
+  test('a reversed mistake leaves the car as it was; no car pays for another; a clearing job never becomes stock (ledger audit of 0008, round 3)', async () => {
+    const { id, period } = await funded('Reversed mistakes');
+    // Job A, converted in error, then the convert reversed: A is an open job again and completes normally.
+    await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 600_000_000n }));
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
+    const conversion = convertToStock({ ...job('A'), history: await historyOf(id, 'A') });
+    const conversionId = await postLines(id, period, conversion);
+    await postLines(id, period, swap(conversion), { reverses: conversionId });
+    // While open, A's funds can't be paid out beyond what is held, and A's costs can't pay for another car's inventory.
+    await assert.rejects(postLines(id, period, [ngnOn('2150', 600_000_001n, 'A', 'A'), ngnOn('1000', -600_000_001n)]), /funds held \(2150\) never cross zero/);
+    await assert.rejects(postLines(id, period, [ngnOn('1150', 100n), ngnOn('1000', -100n)]), /every job-cost, funds-held and inventory line \(1150, 2150, 1200, 1210\) names its car/);
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'C', spot: SPOT_CBN, funding: 'emm_funded' }).lines);
+    await assert.rejects(postLines(id, period, [ngnOn('1200', 100_000_000n, 'C'), ngnOn('1150', -100_000_000n, 'A')]), /the same car's job costs when converting/);
+    await postLines(id, period, completeAgentJob({ ...job('A'), quote: { currency: 'CNY', sellingMinor: 4_500_000n, rate: parseRate('110.000000'), landingChargeNgn: 0n }, history: await historyOf(id, 'A') }).lines);
+    // Car C is stock: agent income for it is refused even with nothing to cross zero.
+    await assert.rejects(postLines(id, period, [ngnOn('1100', 100n, 'C', 'C'), ngnOn('4100', -100n, 'C')]), /EMM stock \(EMM-funded or converted\): it takes no customer-funded postings/);
+    // Car B: its first cost posted as EMM-funded by mistake and reversed; B is then an ordinary customer job.
+    const slip = sharedCost({ amountNgn: 50_000_000n, vehicleIds: ['B'], funding: 'emm_funded' });
+    const slipId = await postLines(id, period, slip);
+    await postLines(id, period, swap(slip), { reverses: slipId });
+    await postLines(id, period, customerReceipt({ ...job('B'), amountNgn: 300_000_000n }));
+    await postLines(id, period, sharedCost({ amountNgn: 150_000_000n, vehicleIds: ['B'] })); // clearing-only: no supplier payment for B
+    // A clearing-only job is the customer's own car: no conversion to stock. (The ledger rule refuses it too.)
+    await assert.rejects(postLines(id, period, [ngnOn('1200', 150_000_000n, 'B'), ngnOn('1150', -150_000_000n, 'B'), ngnOn('2150', 300_000_000n, 'B', 'B'), ngnOn('1000', -300_000_000n)]),
+      /only a car EMM paid the supplier for can be converted/);
+  });
+
+  test('a job completed at a zero cut stays completed; a conversion is undone only after the stock steps after it (ledger audit of 0008, round 4)', async () => {
+    const { id, period } = await funded('Zero cut');
+    // Job A sold to the customer at exactly the car's quote-rate cost with no landing charge: no 4100/4200 line at all.
+    await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 600_000_000n }));
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
+    const zeroCut = completeAgentJob({ ...job('A'), quote: { currency: 'CNY', sellingMinor: 4_000_000n, rate: parseRate('110.000000'), landingChargeNgn: 0n }, history: await historyOf(id, 'A') }).lines;
+    assert.equal(zeroCut.filter((l) => l.account === '4100' || l.account === '4200').length, 0);
+    await postLines(id, period, zeroCut);
+    await postLines(id, period, sharedCost({ amountNgn: 1n, vehicleIds: ['A'] })); // a late kobo of cost
+    // The ledger rule can't see the completion (no 4100/4200), so the database is the guard: the delivered car never becomes stock.
+    await assert.rejects(postLines(id, period, convertToStock({ ...job('A'), history: await historyOf(id, 'A') })), /only an open customer-funded job/);
+    // Job B converted, then a Form M posted for it as stock: the conversion can only be undone after the Form M.
+    await postLines(id, period, customerReceipt({ ...job('B'), amountNgn: 300_000_000n }));
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 2_000_000n, vehicleId: 'B', spot: SPOT_CBN }).lines);
+    const conversion = convertToStock({ ...job('B'), history: await historyOf(id, 'B') });
+    const conversionId = await postLines(id, period, conversion);
+    const formM = sharedCost({ amountNgn: 50_000_000n, vehicleIds: ['B'], funding: 'emm_funded' });
+    const formMId = await postLines(id, period, formM);
+    await assert.rejects(postLines(id, period, swap(conversion), { reverses: conversionId }), /undo the car's later stock postings before reversing its conversion/);
+    await postLines(id, period, swap(formM), { reverses: formMId });
+    await postLines(id, period, swap(conversion), { reverses: conversionId });
+    await postLines(id, period, completeAgentJob({ ...job('B'), quote: { currency: 'CNY', sellingMinor: 2_200_000n, rate: parseRate('110.000000'), landingChargeNgn: 0n }, history: await historyOf(id, 'B') }).lines);
+  });
+
+  test('a conversion repays the customer in cash, exactly: none of it diverted (ledger audit of 0008, round 3)', async () => {
+    const { id, period } = await funded('Convert diversion');
+    await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 600_000_000n }));
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
+    const conversion = convertToStock({ ...job('A'), history: await historyOf(id, 'A') });
+    const diverted = [...conversion.filter((l) => l.account !== '1000'), ngnOn('1000', -100_000_000n), ngnOn('2000', -500_000_000n, undefined, SUPPLIER)];
+    await assert.rejects(postLines(id, period, diverted), /repays the customer's whole funds held \(2150\), nothing else/);
+    await postLines(id, period, conversion);
+  });
+
+  test('inventory only from real costs; corrections undo later steps first; deposits stay with their buyer (ledger audit of 0008)', async () => {
+    const { id, period } = await funded('Stock corrections');
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 3_000_000n, vehicleId: 'C', spot: SPOT_CBN, funding: 'emm_funded' }).lines);
+    // A "cost" conjured from equity or income: refused.
+    await assert.rejects(postLines(id, period, [ngnOn('1200', 100_000_000n, 'C'), ngnOn('3000', -100_000_000n)]), /paid for only from the pool \(1010\), payables \(2000\), cash \(1000\)/);
+    const formM = sharedCost({ amountNgn: 50_000_000n, vehicleIds: ['C'], funding: 'emm_funded' });
+    const formMId = await postLines(id, period, formM);
+    const arrival = arriveInYard({ vehicleId: 'C', history: await historyOf(id, 'C') });
+    const arrivalId = await postLines(id, period, arrival);
+    // The Form M was wrong: reversing it now would leave transit below zero. Reverse the arrival first, then the Form M, then arrive again.
+    await assert.rejects(postLines(id, period, swap(formM), { reverses: formMId }), /never cross zero: undo later steps first/);
+    await postLines(id, period, swap(arrival), { reverses: arrivalId });
+    await postLines(id, period, swap(formM), { reverses: formMId });
+    await postLines(id, period, arriveInYard({ vehicleId: 'C', history: await historyOf(id, 'C') }));
+    // Customer A put down a deposit and walked away; customer B buys. A's deposit can't pay for B's car, and goes back to A.
+    await assert.rejects(postLines(id, period, [ngnOn('1000', 1_000n), ngnOn('2100', -1_000n, 'C')]), /every deposit line \(2100\) its car and buyer/);
+    await postLines(id, period, stockDeposit({ ...job('A'), vehicleId: 'C', amountNgn: 200_000_000n }));
+    const sale = sellStockCar({ ...job('B'), vehicleId: 'C', priceNgn: 450_000_000n, history: await historyOf(id, 'C') });
+    assert.equal(sale.find((l) => l.account === '1100')?.debit, 450_000_000n, 'B owes the whole price');
+    await assert.rejects(postLines(id, period, [ngnOn('2100', 200_000_000n, 'C', 'B'), ...sale.map((l) => (l.account === '1100' ? { ...l, debit: 250_000_000n, amountMinor: 250_000_000n } : l))]),
+      /a buyer's deposit \(2100\) is used or repaid only up to what that buyer paid/);
+    await postLines(id, period, sale);
+    await postLines(id, period, refundStockDeposit({ ...job('A'), vehicleId: 'C', amountNgn: 200_000_000n, history: await historyOf(id, 'C') }));
+    const net = await netOf(id);
+    assert.deepEqual([net['1200'], net['1210'], net['2100'], net['4000'], net['5000']], [0n, 0n, 0n, -450_000_000n, 320_000_000n]);
+  });
+  const netOf = (tenant: string) => tx(tenant, async (t) => Object.fromEntries((await t.client.query<{ code: string; net: string }>(
+    'SELECT a.code, sum(l.debit_ngn - l.credit_ngn)::text AS net FROM journal_lines l JOIN accounts a ON a.id = l.account_id GROUP BY a.code')).rows.map((r) => [r.code, BigInt(r.net)])));
+
+  // EMM-funded stock car C (principal, ADR 0012), the ledger package's worked example through Postgres: CNY 30,000.00 from a
+  // pool at 16,000,000.00 / 150,000.00 = NGN 3,200,000.00, Form M NGN 500,000.00, to the yard at 3,700,000.00, deposit
+  // 2,000,000.00, sold for 4,500,000.00 -> gross profit NGN 800,000.00, inventory cleared.
+  test('worked example: an EMM-funded stock car through the database, to the kobo', async () => {
+    const { id, period } = await funded('Stock car');
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 3_000_000n, vehicleId: 'C', spot: SPOT_CBN, funding: 'emm_funded' }).lines);
+    await postLines(id, period, sharedCost({ amountNgn: 50_000_000n, vehicleIds: ['C'], funding: 'emm_funded' }));
+    await postLines(id, period, arriveInYard({ vehicleId: 'C', history: await historyOf(id, 'C') }));
+    await postLines(id, period, stockDeposit({ ...job('C'), amountNgn: 200_000_000n }));
+    await postLines(id, period, sellStockCar({ ...job('C'), priceNgn: 450_000_000n, history: await historyOf(id, 'C') }));
+    const net = await netOf(id);
+    assert.deepEqual([net['1200'], net['1210'], net['2100'], net['1100'], net['4000'], net['5000']], [0n, 0n, 0n, 250_000_000n, -450_000_000n, 370_000_000n]);
+    assert.equal(net['1150'] ?? 0n, 0n, 'no agent cost account touched');
+    const tb = await trialBalance(id);
+    assert.equal(tb.dr - tb.cr, 0n);
+    assert.deepEqual(await chainBreaks(id), []);
+  });
+
+  test('the app can execute no privileged (definer) function except the ones meant for it (security review of 0008)', async () => {
+    // A definer function runs as the owner, past RLS: one the app could call would read or lock any tenant. Trigger functions
+    // can't be called directly. Any new check function must have EXECUTE revoked, or this list changes and the test fails.
+    // Every role but the owner (superuser): the app, the API and rates logins, and any role added later.
+    const callable = await owner<{ who: string }>(
+      `SELECT r.rolname || ': ' || p.proname AS who FROM pg_roles r CROSS JOIN pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE NOT r.rolsuper AND n.nspname = 'public' AND p.prosecdef AND p.prorettype <> 'trigger'::regtype AND has_function_privilege(r.oid, p.oid, 'EXECUTE') ORDER BY 1`);
+    assert.deepEqual(callable.rows.map((r) => r.who), []);
+  });
+
+  test('inventory moves only whole: arrival, sale with revenue, every line naming its car', async () => {
+    const { id, period } = await funded('Stock guards');
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 3_000_000n, vehicleId: 'C', spot: SPOT_CBN, funding: 'emm_funded' }).lines);
+    const ngnLine = (account: string, signed: bigint, vehicleId?: string): LedgerLine =>
+      ({ account, debit: signed > 0n ? signed : 0n, credit: signed < 0n ? -signed : 0n, currency: 'NGN', amountMinor: signed < 0n ? -signed : signed, ...(vehicleId && { vehicleId }) });
+    await assert.rejects(postLines(id, period, [ngnLine('1200', 100n), ngnLine('1000', -100n)]), /1200, 1210\) names its car/);
+    // Half the car to the yard: refused. All of it: fine.
+    await assert.rejects(postLines(id, period, [ngnLine('1210', 160_000_000n, 'C'), ngnLine('1200', -160_000_000n, 'C')]), /leaves transit \(1200\) only by moving its whole cost/);
+    // Out of transit into an expense instead of the yard: refused.
+    await assert.rejects(postLines(id, period, [ngnLine('6000', 320_000_000n), ngnLine('1200', -320_000_000n, 'C')]), /leaves transit \(1200\) only by moving its whole cost/);
+    await postLines(id, period, arriveInYard({ vehicleId: 'C', history: await historyOf(id, 'C') }));
+    // Written off to cost of sales without a sale, or sold at part of its cost: refused.
+    await assert.rejects(postLines(id, period, [ngnLine('5000', 320_000_000n, 'C'), ngnLine('1210', -320_000_000n, 'C')]), /leaves the yard \(1210\) only when sold/);
+    const sale = sellStockCar({ ...job('C'), priceNgn: 450_000_000n, history: await historyOf(id, 'C') });
+    await assert.rejects(postLines(id, period, sale.map((l) => (l.account === '5000' ? { ...l, debit: l.debit - 1n, amountMinor: l.amountMinor - 1n } : l.account === '1210' ? { ...l, credit: l.credit - 1n, amountMinor: l.amountMinor - 1n } : l))),
+      /leaves the yard \(1210\) only when sold/);
+    // A late in-transit cost after arrival must reach the yard before the car can be sold.
+    await postLines(id, period, sharedCost({ amountNgn: 1_000n, vehicleIds: ['C'], funding: 'emm_funded' }));
+    await assert.rejects(postLines(id, period, sale), /nothing left in transit/);
+  });
+
+  test('convert to stock through the database: the job\'s cost becomes inventory and the customer is repaid in full', async () => {
+    const { id, period } = await funded('Convert to stock');
+    await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 600_000_000n }));
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
+    await postLines(id, period, sharedCost({ amountNgn: 131_666_667n, vehicleIds: ['A'] }));
+    await postLines(id, period, convertToStock({ ...job('A'), history: await historyOf(id, 'A') }));
+    const net = await netOf(id);
+    assert.deepEqual([net['1150'], net['2150'], net['1200']], [0n, 0n, 558_333_334n], 'NGN 5,583,333.34 is now EMM stock; the customer got back NGN 6,000,000.00');
+    // The converted car then goes the stock way: to the yard and sold.
+    await postLines(id, period, arriveInYard({ vehicleId: 'A', history: await historyOf(id, 'A') }));
+    await postLines(id, period, sellStockCar({ ...job('A'), priceNgn: 600_000_000n, history: await historyOf(id, 'A') }));
+    const after = await netOf(id);
+    assert.deepEqual([after['1200'], after['1210'], after['4000'], after['5000']], [0n, 0n, -600_000_000n, 558_333_334n]);
+  });
+
   const periodFor = (tenant: string, starts: string, ends: string) =>
     tx(tenant, (t) => one(t.client, 'INSERT INTO periods (tenant_id, starts_on, ends_on) VALUES ($1, $2, $3) RETURNING id', [tenant, starts, ends]));
 
@@ -952,8 +1149,8 @@ describe('phase 1 gate', () => {
   test('10k random entries: trial balance nets to zero, chain intact, invalid entries all refused', { timeout: 900_000 }, async () => {
     let seed = 20260115n;
     const rnd = (max: bigint) => ((seed = (seed * 6364136223846793005n + 1442695040888963407n) % 2n ** 64n), (seed >> 11n) % max);
-    // 2150, not 2000: an unnamed NGN debit on payables is refused (it must name the supplier and stay within what's owed).
-    const ngnCodes = ['1000', '2150', '3000', '4000', '5000', '6000', '7000'];
+    // No 2000 or 2150: an unnamed NGN line on payables, or on customer funds held, is refused (they name a supplier or a car).
+    const ngnCodes = ['1000', '3000', '4000', '5000', '6000', '7000'];
     const pick = () => ngnCodes[Number(rnd(BigInt(ngnCodes.length)))] ?? '1000';
 
     // Random balanced entry: 1-3 lines on one side (NGN, or CNY into the pool 1010), the same total

@@ -6,9 +6,11 @@ _Last updated: 2026-11-15_
 
 ## Start here (next session)
 
-1. **Month-end revaluation is done:** migration 0007, `revalue()`, ADR 0011; ledger audit and security review both PASS WITH NOTES. Committed on branch `phase2-revaluation` (pushed, not merged to `main`). **Next: the `emm_funded` slice.**
+1. **EMM-funded (principal) slice is built, uncommitted:** migration 0008, ledger rules, ADR 0012. Ledger audit (round 4) and security review both PASS WITH NOTES. Next: owner OK to commit, push and apply 0008 to staging. Revaluation (0007) is committed on branch `phase2-revaluation` (pushed, not merged to `main`); this slice sits on the same branch.
 2. **Staging is on 0000–0007** (0007 applied 2026-11-15, which also closed the early-check bypass 0006 had) and the worker has `RATES_DATABASE_URL` (the `finbook_rates` login). **Still to check:** after 10:30 Lagos on 2026-11-16, the worker logs show the snapshot ran and `fx_reference_rates` has cbn and market rows.
-3. **Owner decisions open** (details in the pass 4–6 audit doc): (a) **spec conflict, FX rule 5**: 0006 lets currency leave the pool only for one car or an invoice settlement, so selling leftover RMB, RMB bank charges and car-less RMB costs are refused until each gets an entry type, or an ADR scopes them out; (b) top-up payment after a settled invoice: allow both ways or neither; (c) credit notes/discounts on foreign invoices; (d) evidence mandatory vs "evidence pending". And: build a clickable design prototype with sample data (no backend) to see the UI now, or carry on with the backend (emm_funded next)? The real web app is still a placeholder page.
+3. **Owner rulings (2026-11-15), to build with job_orders in the endpoints slice:** (a) an abandoned job's customer funds are always refunded, never forfeited (ADR 0012, already enforced in a conversion); (b) **converting a job to stock needs a firm reviewer's approval**, like an EMM-funded supplier payment, and shows on the exception report. The database refuses a conversion without an approved request once job_orders and approvals exist; until then no endpoint may post one.
+4. **Open, for the accountant: cost of sales basis for EMM-funded stock cars.** The books carry a stock car at pool cost (the naira the pool actually spent), so 5000 Cost of vehicles sold is pool basis. Client reports show the spot basis (ADR 0009: each foreign cost at the CBN spot rate on its own day), so a stock car's gross profit in client reports would be price minus spot cost, and differ from the books by the gap between pool and spot. Options: (i) keep the books at pool and show spot cost of sales in client reports with a reconciling line (current design); (ii) book stock cars at spot and post the gap to 7000 when the pool pays (IAS 21 style, changes the posting rules); (iii) show both. The accountant decides; the stored data supports all three.
+5. **Owner decisions open** (details in the pass 4–6 audit doc): (a) **spec conflict, FX rule 5**: 0006 lets currency leave the pool only for one car or an invoice settlement, so selling leftover RMB, RMB bank charges and car-less RMB costs are refused until each gets an entry type, or an ADR scopes them out; (b) top-up payment after a settled invoice: allow both ways or neither; (c) credit notes/discounts on foreign invoices; (d) evidence mandatory vs "evidence pending". And: build a clickable design prototype with sample data (no backend) to see the UI now, or carry on with the backend (tables + endpoints next, which needs Clerk)? The real web app is still a placeholder page.
 
 ## Where we are
 
@@ -16,7 +18,7 @@ _Last updated: 2026-11-15_
 | --- | --- |
 | 0 Foundations | Done, except owner-blocked items (below) and Clerk auth, which isn't wired yet |
 | 1 Ledger core | **Done.** Gate evidence: local pre-push run (ADR 0007): 10k random entries net to zero, cross-tenant reads return zero rows |
-| 2 Vehicles + FX | **In progress.** Gate approved by the owner (2026-11-15, provisional: the accountant still reviews it and fixes come back here). Slices 1–3 built (3 = revaluation, uncommitted); emm_funded, tables + endpoints, report basis to build |
+| 2 Vehicles + FX | **In progress.** Gate approved by the owner (2026-11-15, provisional: the accountant still reviews it and fixes come back here). Slices 1–4 built (revaluation committed; emm_funded uncommitted); tables + endpoints and report basis to build |
 | 3–6 | Not started |
 
 ## Phase 2: now and next
@@ -41,12 +43,14 @@ Research behind the next slices: `docs/research/2026-11-15-existing-platforms.md
 - Migration 0006 (audit passes 4–6): 1010 takes no NGN lines; foreign payables only from supplier invoices naming supplier and car; a car is paid directly or invoiced, not both (race-safe, lock before read); reversals can't be reversed; at commit, a settlement holds only 2000/1010/7000 with settled = spent, a car's cost reaches its 1150, and NGN on 2000 names the supplier and never exceeds what's owed (advances go to 1300); the rates login can't set `fetched_at`.
 - Migration 0007 (month-end revaluation, ADR 0011): pool and foreign payables restated at the latest CBN rate (at most 7 days old) to 7100 through 1019/2009, reversed on day 1 in the same transaction, evidence in `fx_revaluations`, re-performed by the database. The whole-entry checks (0006, 0007) now run inside `post_journal_entry` (as separate deferred triggers they could be fired early and dodged), EXECUTE revoked from PUBLIC. Foreign lines on the balance sheet only on 1010 and 2000.
 - **Phase 4 gate item (ledger audit of 0007):** the period lock must refuse unless the period's latest revaluation equals a fresh re-computation, shipped before or with the first endpoint that locks a period (`finbook_app` can already UPDATE `periods.status`). Until then a posting backdated after a revaluation leaves it stale.
+- Migration 0008 (EMM-funded, ADR 0012): `funding` on the cost rules (emm_funded → 1200), `stockDeposit`, `refundStockDeposit`, `arriveInYard`, `sellStockCar` (gross 4000, full cost to 5000), `convertToStock` (cost to 1200, customer refunded in full). The database reads each car's mode (job or stock) from its live entries: never both, convert is the only crossing (open job, supplier-paid car, whole cost, whole refund in cash), balances never cross zero, inventory only from real costs, moves only whole.
+- **Endpoints slice (blockers from the 0008 audit):** before any endpoint posts a 2150 debit outside the posting rules, close the forfeit gap with job_orders or a checked `source_type` (a completion and a forfeit to income look alike today). Also with job_orders: funding per job (1150 vs 1200), reviewer approval before an EMM-funded supplier payment (and for convert, owner to confirm), funding locked at the first payment, the job type as proof of a supplier purchase. Add indexes `journal_lines (tenant_id, vehicle_id, account_id)` before volume grows (the per-car checks scan under the tenant lock).
 - **Endpoints slice:** Postgres check messages carry the tenant's own balances; map them before showing them to roles without report access or sending them to Sentry.
 - Security follow-ups (pre-existing, low): a session-level advisory lock can freeze a tenant's postings; no lock/idle/statement timeouts on `finbook_api`.
 - Known gaps: no mixed v2/v3 hash-chain test across the upgrade; the 10k fuzz test doesn't include pool, payable or spot lines; `counterparty_id` isn't typed (customer vs supplier) until the counterparties table lands (slice 3). Evidence stays optional on purpose: the spec lets entries post as "evidence pending" and flags them on the exception report.
 
 **Next slices, in order (build from the top):**
-1. **`emm_funded` (principal) path.** Ledger side now (0006's "cost reaches 1150" check must accept 1200 for these cars); approval needs job orders (slice 2). Abandoned jobs: the customer's funds are always refunded (Dr 2150 / Cr cash), never forfeited (owner, 2026-11-15; narrows the spec's "forfeit or refund terms", ADR due with the slice). Inventory 1200/1210, gross sale 4000/5000, reason + reviewer approval before any supplier payment, convert-to-stock for abandoned jobs.
+1. **`emm_funded` (principal) path: built** (migration 0008, ADR 0012); the job-order parts are listed under the endpoints-slice blockers above.
 2. **Tables + endpoints.** Vehicles (VIN check digit, unique per tenant, `vin_needs_correction`), job orders (gapless numbers, accepted-quote evidence, funding field), shipments/containers, cost types, `cost_allocations` storing the split basis (borrowed from ERPNext's landed cost voucher), refuse costs on a completed job. Needs Clerk auth first (phase 0 item).
 3. **Reports take a basis** (`spot` | `pool`); client-facing ones default to and only accept `spot` (ADR 0009).
 
@@ -61,12 +65,12 @@ Research behind the next slices: `docs/research/2026-11-15-existing-platforms.md
 ## What exists
 
 - **Apps:** `apps/api` (NestJS 12, `GET /health`, Sentry), `apps/worker` (NestJS + BullMQ, `system` queue with a `ping` job, Sentry), `apps/web` (Next.js 16 on Cloudflare Workers via vinext, placeholder page). No auth or business endpoints yet.
-- **Packages:** `money`, `ledger`, `db` (Drizzle schema; migrations 0000–0007; `withTenant()`; `migrate()`).
+- **Packages:** `money`, `ledger`, `db` (Drizzle schema; migrations 0000–0008; `withTenant()`; `migrate()`).
 - **Database guarantees** (ADR 0006): API logs in as `finbook_api` (non-superuser) and runs as `finbook_app` under forced RLS; owner URL only for migrations. Balance at commit, append-only ledger and audit log, period lock, reversals mirror exactly, accounts frozen once posted to, FX checks, DB-stamped actor and time, audit rows, per-tenant hash chain with `ledger_chain_breaks()`. Known limit: chain tampering by a DB superuser needs an off-site anchor (backup manifest, phase 5).
-- **Tests:** money 10 and ledger 12 (100% branch coverage), api 2, worker 7 (1 needs Redis), db integration 60 (Testcontainers Postgres 18, needs Docker).
+- **Tests:** money 10 and ledger 17 (100% branch coverage), api 2, worker 7 (1 needs Redis), db integration 69 (Testcontainers Postgres 18, needs Docker).
 - **Quality gate:** `.githooks/pre-push` runs install, lint, typecheck, unit, integration and build before every push (ADR 0007). Strict type-aware ESLint bans float money (`parseFloat`, `Number()`, `Math.round` and friends, `toFixed`).
 - **Staging (Railway project `finbook`, env `staging`):** Postgres 18, Redis, api (https://api-staging-c68d0388.up.railway.app/health), worker, and a one-off `migrate` service. Production environment exists, empty, owner-run only. Details: `docs/deploy.md`.
-- **Decisions:** ADRs 0001–0011 in `docs/decisions/`. Research notes in `docs/research/`.
+- **Decisions:** ADRs 0001–0012 in `docs/decisions/`. Research notes in `docs/research/`.
 
 ## Gotchas for the next session
 

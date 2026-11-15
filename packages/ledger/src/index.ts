@@ -25,6 +25,12 @@ export type Line = {
   counterpartyId?: string;
 };
 type Tags = Pick<Line, 'vehicleId' | 'counterpartyId' | 'evidenceDocumentId'>;
+/**
+ * Who funds a car's purchase (ADR 0001). customer_funded (default): agent accounting, the car's cost is recoverable from the
+ * customer (1150). emm_funded: principal accounting, the car is EMM's inventory (1200 in transit, then 1210 in the yard).
+ */
+export type Funding = 'customer_funded' | 'emm_funded';
+const costAccount = (f: Funding | undefined) => (f === 'emm_funded' ? '1200' : '1150');
 /** The customer's job a line belongs to: every 2150 and 1100 line carries both, so funds held are traceable. */
 type Job = { vehicleId: string; counterpartyId: string };
 
@@ -68,9 +74,9 @@ export function buyCurrency(e: { currency: string; amountMinor: bigint; rate: bi
  * (spec → Currency and FX, rule 4). The foreign line's rate is that cost / amount (rate source pool_average);
  * the database re-computes the pool under the tenant lock and refuses any other figure (migration 0004).
  */
-export function payFromPool(e: { pool: Pool; currency: string; amountMinor: bigint; vehicleId: string; spot: Spot; rateNote?: string; evidenceDocumentId?: string }): { lines: Line[]; pool: Pool } {
+export function payFromPool(e: { pool: Pool; currency: string; amountMinor: bigint; vehicleId: string; spot: Spot; rateNote?: string; evidenceDocumentId?: string; funding?: Funding }): { lines: Line[]; pool: Pool } {
   const out = poolOut(e, { vehicleId: e.vehicleId, evidenceDocumentId: e.evidenceDocumentId });
-  return { pool: out.pool, lines: [...ngn('1150', out.line.credit, { vehicleId: e.vehicleId }), out.line] };
+  return { pool: out.pool, lines: [...ngn(costAccount(e.funding), out.line.credit, { vehicleId: e.vehicleId }), out.line] };
 }
 
 /** The spot fields of a line. A manual spot rate needs a note saying why it differs from the CBN rate. */
@@ -103,11 +109,11 @@ type SupplierBill = { vehicleId: string; supplierId: string };
  * A supplier's invoice for one car, in foreign currency at the invoice rate: the car's cost goes up and a
  * foreign-currency payable (2000) is owed. The invoice-day spot rate is recorded for the spot basis (ADR 0009).
  */
-export function supplierInvoice(e: SupplierBill & { currency: string; amountMinor: bigint; rate: bigint; spot: Spot; rateNote?: string; evidenceDocumentId?: string }): Line[] {
+export function supplierInvoice(e: SupplierBill & { currency: string; amountMinor: bigint; rate: bigint; spot: Spot; rateNote?: string; evidenceDocumentId?: string; funding?: Funding }): Line[] {
   positive(e.amountMinor, 'amount');
   const booked = convert(e.amountMinor, e.rate);
   return [
-    ...ngn('1150', booked, { vehicleId: e.vehicleId }),
+    ...ngn(costAccount(e.funding), booked, { vehicleId: e.vehicleId }),
     {
       account: '2000', debit: 0n, credit: booked, currency: e.currency, amountMinor: e.amountMinor, rate: formatRate(e.rate), rateSource: 'agent_invoice',
       ...spotOf(e.spot, e.rateNote), ...tagged({ vehicleId: e.vehicleId, counterpartyId: e.supplierId, evidenceDocumentId: e.evidenceDocumentId }),
@@ -165,12 +171,13 @@ function carCost(history: readonly Line[], vehicleId: string) {
 export const spotCarCost = (history: readonly Line[], vehicleId: string): bigint => carCost(history, vehicleId).spotNgn;
 
 /** An NGN cost for one or more cars (a container charge, or one car's IDEC bill), split equally in kobo, remainder on the first car. */
-export function sharedCost(e: { amountNgn: bigint; vehicleIds: readonly string[]; evidenceDocumentId?: string }): Line[] {
+export function sharedCost(e: { amountNgn: bigint; vehicleIds: readonly string[]; evidenceDocumentId?: string; funding?: Funding }): Line[] {
   positive(e.amountNgn, 'cost');
   if (e.vehicleIds.length === 0) throw new Error('a cost needs at least one car');
   if (new Set(e.vehicleIds).size !== e.vehicleIds.length) throw new Error('a car can appear only once in a cost split');
   const shares = allocateEqual(e.amountNgn, e.vehicleIds.length);
-  return [...shares.flatMap((share, i) => ngn('1150', share, { vehicleId: e.vehicleIds[i] })), ...ngn('1000', -e.amountNgn, { evidenceDocumentId: e.evidenceDocumentId })];
+  // ponytail: one funding for every car in the split; split a container holding both kinds of car into two costs.
+  return [...shares.flatMap((share, i) => ngn(costAccount(e.funding), share, { vehicleId: e.vehicleIds[i] })), ...ngn('1000', -e.amountNgn, { evidenceDocumentId: e.evidenceDocumentId })];
 }
 
 /** What the ledger says about one car's job: its supplier cost, everything capitalized, and the customer's funds held. */
@@ -207,6 +214,7 @@ export function completeAgentJob(e: Job & {
 }): { lines: Line[]; invoiceNgn: bigint } {
   positive(e.quote.sellingMinor, 'selling price');
   if (e.quote.landingChargeNgn < 0n) throw new Error('landing charge cannot be negative');
+  notStock(e.history, e.vehicleId);
   const p = jobPosition(e.history, e.vehicleId);
   if (p.carMinor === 0n) throw new Error('no supplier payment recorded for this car');
   if (p.carCurrency !== e.quote.currency) throw new Error(`quote is in ${e.quote.currency} but the car was paid in ${String(p.carCurrency)}`);
@@ -230,6 +238,7 @@ export function completeAgentJob(e: Job & {
 /** Complete a clearing-only job: the car was never ours; revenue is the landing charge minus the landed cost. */
 export function completeClearingJob(e: Job & { landingChargeNgn: bigint; history: readonly Line[] }): { lines: Line[]; invoiceNgn: bigint } {
   positive(e.landingChargeNgn, 'landing charge');
+  notStock(e.history, e.vehicleId);
   const p = jobPosition(e.history, e.vehicleId);
   const car = { vehicleId: e.vehicleId };
   return {
@@ -240,6 +249,81 @@ export function completeClearingJob(e: Job & { landingChargeNgn: bigint; history
       ...ngn('4200', -(e.landingChargeNgn - p.costNgn), car),
     ],
   };
+}
+
+/** One car's net balance on one account, from its ledger history. */
+const carBalance = (history: readonly Line[], vehicleId: string, account: string) =>
+  history.filter((l) => l.vehicleId === vehicleId && l.account === account).reduce((s, l) => s + l.debit - l.credit, 0n);
+/** Whether any of these accounts holds a balance for the car. Net, so a reversed mistake (entry plus its mirror) counts as nothing. */
+const touched = (history: readonly Line[], vehicleId: string, accounts: readonly string[]) =>
+  accounts.some((a) => carBalance(history, vehicleId, a) !== 0n);
+/** A car in inventory, or sold from it, is EMM stock (EMM-funded or converted): it is sold, never completed as a job (migration 0008). */
+function notStock(history: readonly Line[], vehicleId: string) {
+  if (touched(history, vehicleId, ['1200', '1210', '4000', '5000'])) throw new Error('this car is EMM stock: sell it (sellStockCar), it is not completed as a job');
+}
+
+/** A buyer's deposit towards an EMM-funded stock car (principal): theirs until the sale, held in 2100 customer deposits. */
+export function stockDeposit(e: Job & { amountNgn: bigint; evidenceDocumentId?: string }): Line[] {
+  positive(e.amountNgn, 'deposit');
+  return [...ngn('1000', e.amountNgn, { evidenceDocumentId: e.evidenceDocumentId }), ...ngn('2100', -e.amountNgn, e)];
+}
+
+/** Pay a buyer's deposit back (they walked away, or paid more than the price): Dr 2100 / Cr cash, never more than they paid. */
+export function refundStockDeposit(e: Job & { amountNgn: bigint; history: readonly Line[]; evidenceDocumentId?: string }): Line[] {
+  positive(e.amountNgn, 'refund');
+  const paid = -carBalance(e.history.filter((l) => l.counterpartyId === e.counterpartyId), e.vehicleId, '2100');
+  if (e.amountNgn > paid) throw new Error('refund exceeds what this buyer paid towards this car');
+  return [...ngn('2100', e.amountNgn, e), ...ngn('1000', -e.amountNgn, { evidenceDocumentId: e.evidenceDocumentId })];
+}
+
+/** An EMM-funded car reaches the yard: its whole in-transit cost (1200) moves to 1210, read from its ledger history. */
+export function arriveInYard(e: { vehicleId: string; history: readonly Line[] }): Line[] {
+  const cost = carBalance(e.history, e.vehicleId, '1200');
+  positive(cost, 'in-transit cost');
+  const car = { vehicleId: e.vehicleId };
+  return [...ngn('1210', cost, car), ...ngn('1200', -cost, car)];
+}
+
+/**
+ * Sell an EMM-funded stock car (principal, spec → Vehicle module): gross revenue (4000) at the price, paid first from the
+ * buyer's deposits (2100) with the rest receivable (1100); the car's full landed cost (specific identification) moves from
+ * 1210 to 5000. The database refuses a sale that doesn't clear the car's 1210 (migration 0008).
+ * ponytail: NGN price only; an RMB-priced stock sale needs the quote-day rate and FX-on-sale line like completeAgentJob.
+ */
+export function sellStockCar(e: Job & { priceNgn: bigint; history: readonly Line[] }): Line[] {
+  positive(e.priceNgn, 'price');
+  if (carBalance(e.history, e.vehicleId, '1200') !== 0n) throw new Error('the car is still in transit: record its arrival in the yard first');
+  const cost = carBalance(e.history, e.vehicleId, '1210');
+  positive(cost, 'cost in the yard');
+  // Only this buyer's deposits on this car: another buyer's deposit stays theirs (refundStockDeposit).
+  const deposits = -carBalance(e.history.filter((l) => l.counterpartyId === e.counterpartyId), e.vehicleId, '2100');
+  if (deposits > e.priceNgn) throw new Error('deposits exceed the price: refund the difference first (refundStockDeposit)');
+  const car = { vehicleId: e.vehicleId };
+  return [
+    ...ngn('2100', deposits, e), ...ngn('1100', e.priceNgn - deposits, e), ...ngn('4000', -e.priceNgn, car),
+    ...ngn('5000', cost, car), ...ngn('1210', -cost, car),
+  ];
+}
+
+/**
+ * A customer abandons a customer-funded job after EMM paid the supplier ("convert to stock", spec → Vehicle module): the
+ * car becomes EMM's inventory (1200) at everything capitalized for it in 1150, and the customer's funds held (2150) are
+ * repaid in full. Owner ruling 2026-11-15 (ADR 0012): a deposit is never forfeited.
+ */
+export function convertToStock(e: Job & { history: readonly Line[]; evidenceDocumentId?: string }): Line[] {
+  // ponytail: a completion at a zero cut posts no 4100/4200 line, and a flat line history can't show which 1150 credit was a
+  // completion; the database refuses that case (migration 0008 reads entries). Pass job status here once job_orders exists.
+  if (touched(e.history, e.vehicleId, ['4100', '4200'])) throw new Error('this job is already completed: it cannot be converted to stock');
+  notStock(e.history, e.vehicleId);
+  const p = jobPosition(e.history, e.vehicleId);
+  positive(p.costNgn, 'job cost');
+  if (p.carMinor === 0n) throw new Error('only a car EMM paid the supplier for can become stock: a clearing-only job is the customer\'s own car');
+  if (p.fundsHeldNgn < 0n) throw new Error('customer funds held for this job are negative');
+  const car = { vehicleId: e.vehicleId };
+  return [
+    ...ngn('1200', p.costNgn, car), ...ngn('1150', -p.costNgn, car),
+    ...ngn('2150', p.fundsHeldNgn, e), ...ngn('1000', -p.fundsHeldNgn, { evidenceDocumentId: e.evidenceDocumentId }),
+  ];
 }
 
 /** One monetary balance restated at month-end: the pool (1010) or the foreign supplier payables (2000), in one currency. */
