@@ -6,8 +6,8 @@ _Last updated: 2026-11-15_
 
 ## Start here (next session)
 
-1. **Month-end revaluation is built, uncommitted:** migration 0007, `revalue()`, ADR 0011. Ledger audit and security review both PASS WITH NOTES. Next: owner OK to commit, push and apply 0007 to staging (it also closes an early-check bypass live on staging with 0006). Then the `emm_funded` slice.
-2. **Staging is on 0000–0006** (applied 2026-11-15) and the worker has `RATES_DATABASE_URL` (the `finbook_rates` login). **Still to check:** after 10:30 Lagos on 2026-11-16, the worker logs show the snapshot ran and `fx_reference_rates` has cbn and market rows.
+1. **Month-end revaluation is done:** migration 0007, `revalue()`, ADR 0011; ledger audit and security review both PASS WITH NOTES. Committed on branch `phase2-revaluation` (pushed, not merged to `main`). **Next: the `emm_funded` slice.**
+2. **Staging is on 0000–0007** (0007 applied 2026-11-15, which also closed the early-check bypass 0006 had) and the worker has `RATES_DATABASE_URL` (the `finbook_rates` login). **Still to check:** after 10:30 Lagos on 2026-11-16, the worker logs show the snapshot ran and `fx_reference_rates` has cbn and market rows.
 3. **Owner decisions open** (details in the pass 4–6 audit doc): (a) **spec conflict, FX rule 5**: 0006 lets currency leave the pool only for one car or an invoice settlement, so selling leftover RMB, RMB bank charges and car-less RMB costs are refused until each gets an entry type, or an ADR scopes them out; (b) top-up payment after a settled invoice: allow both ways or neither; (c) credit notes/discounts on foreign invoices; (d) evidence mandatory vs "evidence pending". And: build a clickable design prototype with sample data (no backend) to see the UI now, or carry on with the backend (emm_funded next)? The real web app is still a placeholder page.
 
 ## Where we are
