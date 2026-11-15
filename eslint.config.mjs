@@ -12,7 +12,7 @@ const noFloatMoney = {
 };
 
 export default tseslint.config(
-  { ignores: ['**/node_modules/**', '**/dist/**', '**/.next/**', '**/.open-next/**', '**/.turbo/**', 'graphify-out/**', 'coverage/**'] },
+  { ignores: ['**/node_modules/**', '**/dist/**', '**/.next/**', '**/.open-next/**', '**/.cloudflare/**', '**/.turbo/**', 'graphify-out/**', 'coverage/**'] },
   js.configs.recommended,
   ...tseslint.configs.strictTypeChecked,
   {

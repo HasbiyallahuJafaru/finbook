@@ -3,7 +3,15 @@
   "tasks": {
     "typecheck": {},
     "test": {},
-    "build": { "dependsOn": ["^build"], "outputs": ["dist/**", ".next/**"] },
+    "build": {
+      "dependsOn": [
+        "^build"
+      ],
+      "outputs": [
+        "dist/**",
+        ".cloudflare/output/**"
+      ]
+    },
     "lint": {}
   }
 }
