@@ -15,6 +15,20 @@
       "when": 1794731484035,
       "tag": "0001_ledger_guarantees",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794732539972,
+      "tag": "0002_currencies_and_line_links",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1794732549509,
+      "tag": "0003_ledger_guarantees_v2",
+      "breakpoints": true
     }
   ]
 }

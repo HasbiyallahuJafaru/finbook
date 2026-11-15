@@ -1,19 +1,30 @@
 // Table structure only. Ledger guarantees (RLS, triggers, grants, hash chain) live in the
-// hand-written SQL migration `*_ledger_guarantees.sql`, because Drizzle can't express them.
+// hand-written SQL migrations `0001_ledger_guarantees.sql` and `0003_ledger_guarantees_v2.sql`, because Drizzle
+// can't express them. ADR 0006.
 import { sql } from 'drizzle-orm';
 import {
-  bigint, boolean, char, check, date, foreignKey, index, inet, jsonb, numeric, pgTable, text, timestamp, unique, uuid,
+  bigint, boolean, char, check, date, foreignKey, index, inet, jsonb, numeric, pgTable, smallint, text, timestamp, unique, uuid,
 } from 'drizzle-orm/pg-core';
 
 const id = () => uuid('id').primaryKey().default(sql`uuidv7()`);
 const tenantId = () => uuid('tenant_id').notNull().references(() => tenants.id);
 const createdAt = () => timestamp('created_at', { withTimezone: true }).notNull().defaultNow();
+const currency = (name: string) => char(name, { length: 3 }).references(() => currencies.code);
+
+/** Global, not per tenant. Only exponent-2 currencies until packages/money handles other scales (ADR 0003). */
+export const currencies = pgTable('currencies', {
+  code: char('code', { length: 3 }).primaryKey(),
+  exponent: smallint('exponent').notNull(),
+}, (t) => [
+  check('currencies_code', sql`${t.code} ~ '^[A-Z]{3}$'`),
+  check('currencies_exponent', sql`${t.exponent} = 2`),
+]);
 
 export const tenants = pgTable('tenants', {
   id: id(),
   clerkOrgId: text('clerk_org_id').unique(),
   legalName: text('legal_name').notNull(),
-  functionalCurrency: char('functional_currency', { length: 3 }).notNull().default('NGN'),
+  functionalCurrency: currency('functional_currency').notNull().default('NGN'),
   status: text('status').notNull().default('active'),
   createdAt: createdAt(),
 }, (t) => [check('tenants_status', sql`${t.status} in ('active', 'suspended', 'closed')`)]);
@@ -24,7 +35,7 @@ export const accounts = pgTable('accounts', {
   code: text('code').notNull(),
   name: text('name').notNull(),
   type: text('type').notNull(),
-  currency: char('currency', { length: 3 }),
+  currency: currency('currency'),
   parentId: uuid('parent_id'),
   isSystem: boolean('is_system').notNull().default(false),
   createdAt: createdAt(),
@@ -65,7 +76,8 @@ export const journalEntries = pgTable('journal_entries', {
 }, (t) => [
   unique('journal_entries_tenant_id_id').on(t.tenantId, t.id),
   unique('journal_entries_idempotency').on(t.tenantId, t.idempotencyKey),
-  unique('journal_entries_reversed_once').on(t.reversesEntryId),
+  unique('journal_entries_reversed_once').on(t.tenantId, t.reversesEntryId),
+  check('journal_entries_memo', sql`btrim(${t.memo}) <> ''`),
   foreignKey({ name: 'journal_entries_period', columns: [t.tenantId, t.periodId], foreignColumns: [periods.tenantId, periods.id] }),
   foreignKey({ name: 'journal_entries_reverses', columns: [t.tenantId, t.reversesEntryId], foreignColumns: [t.tenantId, t.id] }),
   index('journal_entries_tenant_date').on(t.tenantId, t.entryDate),
@@ -78,11 +90,15 @@ export const journalLines = pgTable('journal_lines', {
   accountId: uuid('account_id').notNull(),
   debitNgn: bigint('debit_ngn', { mode: 'bigint' }).notNull().default(sql`0`),
   creditNgn: bigint('credit_ngn', { mode: 'bigint' }).notNull().default(sql`0`),
-  currency: char('currency', { length: 3 }).notNull().default('NGN'),
+  currency: currency('currency').notNull().default('NGN'),
   amountMinor: bigint('amount_minor', { mode: 'bigint' }).notNull(),
   rate: numeric('rate', { precision: 18, scale: 6 }),
   rateSource: text('rate_source'),
   rateNote: text('rate_note'),
+  // Links filled from phase 2 (vehicles, counterparties, documents); present now so the hash payload never changes shape.
+  evidenceDocumentId: uuid('evidence_document_id'),
+  vehicleId: uuid('vehicle_id'),
+  counterpartyId: uuid('counterparty_id'),
 }, (t) => [
   foreignKey({ name: 'journal_lines_entry', columns: [t.tenantId, t.entryId], foreignColumns: [journalEntries.tenantId, journalEntries.id] }),
   foreignKey({ name: 'journal_lines_account', columns: [t.tenantId, t.accountId], foreignColumns: [accounts.tenantId, accounts.id] }),
@@ -96,7 +112,7 @@ export const journalLines = pgTable('journal_lines', {
     then ${t.rate} is null and ${t.rateSource} is null and ${t.amountMinor} = ${t.debitNgn} + ${t.creditNgn}
     else ${t.rate} > 0 and ${t.amountMinor} > 0
       and ${t.rateSource} in ('bank_receipt', 'bdc_receipt', 'agent_invoice', 'manual')
-      and (${t.rateSource} <> 'manual' or ${t.rateNote} is not null)
+      and (${t.rateSource} <> 'manual' or btrim(${t.rateNote}) <> '')
       and ${t.debitNgn} + ${t.creditNgn} = round(${t.amountMinor} * ${t.rate})
     end, false)`),
 ]);
@@ -106,6 +122,7 @@ export const journalEntryHashes = pgTable('journal_entry_hashes', {
   entryId: uuid('entry_id').primaryKey(),
   tenantId: tenantId(),
   seq: bigint('seq', { mode: 'bigint' }).notNull(),
+  payloadVersion: smallint('payload_version').notNull().default(1),
   prevHash: text('prev_hash'),
   hash: text('hash').notNull(),
   createdAt: createdAt(),
