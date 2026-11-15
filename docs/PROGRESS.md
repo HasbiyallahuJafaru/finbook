@@ -7,10 +7,7 @@ _Last updated: 2026-11-15_
 ## Start here (next session)
 
 1. **Pass-3 findings fixed in migration 0006**; ledger audit pass 6 PASS WITH NOTES (`docs/audits/2026-11-15-phase2-slice2-pass4-6.md`). Its owner decisions (below) are open, the first a spec conflict.
-2. **Staging** (it has 0000–0004; apply 0005 and 0006 together) and switch on the rate snapshot:
-   - generate a password and pipe it in: `railway variable set -e staging -s migrate --skip-deploys --stdin FINBOOK_RATES_DB_PASSWORD`, then `railway up -s migrate -e staging --detach` (logs end with "migrations applied");
-   - on the worker: `RATES_DATABASE_URL=postgresql://finbook_rates:${{migrate.FINBOOK_RATES_DB_PASSWORD}}@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}`, then `railway up -s worker -e staging --detach`;
-   - the first snapshot runs at the next 10:30 Lagos; check `fx_reference_rates` has cbn and market rows.
+2. **Staging is on 0000–0006** (applied 2026-11-15) and the worker has `RATES_DATABASE_URL` (the `finbook_rates` login). **Still to check:** after 10:30 Lagos on 2026-11-16, the worker logs show the snapshot ran and `fx_reference_rates` has cbn and market rows. The work is on branch `phase2-slice2-audit-fixes`, not merged or pushed (the pre-push hook runs the full gate).
 3. **Owner decisions open** (details in the pass 4–6 audit doc): (a) **spec conflict, FX rule 5**: 0006 lets currency leave the pool only for one car or an invoice settlement, so selling leftover RMB, RMB bank charges and car-less RMB costs are refused until each gets an entry type, or an ADR scopes them out; (b) top-up payment after a settled invoice: allow both ways or neither; (c) credit notes/discounts on foreign invoices; (d) evidence mandatory vs "evidence pending". And: build a clickable design prototype with sample data (no backend) to see the UI now, or carry on with the backend (month-end revaluation next)? The real web app is still a placeholder page.
 
 ## Where we are

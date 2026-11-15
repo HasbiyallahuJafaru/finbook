@@ -4,7 +4,7 @@ Claude may build and deploy **staging** (CLAUDE.md → Infrastructure and deploy
 
 ## What exists (2026-11-15)
 
-Staging Postgres has migrations 0000–0004 applied (last run 2026-11-15, via the `migrate` service).
+Staging Postgres has migrations 0000–0006 applied (last run 2026-11-15, via the `migrate` service; 0005 and 0006 together). The worker's daily rate snapshot (10:30 Lagos, ADR 0010) writes as `finbook_rates`.
 
 ### Railway project `finbook` (workspace: hasbiyallahujafaru's Projects)
 
@@ -33,6 +33,8 @@ Staging variables (values never printed or committed):
 | `DATABASE_URL` (api only) | yes | no | `postgresql://finbook_api:${{migrate.FINBOOK_API_DB_PASSWORD}}@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}` (non-superuser login, ADR 0006) |
 | `DATABASE_OWNER_URL` (migrate only) | no | no | `${{Postgres.DATABASE_URL}}`: the owner; never on api or worker |
 | `FINBOOK_API_DB_PASSWORD` (migrate only) | no | no | random, generated locally and piped in with `--stdin`; never printed |
+| `FINBOOK_RATES_DB_PASSWORD` (migrate only) | no | no | random, generated locally and piped in with `--stdin`; never printed. `migrate` sets it as the `finbook_rates` login's password |
+| `RATES_DATABASE_URL` (worker only) | no | yes | `postgresql://finbook_rates:${{migrate.FINBOOK_RATES_DB_PASSWORD}}@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}` (reference rates only, no tenant data) |
 
 Build and start commands are set as Railpack variables because the installed Railway CLI (5.41.2) silently ignores `railway environment edit --service-config`. Node 24 comes from `engines` in the root `package.json`.
 
