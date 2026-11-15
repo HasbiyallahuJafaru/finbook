@@ -14,7 +14,7 @@ _Last updated: 2026-11-15_
 - Claude tooling: hooks (`.claude/hooks`), skills (db-migration, ledger-change, new-endpoint, phase-gate, verify), agents (ledger-auditor, security-reviewer).
 - Build approach set in `CLAUDE.md`: Ponytail for backend; `design-taste-frontend`, `frontend-design`, `ui-ux-pro-max` for frontend.
 - Graphify graph built (`graphify-out/`, 151 nodes, 11 communities). It covers code and docs, not the build itself. It does not replace this file: it maps what exists, this file says where we are and what's next.
-- `git init` done (branch main, no commits yet). `pnpm-workspace.yaml` and root `package.json` in place.
+- First commit `ea9373f` on main; remote `origin` = github.com/HasbiyallahuJafaru/finbook. Push pending (user runs `git push -u origin main`; no network in Claude session). `pnpm-workspace.yaml` and root `package.json` in place.
 - `packages/money` written and green: parseRate, convert (half-up), allocateEqual (remainder on first car), add/sub; 10k-conversion property test; 100% branch coverage. Uses node:test + Node 24 TypeScript stripping, zero dependencies (`pnpm --filter @app/money test`). Not yet wired to the toolchain below.
 - ADRs 0003 (scaled-bigint rates) and 0004 (Drizzle) written.
 
