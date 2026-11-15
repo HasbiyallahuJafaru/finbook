@@ -13,9 +13,9 @@ export const sub = (a: Money, b: Money): Money => (same(a, b), money(a.amount - 
 
 /** Decimal string with up to 6 places -> rate scaled by 10^6. Rejects floats, signs, exponents. */
 export function parseRate(s: string): bigint {
-  const m = /^(\d+)(?:\.(\d{1,6}))?$/.exec(s);
-  if (!m) throw new Error(`invalid rate: ${s}`);
-  const rate = BigInt(m[1]!) * RATE_SCALE + BigInt((m[2] ?? '').padEnd(6, '0'));
+  if (!/^\d+(?:\.\d{1,6})?$/.test(s)) throw new Error(`invalid rate: ${s}`);
+  const [whole, frac = ''] = s.split('.') as [string, string?];
+  const rate = BigInt(whole) * RATE_SCALE + BigInt(frac.padEnd(6, '0'));
   if (rate === 0n) throw new Error('rate must be positive');
   return rate;
 }
@@ -29,6 +29,7 @@ export function convert(amount: bigint, rate: bigint): bigint {
 
 /** Equal split in minor units; the remainder goes on the first share, so shares always sum to total. */
 export function allocateEqual(total: bigint, n: number): bigint[] {
+  // eslint-disable-next-line no-restricted-globals -- n is a share count, not money
   if (!Number.isInteger(n) || n < 1) throw new Error('n must be a positive integer');
   const count = BigInt(n);
   const share = total / count; // truncates toward zero

@@ -28,7 +28,7 @@ test('10k random conversions: always within half a minor unit of the exact produ
     const rate = rnd(10n ** 9n) + 1n;
     const r = convert(amount, rate);
     const err = (r * RATE_SCALE - amount * rate) * 2n; // 2 * (rounded - exact), scaled
-    assert.ok((err < 0n ? -err : err) <= RATE_SCALE, `drift: ${amount} x ${rate}`);
+    assert.ok((err < 0n ? -err : err) <= RATE_SCALE, `drift: ${String(amount)} x ${String(rate)}`);
   }
 });
 

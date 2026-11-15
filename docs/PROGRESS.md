@@ -16,18 +16,20 @@ _Last updated: 2026-11-15_
 - Graphify graph built (`graphify-out/`, 151 nodes, 11 communities). It covers code and docs, not the build itself. It does not replace this file: it maps what exists, this file says where we are and what's next.
 - First commit `ea9373f` on main; remote `origin` = github.com/HasbiyallahuJafaru/finbook. Push pending (user runs `git push -u origin main`; no network in Claude session). `pnpm-workspace.yaml` and root `package.json` in place.
 - `packages/money` written and green: parseRate, convert (half-up), allocateEqual (remainder on first car), add/sub; 10k-conversion property test; 100% branch coverage. Uses node:test + Node 24 TypeScript stripping, zero dependencies (`pnpm --filter @app/money test`). Not yet wired to the toolchain below.
-- ADRs 0003 (scaled-bigint rates) and 0004 (Drizzle) written.
+- Turborepo + TypeScript + shared tsconfig; strict type-aware ESLint (`eslint.config.mjs`) bans parseFloat, Number(), Math.round/floor/ceil/trunc, toFixed and non-null assertions (tests exempt from the Number/promise rules). `pnpm lint`, `pnpm typecheck`, `pnpm test` all green for @app/money.
+- ADRs 0003 (scaled-bigint rates), 0004 (Drizzle), 0005 (TypeScript pinned to ~6.0.3 because typescript-eslint doesn't support 7 yet) written.
 
 ## Next
 
-1. Needs internet (blocked this session): check latest versions, add Turborepo, TypeScript, ESLint; create apps/web, apps/api, apps/worker skeletons. Decide whether money keeps node:test or moves to Vitest.
+1. Create apps/api (NestJS), apps/worker, apps/web (Next.js on Cloudflare) skeletons, checking latest versions first. Money keeps node:test (decided).
 2. `packages/money` still lacks: weighted-average pool maths (phase 2), currency exponent handling beyond 2-decimal currencies.
 3. CI: lint, typecheck, test, build.
 4. Deploy targets (need accounts/env vars from the user): Clerk, Sentry, Cloudflare (vinext compatibility check, OpenNext fallback), Railway (api, worker, Postgres, Redis).
 
 ## Open decisions / blockers
 
-- Blocker (2026-11-15): the npm registry was unreachable from the Claude session (`npm view` and curl returned nothing). CLAUDE.md requires checking latest stable versions before adding packages, so the scaffold hasn't started. Retry, or run `pnpm add` yourself where the network works.
+- Network note: `pnpm add` and `pnpm view` work in the Claude session; `npm view` and curl hang. Use pnpm for registry lookups.
+- Push to GitHub still pending (user runs `git push -u origin main`).
 
 - Decided 2026-11-15: Drizzle (ADR 0004); FX rates as scaled bigint, no decimal lib (ADR 0003). Tick "Prisma or Drizzle" in the Claude Doc spec and re-export.
 - Spec line "Build standard" still names hasbiy-ui / impeccable / uiuxpromax / awesome-design.md; CLAUDE.md now names design-taste-frontend / frontend-design / ui-ux-pro-max. Spec is exported from the Claude Doc — update it there and re-export.

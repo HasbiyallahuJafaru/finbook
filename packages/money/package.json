@@ -5,6 +5,7 @@
   "main": "src/index.ts",
   "scripts": {
     "test": "node --test --experimental-test-coverage --test-coverage-branches=100 src/index.test.ts",
-    "typecheck": "tsc -p ."
+    "typecheck": "tsc -p .",
+    "lint": "eslint ."
   }
 }
