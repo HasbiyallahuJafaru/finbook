@@ -43,6 +43,13 @@
       "when": 1794745070862,
       "tag": "0005_spot_rates",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1794746297790,
+      "tag": "0006_close_pool_payable_side_doors",
+      "breakpoints": true
     }
   ]
 }

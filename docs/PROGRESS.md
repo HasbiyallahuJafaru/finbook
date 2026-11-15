@@ -6,12 +6,12 @@ _Last updated: 2026-11-15_
 
 ## Start here (next session)
 
-1. **Fix the pass-3 audit findings first:** `docs/audits/2026-11-15-phase2-slice2-pass3.md` (verdict FAIL: NGN lines bypass the pool/payable guards; an invoiced car can still be paid twice by three side doors). Migration 0005 is committed, so the fixes go in **0006**, each with a test that fails without it. Then run the ledger-auditor again.
-2. **Then staging** (it has 0000–0004; apply 0005 and 0006 together) and switch on the rate snapshot:
+1. **Pass-3 findings fixed in migration 0006**; ledger audit pass 6 PASS WITH NOTES (`docs/audits/2026-11-15-phase2-slice2-pass4-6.md`). Its owner decisions (below) are open, the first a spec conflict.
+2. **Staging** (it has 0000–0004; apply 0005 and 0006 together) and switch on the rate snapshot:
    - generate a password and pipe it in: `railway variable set -e staging -s migrate --skip-deploys --stdin FINBOOK_RATES_DB_PASSWORD`, then `railway up -s migrate -e staging --detach` (logs end with "migrations applied");
    - on the worker: `RATES_DATABASE_URL=postgresql://finbook_rates:${{migrate.FINBOOK_RATES_DB_PASSWORD}}@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}`, then `railway up -s worker -e staging --detach`;
    - the first snapshot runs at the next 10:30 Lagos; check `fx_reference_rates` has cbn and market rows.
-3. **Owner decisions open:** evidence mandatory vs "evidence pending" (see the audit doc). And: build a clickable design prototype with sample data (no backend) to see the UI now, or carry on with the backend (month-end revaluation next)? The real web app is still a placeholder page.
+3. **Owner decisions open** (details in the pass 4–6 audit doc): (a) **spec conflict, FX rule 5**: 0006 lets currency leave the pool only for one car or an invoice settlement, so selling leftover RMB, RMB bank charges and car-less RMB costs are refused until each gets an entry type, or an ADR scopes them out; (b) top-up payment after a settled invoice: allow both ways or neither; (c) credit notes/discounts on foreign invoices; (d) evidence mandatory vs "evidence pending". And: build a clickable design prototype with sample data (no backend) to see the UI now, or carry on with the backend (month-end revaluation next)? The real web app is still a placeholder page.
 
 ## Where we are
 
@@ -41,6 +41,8 @@ Research behind the next slices: `docs/research/2026-11-15-existing-platforms.md
 - Spot rate + source (`cbn` / `manual` with a note) on every pool payment and supplier invoice; `spotCarCost` gives the client-facing spot basis (ADR 0009). Car cost is net of reversals.
 - Migration 0005: `fx_reference_rates` (CBN + market, revisions, append-only), `spot_rate`/`spot_source` (check added NOT VALID so older rows can't block it), DB checks for cbn spot rates and payable settlements (under the tenant lock), `finbook_rates` login, hash payload v3.
 - Worker: daily CBN + market snapshot at 10:30 Lagos (ADR 0010), exact decimal parsing (`roundRate`).
+- Migration 0006 (audit passes 4–6): 1010 takes no NGN lines; foreign payables only from supplier invoices naming supplier and car; a car is paid directly or invoiced, not both (race-safe, lock before read); reversals can't be reversed; at commit, a settlement holds only 2000/1010/7000 with settled = spent, a car's cost reaches its 1150, and NGN on 2000 names the supplier and never exceeds what's owed (advances go to 1300); the rates login can't set `fetched_at`.
+- Security follow-ups (pre-existing, low): a session-level advisory lock can freeze a tenant's postings; no lock/idle/statement timeouts on `finbook_api`.
 - Known gaps: no mixed v2/v3 hash-chain test across the upgrade; the 10k fuzz test doesn't include pool, payable or spot lines; `counterparty_id` isn't typed (customer vs supplier) until the counterparties table lands (slice 3). Evidence stays optional on purpose: the spec lets entries post as "evidence pending" and flags them on the exception report.
 
 **Next slices, in order (build from the top):**
@@ -60,9 +62,9 @@ Research behind the next slices: `docs/research/2026-11-15-existing-platforms.md
 ## What exists
 
 - **Apps:** `apps/api` (NestJS 12, `GET /health`, Sentry), `apps/worker` (NestJS + BullMQ, `system` queue with a `ping` job, Sentry), `apps/web` (Next.js 16 on Cloudflare Workers via vinext, placeholder page). No auth or business endpoints yet.
-- **Packages:** `money`, `ledger`, `db` (Drizzle schema; migrations 0000–0004; `withTenant()`; `migrate()`).
+- **Packages:** `money`, `ledger`, `db` (Drizzle schema; migrations 0000–0006; `withTenant()`; `migrate()`).
 - **Database guarantees** (ADR 0006): API logs in as `finbook_api` (non-superuser) and runs as `finbook_app` under forced RLS; owner URL only for migrations. Balance at commit, append-only ledger and audit log, period lock, reversals mirror exactly, accounts frozen once posted to, FX checks, DB-stamped actor and time, audit rows, per-tenant hash chain with `ledger_chain_breaks()`. Known limit: chain tampering by a DB superuser needs an off-site anchor (backup manifest, phase 5).
-- **Tests:** money 9 and ledger 5 (100% branch coverage), api 2, worker 3 (1 needs Redis), db integration 35 (Testcontainers Postgres 18, needs Docker).
+- **Tests:** money 10 and ledger 10 (100% branch coverage), api 2, worker 7 (1 needs Redis), db integration 53 (Testcontainers Postgres 18, needs Docker).
 - **Quality gate:** `.githooks/pre-push` runs install, lint, typecheck, unit, integration and build before every push (ADR 0007). Strict type-aware ESLint bans float money (`parseFloat`, `Number()`, `Math.round` and friends, `toFixed`).
 - **Staging (Railway project `finbook`, env `staging`):** Postgres 18, Redis, api (https://api-staging-c68d0388.up.railway.app/health), worker, and a one-off `migrate` service. Production environment exists, empty, owner-run only. Details: `docs/deploy.md`.
 - **Decisions:** ADRs 0001–0010 in `docs/decisions/`. Research notes in `docs/research/`.

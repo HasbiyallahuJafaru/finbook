@@ -76,13 +76,13 @@ const trialBalance = (tenant: string) => tx(tenant, async (t) => {
 const chainBreaks = (tenant: string) => tx(tenant, async (t) =>
   (await t.client.query<{ seq: string | null; entry_id: string; problem: string }>('SELECT * FROM ledger_chain_breaks($1)', [tenant])).rows);
 
-/** A fresh tenant with the test chart (1010 is a CNY account) and an open January 2026 period. */
+/** A fresh tenant with the test chart and an open January 2026 period. 1010 (the pool) has no account currency, as in production; 1020 is a CNY account. */
 async function freshTenant(name: string): Promise<{ id: string; period: string }> {
   const id = (await owner<{ id: string }>('INSERT INTO tenants (legal_name) VALUES ($1) RETURNING id', [name])).rows[0]?.id ?? '';
   const ids: Record<string, string> = {};
   accounts[id] = ids;
   const period = await tx(id, async (t) => {
-    for (const [code, type, currency] of [['1000', 'asset', null], ['1010', 'asset', 'CNY'], ['2000', 'liability', null], ['3000', 'equity', null],
+    for (const [code, type, currency] of [['1000', 'asset', null], ['1010', 'asset', null], ['1020', 'asset', 'CNY'], ['2000', 'liability', null], ['3000', 'equity', null],
       ['4000', 'income', null], ['5000', 'expense', null], ['6000', 'expense', null], ['7000', 'income', null],
       ['1100', 'asset', null], ['1150', 'asset', null], ['2150', 'liability', null], ['4100', 'income', null], ['4200', 'income', null]] as const) {
       ids[code] = await one(t.client, 'INSERT INTO accounts (tenant_id, code, name, type, currency) VALUES ($1, $2, $3, $4, $5) RETURNING id',
@@ -322,7 +322,7 @@ describe('foreign currency lines', () => {
 
   test('currencies must be known, and a line must match its account currency', async () => {
     await assert.rejects(post(tenantA, usd({ currency: 'ZZZ' })), /journal_lines_currency/);
-    await assert.rejects(post(tenantA, usd({ account: '1010' })), /a USD line cannot post to a CNY account/);
+    await assert.rejects(post(tenantA, usd({ account: '1020' })), /a USD line cannot post to a CNY account/);
   });
 });
 
@@ -390,7 +390,7 @@ describe('phase 2: posting rules through the database', () => {
   const job = (v: string) => ({ vehicleId: v, counterpartyId: v });
 
   /** Persist one posting-rule result as one journal entry (what the API will do). */
-  const postLines = (tenant: string, period: string, lines: LedgerLine[], opts: { date?: string; reverses?: string } = {}) => tx(tenant, async (t) => {
+  const postLines = (tenant: string, period: string, lines: LedgerLine[], opts: { date?: string; reverses?: string; beforeCommit?: (c: pg.ClientBase) => Promise<unknown> } = {}) => tx(tenant, async (t) => {
     const ids = accounts[tenant] ?? {};
     const entryId = await one(t.client,
       'INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, reverses_entry_id) VALUES ($1, $2, $3, \'posting rule\', \'test\', uuidv7(), $4, $5) RETURNING id',
@@ -402,8 +402,24 @@ describe('phase 2: posting rules through the database', () => {
         [tenant, entryId, ids[l.account], l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null, l.spotRate ?? null, l.spotSource ?? null, l.rateNote ?? null,
           l.vehicleId ? car[l.vehicleId] : null, l.counterpartyId ? (l.counterpartyId.length === 36 ? l.counterpartyId : customer(l.counterpartyId)) : null]);
     }
+    await opts.beforeCommit?.(t.client);
     return entryId;
   });
+  /** Post `first` and keep its transaction open while `second` tries, then commit `first`. Resolves to `second`'s outcome. */
+  const race = async (tenant: string, period: string, first: LedgerLine[], second: LedgerLine[]) => {
+    let inserted = (): void => undefined;
+    let release = (): void => undefined;
+    const firstIn = new Promise<void>((r) => { inserted = r; });
+    const hold = new Promise<void>((r) => { release = r; });
+    const a = postLines(tenant, period, first, { beforeCommit: async () => { inserted(); await hold; } });
+    await firstIn;
+    const b = postLines(tenant, period, second);
+    b.catch(() => undefined); // judged by the caller, after the first commits
+    await new Promise((r) => setTimeout(r, 300)); // the second is now waiting on the tenant lock
+    release();
+    await a;
+    return b;
+  };
   /** The pool is derived from the ledger, never stored (ADR 0008): the CNY lines on account 1010. */
   const poolOf = (tenant: string) => tx(tenant, async (t) => {
     const r = (await t.client.query<{ bal: string; cost: string }>(
@@ -577,7 +593,8 @@ describe('phase 2: posting rules through the database', () => {
   test('a CBN rate more than 7 days old is not accepted as that day\'s CBN rate', async () => {
     const { id, period } = await funded('Stale CBN');
     const lines = payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines;
-    await assert.rejects(postLines(id, period, lines, { date: '2026-01-20' }), /no CBN rate for CNY in the 7 days up to 2026-01-20/);
+    // The stored CBN rate is for 2026-01-08: 7 days later still counts, 8 days later doesn't.
+    await assert.rejects(postLines(id, period, lines, { date: '2026-01-16' }), /no CBN rate for CNY in the 7 days up to 2026-01-16/);
     await postLines(id, period, lines, { date: '2026-01-15' });
   });
 
@@ -594,7 +611,7 @@ describe('phase 2: posting rules through the database', () => {
       { account: '3000', debit: 0n, credit: 100n, currency: 'NGN', amountMinor: 100n },
     ]), /journal_lines_spot/);
     // No USD rate has been published at all: a USD invoice marked cbn is refused.
-    await assert.rejects(postLines(id, period, supplierInvoice({ ...bill, currency: 'USD', amountMinor: 100n, rate: parseRate('1500.000000'), spot: SPOT_CBN })), /no CBN rate for USD in the 7 days/);
+    await assert.rejects(postLines(id, period, supplierInvoice({ vehicleId: 'B', supplierId: SUPPLIER, currency: 'USD', amountMinor: 100n, rate: parseRate('1500.000000'), spot: SPOT_CBN })), /no CBN rate for USD in the 7 days/);
   });
 
   test('reference rates: one per day per source; only the rates login can add them; nobody can change them', async () => {
@@ -607,6 +624,7 @@ describe('phase 2: posting rules through the database', () => {
       await ratesPool.query("INSERT INTO fx_reference_rates (rate_date, currency, rate, source, revision) VALUES ('2027-03-10', 'CNY', '108.500000', 'cbn', 2)"); // a correction
       assert.equal((await ratesPool.query<{ rate: string }>("SELECT rate FROM fx_reference_rates WHERE rate_date = '2027-03-10' AND source = 'cbn' ORDER BY revision DESC LIMIT 1")).rows[0]?.rate, '108.500000');
       await assert.rejects(add('blog', '110.000000'), /fx_reference_rates_source/);
+      await assert.rejects(ratesPool.query("INSERT INTO fx_reference_rates (rate_date, currency, rate, source, fetched_at) VALUES ('2027-03-12', 'CNY', '108.000000', 'cbn', '2027-03-01')"), /permission denied/); // can't backdate
       await assert.rejects(ratesPool.query('SELECT 1 FROM journal_lines'), /permission denied/);
       await assert.rejects(ratesPool.query('SELECT 1 FROM tenants'), /permission denied/);
     } finally {
@@ -620,27 +638,121 @@ describe('phase 2: posting rules through the database', () => {
   test('two payments at the same moment cannot both spend the same pool', async () => {
     const { id, period } = await funded('Pool race');
     const stale = await poolOf(id); // both payments are prepared from the same view: CNY 150,000.00
-    let holding = (): void => undefined;
-    let release = (): void => undefined;
-    const firstHasLine = new Promise<void>((r) => { holding = r; });
-    const gate = new Promise<void>((r) => { release = r; });
-    const first = tx(id, async (t) => {
-      const lines = payFromPool({ pool: stale, currency: 'CNY', amountMinor: 10_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines;
-      const entryId = await one(t.client, "INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key) VALUES ($1, $2, '2026-01-10', 'race 1', 'test', uuidv7(), 'race-1') RETURNING id", [id, period]);
-      for (const l of lines) {
-        await t.client.query('INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, spot_rate, spot_source, vehicle_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)',
-          [id, entryId, accounts[id]?.[l.account], l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null, l.spotRate ?? null, l.spotSource ?? null, car.A]);
-      }
-      holding();
-      await gate; // keep the transaction open while the second payment tries
-    });
-    await firstHasLine;
-    const second = postLines(id, period, payFromPool({ pool: stale, currency: 'CNY', amountMinor: 10_000_000n, vehicleId: 'B', spot: SPOT_CBN }).lines);
-    await new Promise((r) => setTimeout(r, 300)); // the second payment is now waiting on the tenant lock
-    release();
-    await first;
-    await assert.rejects(second, /pool overspent/);
+    const pay = (v: string) => payFromPool({ pool: stale, currency: 'CNY', amountMinor: 10_000_000n, vehicleId: v, spot: SPOT_CBN }).lines;
+    await assert.rejects(race(id, period, pay('A'), pay('B')), /pool overspent/);
     assert.deepEqual(await poolOf(id), { balanceMinor: 5_000_000n, costNgn: 533_333_333n });
+  });
+
+  test('an invoice and a direct pool payment for the same car at the same moment cannot both post (either order)', async () => {
+    const { id, period } = await funded('Invoice race');
+    const pool = await poolOf(id);
+    const invoice = (v: string) => supplierInvoice({ vehicleId: v, supplierId: SUPPLIER, currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN });
+    const direct = (v: string) => payFromPool({ pool, currency: 'CNY', amountMinor: 2_000_000n, vehicleId: v, spot: SPOT_CBN }).lines;
+    await assert.rejects(race(id, period, invoice('A'), direct('A')), /open supplier invoice/);
+    await assert.rejects(race(id, period, direct('B'), invoice('B')), /already paid straight from the pool/);
+  });
+
+  test('NGN lines cannot stand in for foreign money on the pool or a foreign payable', async () => {
+    const { id, period } = await funded('NGN side door');
+    await postLines(id, period, supplierInvoice({ ...bill, currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN }));
+    const ngn = (account: string, debit: bigint, credit: bigint, tags: Partial<LedgerLine> = {}): LedgerLine => ({ account, debit, credit, currency: 'NGN', amountMinor: debit + credit, ...tags });
+    // Raise car A's cost with no currency leaving any pool.
+    await assert.rejects(postLines(id, period, [ngn('1150', 100_000_000n, 0n, { vehicleId: 'A' }), ngn('1010', 0n, 100_000_000n)]), /holds foreign currency only/);
+    // "Pay" the CNY invoice in NGN, leaving its CNY balance open to be paid again: named, unnamed, or in the invoice's own entry.
+    const payNgn = ngn('2000', 210_000_000n, 0n, { vehicleId: 'A', counterpartyId: SUPPLIER });
+    await assert.rejects(postLines(id, period, [payNgn, ngn('1000', 0n, 210_000_000n)]), /more NGN than is owed/);
+    await assert.rejects(postLines(id, period, [ngn('2000', 210_000_000n, 0n), ngn('1000', 0n, 210_000_000n)]), /must name the supplier/);
+    await assert.rejects(postLines(id, period, [ngn('6000', 1_000n, 0n), ngn('2000', 0n, 1_000n)]), /must name the supplier/); // an unnamed bill could never be paid
+    const invoiceB = supplierInvoice({ vehicleId: 'B', supplierId: SUPPLIER, currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN });
+    await assert.rejects(postLines(id, period, [{ ...payNgn, vehicleId: 'B' }, ...invoiceB, ngn('1000', 0n, 210_000_000n)]), /more NGN than is owed/);
+    await postLines(id, period, payPayableFromPool({ ...bill, pool: await poolOf(id), payable: await payableOf(id), currency: 'CNY', amountMinor: 2_000_000n, spot: SPOT_CBN }).lines);
+    // An NGN bill and its payment post; paying a kobo more than the bill does not.
+    await postLines(id, period, [ngn('6000', 5_000_000n, 0n), ngn('2000', 0n, 5_000_000n, { counterpartyId: SUPPLIER })]);
+    await assert.rejects(postLines(id, period, [ngn('2000', 5_000_001n, 0n, { counterpartyId: SUPPLIER }), ngn('1000', 0n, 5_000_001n)]), /more NGN than is owed/);
+    await postLines(id, period, [ngn('2000', 5_000_000n, 0n, { counterpartyId: SUPPLIER }), ngn('1000', 0n, 5_000_000n)]);
+  });
+
+  test('a car\'s supplier cost goes to that car\'s job costs, and a settlement cannot pay a car from the pool as well', async () => {
+    const { id, period } = await funded('Entry shape');
+    const pay = payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines;
+    const cost = /must go to that car's job costs \(1150\)/;
+    await assert.rejects(postLines(id, period, pay.map((l) => (l.account === '1010' ? { ...l, vehicleId: 'B' } : l))), cost); // pool names B, 1150 names A
+    const inv = supplierInvoice({ ...bill, currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN });
+    await assert.rejects(postLines(id, period, inv.map((l) => (l.account === '1150' ? { ...l, account: '6000', vehicleId: undefined } : l))), cost); // invoice expensed, car never costed
+    await postLines(id, period, inv);
+    const settle = payPayableFromPool({ ...bill, pool: await poolOf(id), payable: await payableOf(id), currency: 'CNY', amountMinor: 2_000_000n, spot: SPOT_CBN }).lines;
+    const shape = /a supplier settlement holds only the payable \(2000\), the pool \(1010, no car\) and realized FX \(7000\)/;
+    await assert.rejects(postLines(id, period, settle.map((l) => (l.account === '1010' ? { ...l, vehicleId: 'A' } : l))), /settle a supplier invoice in the same entry/); // pool line names the car
+    await assert.rejects(postLines(id, period, settle.map((l) => (l.account === '7000' ? { ...l, account: '1150', vehicleId: 'B' } : l))), shape); // FX gap into car B's cost
+    // Clear the payable with no currency leaving the pool, as "income": refused.
+    const [payableLine] = settle;
+    if (!payableLine) throw new Error('settlement has a payable line');
+    await assert.rejects(postLines(id, period, [payableLine, { account: '7000', debit: 0n, credit: payableLine.debit, currency: 'NGN', amountMinor: payableLine.debit }]), /an invoice is settled only from the pool/);
+    await postLines(id, period, settle);
+  });
+
+  test('a chart without 7000 refuses a settlement whose FX gap goes elsewhere (a missing account does not open the shape check)', async () => {
+    const { id, period } = await funded('No 7000');
+    await owner("UPDATE accounts SET code = '7999' WHERE tenant_id = $1 AND code = '7000'", [id]); // the app can't recode accounts; the owner sets up the odd chart
+    await postLines(id, period, supplierInvoice({ ...bill, currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN }));
+    const settle = payPayableFromPool({ ...bill, pool: await poolOf(id), payable: await payableOf(id), currency: 'CNY', amountMinor: 2_000_000n, spot: SPOT_CBN }).lines;
+    await assert.rejects(postLines(id, period, settle.map((l) => (l.account === '7000' ? { ...l, account: '1150', vehicleId: 'B' } : l))), /a supplier settlement holds only/);
+  });
+
+  test('a car paid straight from the pool cannot be invoiced too, and a reversal cannot be reversed', async () => {
+    const { id, period } = await funded('Pay then invoice');
+    const paid = payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 2_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines;
+    const payId = await postLines(id, period, paid);
+    const invoice = supplierInvoice({ ...bill, currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN });
+    await assert.rejects(postLines(id, period, invoice), /already paid straight from the pool/);
+    const mirror = (lines: LedgerLine[]) => lines.map((l) => ({ ...l, debit: l.credit, credit: l.debit }));
+    const revId = await postLines(id, period, mirror(paid), { reverses: payId });
+    await postLines(id, period, invoice);
+    // Reversing the reversal would re-post the direct payment beside the invoice.
+    await assert.rejects(postLines(id, period, paid, { reverses: revId }), /is itself a reversal/);
+  });
+
+  test('a pool payment must name the car or settle an invoice in the same entry', async () => {
+    const { id, period } = await funded('Car-less pool payment');
+    const lines = payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines;
+    const carless = lines.map((l) => (l.account === '1010' ? { ...l, vehicleId: undefined } : l));
+    await assert.rejects(postLines(id, period, carless), /must name the car, or settle a supplier invoice/);
+    // Clearing the tenant setting before COMMIT must not blind the commit-time check (security review).
+    await assert.rejects(postLines(id, period, carless, { beforeCommit: (c) => c.query("SELECT set_config('app.tenant_id', '', true)") }), /must name the car, or settle a supplier invoice/);
+    await postLines(id, period, supplierInvoice({ ...bill, currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN }));
+    // Pays CNY 20,000.00 from the pool but settles only CNY 10,000.00 of the invoice: refused.
+    const settled = payPayableFromPool({ ...bill, pool: await poolOf(id), payable: await payableOf(id), currency: 'CNY', amountMinor: 1_000_000n, spot: SPOT_CBN });
+    const settle = settled.lines;
+    const extra = payFromPool({ pool: settled.pool, currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines
+      .map((l) => (l.account === '1010' ? { ...l, vehicleId: undefined, counterpartyId: SUPPLIER } : { ...l, account: '6000', vehicleId: undefined }));
+    await assert.rejects(postLines(id, period, [...settle, ...extra]), /must name the car, or settle a supplier invoice/);
+    await postLines(id, period, settle);
+  });
+
+  test('a foreign payable is created only by a supplier invoice naming the supplier and the car', async () => {
+    const { id, period } = await funded('Invoice only');
+    const inv = supplierInvoice({ ...bill, currency: 'CNY', amountMinor: 1_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN });
+    const payable = (l: LedgerLine) => l.account === '2000';
+    await assert.rejects(postLines(id, period, inv.map((l) => (payable(l) ? { ...l, rateSource: 'bank_receipt', spotRate: undefined, spotSource: undefined } : l))), /created only by a supplier invoice/);
+    await assert.rejects(postLines(id, period, inv.map((l) => (payable(l) ? { ...l, rateSource: 'manual', rateNote: 'x' } : l))), /created only by a supplier invoice/);
+    await assert.rejects(postLines(id, period, inv.map((l) => (payable(l) ? { ...l, vehicleId: undefined } : l))), /must name the supplier and the car/);
+    await postLines(id, period, inv);
+  });
+
+  test('payables are per car: a supplier\'s balance on another car cannot cover this car\'s payment', async () => {
+    const { id, period } = await funded('Two cars, one supplier');
+    for (const v of ['A', 'B']) await postLines(id, period, supplierInvoice({ vehicleId: v, supplierId: SUPPLIER, currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN }));
+    const supplierTotal = { balanceMinor: 4_000_000n, costNgn: 420_000_000n }; // both cars together
+    await assert.rejects(postLines(id, period, payPayableFromPool({ ...bill, pool: await poolOf(id), payable: supplierTotal, currency: 'CNY', amountMinor: 3_000_000n, spot: SPOT_CBN }).lines),
+      /exceeds the 2000000 owed to this supplier for this car/);
+  });
+
+  test('a CBN spot rate must match the latest revision for that day', async () => {
+    const { id, period } = await funded('CBN revision');
+    await owner("INSERT INTO fx_reference_rates (rate_date, currency, rate, source, revision) VALUES ('2026-01-25', 'CNY', '107.000000', 'cbn', 1), ('2026-01-25', 'CNY', '107.500000', 'cbn', 2)"); // fixture rates: a corrected publication
+    const pay = (rate: string) => postLines(id, period, payFromPool({ pool: { balanceMinor: 15_000_000n, costNgn: 1_600_000_000n }, currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'A', spot: { rate: parseRate(rate), source: 'cbn' } }).lines, { date: '2026-01-25' });
+    await assert.rejects(pay('107.000000'), /the CBN rate for CNY on 2026-01-25 is 107.500000/);
+    await pay('107.500000');
   });
 });
 
@@ -648,10 +760,11 @@ describe('phase 1 gate', () => {
   test('10k random entries: trial balance nets to zero, chain intact, invalid entries all refused', { timeout: 900_000 }, async () => {
     let seed = 20260115n;
     const rnd = (max: bigint) => ((seed = (seed * 6364136223846793005n + 1442695040888963407n) % 2n ** 64n), (seed >> 11n) % max);
-    const ngnCodes = ['1000', '2000', '3000', '4000', '5000', '6000', '7000'];
+    // 2150, not 2000: an unnamed NGN debit on payables is refused (it must name the supplier and stay within what's owed).
+    const ngnCodes = ['1000', '2150', '3000', '4000', '5000', '6000', '7000'];
     const pick = () => ngnCodes[Number(rnd(BigInt(ngnCodes.length)))] ?? '1000';
 
-    // Random balanced entry: 1-3 lines on one side (NGN, or CNY into the CNY account 1010), the same total
+    // Random balanced entry: 1-3 lines on one side (NGN, or CNY into the pool 1010), the same total
     // split over 1-3 NGN lines on the other side. Half the time the sides are swapped.
     const randomEntry = (): Entry => {
       const side: Line[] = [];

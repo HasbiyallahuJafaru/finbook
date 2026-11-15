@@ -84,7 +84,8 @@ function spotOf(spot: Spot, rateNote: string | undefined): Pick<Line, 'spotRate'
 function poolOut(e: { pool: Pool; currency: string; amountMinor: bigint; spot: Spot; rateNote?: string }, tags: Tags): { line: Line; pool: Pool } {
   const spot = spotOf(e.spot, e.rateNote);
   const { costNgn, pool } = poolSpend(e.pool, e.amountMinor);
-  // ponytail: a pool left holding currency with no NGN cost (rounding at extreme rates) refuses payments; clear it with a manual journal.
+  // ponytail: a pool left holding currency with no NGN cost (rounding at extreme rates) refuses payments. 1010 takes no NGN
+  // lines (migration 0006), so clearing it waits for the month-end revaluation account (next slice).
   if (costNgn === 0n) throw new Error('pool payment rounds to zero kobo');
   return {
     pool,
