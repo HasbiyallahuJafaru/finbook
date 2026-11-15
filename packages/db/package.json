@@ -1,0 +1,23 @@
+{
+  "name": "@app/db",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc -p . --noEmit",
+    "lint": "eslint .",
+    "test:integration": "node --test \"test/**/*.integration.test.ts\"",
+    "generate": "drizzle-kit generate",
+    "migrate": "node src/migrate.ts"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.45.4",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@app/money": "workspace:*",
+    "@testcontainers/postgresql": "^12.2.1",
+    "@types/pg": "^8.23.1",
+    "drizzle-kit": "^0.31.11"
+  }
+}

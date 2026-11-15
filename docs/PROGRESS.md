@@ -6,7 +6,9 @@ _Last updated: 2026-11-15_
 
 ## Current phase
 
-**Phase 0 — Foundations** (in progress: money package done, everything needing installs or deploys not started). Gate: both sides deployed from main; `money` property tests pass (10k random conversions, no float drift). See `docs/spec/build-spec.md` → Build phases.
+**Phase 1 — Ledger core** (in progress). Gate: 10k random entries keep the trial balance at zero; a cross-tenant read returns zero rows. **Gate test passes locally** (`pnpm test:integration`, Testcontainers Postgres 18). Waiting on: ledger-auditor + security-reviewer findings, then apply migrations to staging, then CI green.
+
+**Phase 0** is done except owner-blocked items: web staging deploy (Cloudflare login), CI (GitHub billing lock), Railway↔GitHub, Sentry DSNs (see `docs/deploy.md` → Open items).
 
 ## Done
 
@@ -24,6 +26,7 @@ _Last updated: 2026-11-15_
 - Sentry in `apps/api` and `apps/worker` (`@sentry/nestjs` 11.12): `src/instrument.ts` loaded by `node --import ./dist/instrument.js` (ESM), DSN/environment from `SENTRY_DSN` / `SENTRY_ENVIRONMENT` (no DSN = disabled). API has `SentryModule` + `SentryGlobalFilter`; BullMQ processor errors are auto-captured by the SDK. Unverified against a real Sentry project (needs a DSN). Known: Nest logs a harmless-looking warning that `SentryGlobalFilter` has no decorator metadata at index [0]; unhandled errors still return 500 (tested). Revisit if error responses misbehave.
 - **Staging is live on Railway** (project `finbook`, env `staging`): Postgres, Redis, api (https://api-staging-c68d0388.up.railway.app/health → ok), worker (connected to Redis). Details and open items in `docs/deploy.md`. Policy: Claude does staging infra; production is user-run only (CLAUDE.md, settings.json deny rules).
 - Web staging Worker `finbook-web-staging` not deployed: Cloudflare login expired (user must run `pnpm --filter @app/web exec cf login`). Dry run passes.
+- `packages/db` (phase 1): Drizzle schema (`src/schema.ts`) + migrations `0000_init` (tables) and `0001_ledger_guarantees` (hand-written: RLS, `finbook_app` role, append-only triggers, period lock, deferred balance check, hash chain, `ledger_chain_breaks()`). `withTenant(pool, tenantId, fn)` is the only way app code should touch tenant data. 19 integration tests incl. the 10k fuzz gate. ADR 0006 explains the design. Not yet: `firm_access`, gapless numbers, period reopen, backup bundle versioning, packages/ledger posting rules (phase 2).
 - ADRs 0003 (scaled-bigint rates), 0004 (Drizzle), 0005 (TypeScript pinned to ~6.0.3 because typescript-eslint doesn't support 7 yet) written.
 
 ## Next
