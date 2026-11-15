@@ -4,7 +4,7 @@ Claude may build and deploy **staging** (CLAUDE.md → Infrastructure and deploy
 
 ## What exists (2026-11-15)
 
-Staging Postgres has migrations 0000–0007 applied (last run 2026-11-15, via the `migrate` service). The worker's daily rate snapshot (10:30 Lagos, ADR 0010) writes as `finbook_rates`.
+Staging Postgres has migrations 0000–0008 applied (last run 2026-11-15, via the `migrate` service). The worker's daily rate snapshot (10:30 Lagos, ADR 0010) writes as `finbook_rates`.
 
 ### Railway project `finbook` (workspace: hasbiyallahujafaru's Projects)
 

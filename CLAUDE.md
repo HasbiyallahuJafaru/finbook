@@ -103,7 +103,7 @@ The Flutter app (phase 6) will be another API client, so every rule must live in
 pnpm install
 pnpm dev                     # apps that have a dev script (web on :3001)
 pnpm lint | pnpm typecheck | pnpm test | pnpm build
-pnpm test:integration        # Testcontainers Postgres 18 — needs Docker
+pnpm test:integration        # Testcontainers Postgres 18 — needs Docker Desktop running (start it if "no container runtime")
 pnpm db:generate             # migration from changes to packages/db/src/schema.ts
 pnpm db:new <verb_noun>      # empty forward-only SQL migration (triggers, policies, grants)
 pnpm db:migrate              # needs DATABASE_OWNER_URL; local, or staging via the Railway `migrate` service
@@ -124,6 +124,7 @@ Not built yet: `pnpm openapi` (arrives with `packages/contracts` and the first r
 - **Docs first:** before writing any integration code (Clerk, Resend, R2, Railway, Cloudflare, BullMQ, Sentry, Drizzle), fetch the official docs. Never rely on remembered syntax or auth flows.
 - **Latest versions:** check the registry for the latest stable version before adding or referencing any package or model. Never pin a version from memory.
 - **Ledger or FX change:** use the `ledger-change` skill. Write the worked-example test first, to the kobo.
+- **Whole-entry DB checks** go in an `assert_*(e journal_entries)` function called from `post_journal_entry` (migration 0007), with `REVOKE EXECUTE ... FROM PUBLIC`. Never as a separate deferred trigger: those can be fired early with `SET CONSTRAINTS` and dodged. An integration test fails if any non-trigger definer function is executable by a non-owner role.
 - **New endpoint:** use the `new-endpoint` skill. **Schema change:** use the `db-migration` skill.
 - **Before every commit:** the `verify` skill runs. Do not commit with red checks. **Before every push:** `.githooks/pre-push` runs the full CI steps and blocks on red (ADR 0007; GitHub Actions is billing-locked). Never push with `--no-verify`.
 - **Review:** after changes to `packages/ledger`, `packages/money`, posting, reports or permissions, run the `ledger-auditor` subagent. After auth, RLS or document access changes, run the `security-reviewer` subagent.
