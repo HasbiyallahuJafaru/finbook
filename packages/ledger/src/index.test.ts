@@ -24,12 +24,18 @@
 //       check: 4,266,666.67 + 1,316,666.67 + 550,000.00 + 133,333.33 + 183,333.33 = 6,450,000.00
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseRate, type Pool } from '@app/money';
-import { buyCurrency, completeAgentJob, completeClearingJob, customerReceipt, jobPosition, payFromPool, sharedCost, type Line } from './index.ts';
+import { convert, parseRate, type Pool } from '@app/money';
+import {
+  buyCurrency, completeAgentJob, completeClearingJob, customerReceipt, jobPosition, payFromPool, payPayableFromPool, sharedCost, spotCarCost, supplierInvoice, type Line,
+} from './index.ts';
 
 const FIXTURE_RATE_BUY_1 = parseRate('100.000000');
 const FIXTURE_RATE_BUY_2 = parseRate('120.000000');
 const FIXTURE_RATE_QUOTE = parseRate('110.000000');
+const FIXTURE_RATE_SPOT = parseRate('108.000000'); // spot (reference) rate on the payment day
+const FIXTURE_RATE_INVOICE_LOW = parseRate('95.000000');
+const SPOT_CBN = { rate: FIXTURE_RATE_SPOT, source: 'cbn' as const };
+const FIXTURE_RATE_INVOICE = parseRate('105.000000'); // rate on the supplier's invoice
 
 const balanced = (lines: Line[]) => lines.reduce((s, l) => s + l.debit - l.credit, 0n) === 0n;
 const balances = (lines: Line[]) => {
@@ -56,14 +62,14 @@ test('worked example: 3 cars, 1 shared container, 3 rates, 1 sale, to the kobo',
 
   let pool: Pool = { balanceMinor: 15_000_000n, costNgn: 1_600_000_000n };
   const pay = (vehicleId: string, amountMinor: bigint) => {
-    const r = payFromPool({ pool, currency: 'CNY', amountMinor, vehicleId });
+    const r = payFromPool({ pool, currency: 'CNY', amountMinor, vehicleId, spot: SPOT_CBN });
     pool = r.pool;
     entries.push(r.lines);
     return r.lines;
   };
   assert.deepEqual(pay('A', 4_000_000n), [
     { account: '1150', debit: 426_666_667n, credit: 0n, currency: 'NGN', amountMinor: 426_666_667n, vehicleId: 'A' },
-    { account: '1010', debit: 0n, credit: 426_666_667n, currency: 'CNY', amountMinor: 4_000_000n, rate: '106.666667', rateSource: 'pool_average', vehicleId: 'A' },
+    { account: '1010', debit: 0n, credit: 426_666_667n, currency: 'CNY', amountMinor: 4_000_000n, rate: '106.666667', rateSource: 'pool_average', spotRate: '108.000000', spotSource: 'cbn', vehicleId: 'A' },
   ]);
   pay('B', 3_500_000n);
   pay('C', 4_500_000n);
@@ -149,7 +155,10 @@ test('guards: bad amounts, duplicate cars, missing or mismatched supplier paymen
   assert.throws(() => sharedCost({ amountNgn: -300n, vehicleIds: ['A'] }), /cost must be positive/);
   assert.throws(() => sharedCost({ amountNgn: 1n, vehicleIds: [] }), /at least one car/);
   assert.throws(() => sharedCost({ amountNgn: 300n, vehicleIds: ['A', 'A'] }), /only once/);
-  assert.throws(() => payFromPool({ pool: { balanceMinor: 10n ** 12n, costNgn: 1n }, currency: 'CNY', amountMinor: 1n, vehicleId: 'Z' }), /rounds to zero/);
+  assert.throws(() => payFromPool({ pool: { balanceMinor: 10n ** 12n, costNgn: 1n }, currency: 'CNY', amountMinor: 1n, vehicleId: 'Z', spot: SPOT_CBN }), /rounds to zero/);
+  assert.throws(() => payFromPool({ pool: { balanceMinor: 100n, costNgn: 100n }, currency: 'CNY', amountMinor: 1n, vehicleId: 'Z', spot: { rate: 0n, source: 'cbn' } }), /spot rate must be positive/);
+  assert.throws(() => payFromPool({ pool: { balanceMinor: 100n, costNgn: 100n }, currency: 'CNY', amountMinor: 1n, vehicleId: 'Z', spot: { rate: FIXTURE_RATE_SPOT, source: 'manual' } }), /manual spot rate needs a note/);
+  assert.throws(() => supplierInvoice({ vehicleId: 'D', supplierId: 's', currency: 'CNY', amountMinor: 0n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN }), /amount must be positive/);
   assert.throws(() => completeAgentJob({ ...job('X'), quote: { ...quoteA, currency: 'USD' }, history: historyX }), /quote is in USD but the car was paid in CNY/);
   assert.throws(() => completeAgentJob({ ...job('none'), quote: quoteA, history: historyX }), /no supplier payment/);
   assert.throws(() => completeAgentJob({ ...job('X'), quote: { ...quoteA, sellingMinor: 0n }, history: historyX }), /selling price must be positive/);
@@ -159,4 +168,95 @@ test('guards: bad amounts, duplicate cars, missing or mismatched supplier paymen
   const refunded: Line[] = [...historyX, { account: '2150', debit: 2_000_000n, credit: 0n, currency: 'NGN', amountMinor: 2_000_000n, vehicleId: 'X' }];
   assert.throws(() => completeAgentJob({ ...job('X'), quote: quoteA, history: refunded }), /funds held for this job are negative/);
   assert.throws(() => completeClearingJob({ ...job('Y'), landingChargeNgn: 0n, history: [] }), /landing charge must be positive/);
+});
+
+// Realized FX on a payable (spec FX rule 5), hand-worked. Pool: CNY 100,000.00 costing NGN 10,000,000.00 (average 100).
+//  1. Supplier invoice for car D: CNY 20,000.00 at the invoice rate FIXTURE_RATE_INVOICE (105) = NGN 2,100,000.00 -> Dr 1150, Cr 2000 (CNY payable).
+//     The invoice-day spot rate (FIXTURE_RATE_SPOT, 108, from CBN) is recorded for the spot basis.
+//  2. Pay it from the pool: CNY 20,000.00 x average 100 = NGN 2,000,000.00 out of the pool.
+//     The payable comes off at its booked NGN 2,100,000.00: realized FX gain NGN 100,000.00 (7000).
+const supplier = { vehicleId: 'D', supplierId: 'supplier-1' };
+const invoiceD = supplierInvoice({ ...supplier, currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN, evidenceDocumentId: 'doc-inv' });
+
+test('realized FX: a supplier invoice booked at one rate and paid from the pool at another', () => {
+  assert.deepEqual(invoiceD, [
+    { account: '1150', debit: 210_000_000n, credit: 0n, currency: 'NGN', amountMinor: 210_000_000n, vehicleId: 'D' },
+    {
+      account: '2000', debit: 0n, credit: 210_000_000n, currency: 'CNY', amountMinor: 2_000_000n, rate: '105.000000', rateSource: 'agent_invoice',
+      spotRate: '108.000000', spotSource: 'cbn', vehicleId: 'D', counterpartyId: 'supplier-1', evidenceDocumentId: 'doc-inv',
+    },
+  ]);
+  const paid = payPayableFromPool({
+    ...supplier, pool: { balanceMinor: 10_000_000n, costNgn: 1_000_000_000n }, payable: { balanceMinor: 2_000_000n, costNgn: 210_000_000n },
+    currency: 'CNY', amountMinor: 2_000_000n, spot: SPOT_CBN, evidenceDocumentId: 'doc-voucher',
+  });
+  assert.deepEqual(paid.lines, [
+    { account: '2000', debit: 210_000_000n, credit: 0n, currency: 'CNY', amountMinor: 2_000_000n, rate: '105.000000', rateSource: 'payable_average', vehicleId: 'D', counterpartyId: 'supplier-1', evidenceDocumentId: 'doc-voucher' },
+    { account: '1010', debit: 0n, credit: 200_000_000n, currency: 'CNY', amountMinor: 2_000_000n, rate: '100.000000', rateSource: 'pool_average', spotRate: '108.000000', spotSource: 'cbn', counterpartyId: 'supplier-1', evidenceDocumentId: 'doc-voucher' },
+    { account: '7000', debit: 0n, credit: 10_000_000n, currency: 'NGN', amountMinor: 10_000_000n, vehicleId: 'D' },
+  ]);
+  assert.deepEqual(paid.pool, { balanceMinor: 8_000_000n, costNgn: 800_000_000n });
+  assert.deepEqual(paid.payable, { balanceMinor: 0n, costNgn: 0n });
+  const history = [...invoiceD, ...paid.lines];
+  assert.ok(balanced(invoiceD) && balanced(paid.lines));
+  assert.equal(balances(history)['2000'], 0n, 'payable fully settled');
+  // The car carries the invoice-rate cost; the currency gap was realized at payment, so completion won't count it twice.
+  assert.deepEqual(jobPosition(history, 'D'), { carCurrency: 'CNY', carMinor: 2_000_000n, carNgn: 210_000_000n, costNgn: 210_000_000n, fundsHeldNgn: 0n });
+});
+
+test('realized FX loss: invoice booked at 95, cleared with currency that cost 100', () => {
+  // Payable CNY 20,000.00 booked at FIXTURE_RATE_INVOICE_LOW (95) = NGN 1,900,000.00; the pool pays NGN 2,000,000.00 -> loss NGN 100,000.00.
+  const loss = payPayableFromPool({
+    ...supplier, pool: { balanceMinor: 10_000_000n, costNgn: 1_000_000_000n }, payable: { balanceMinor: 2_000_000n, costNgn: convert(2_000_000n, FIXTURE_RATE_INVOICE_LOW) },
+    currency: 'CNY', amountMinor: 2_000_000n, spot: SPOT_CBN,
+  });
+  assert.deepEqual(only(loss.lines), [['2000', 190_000_000n, 0n, 'D'], ['1010', 0n, 200_000_000n, null], ['7000', 10_000_000n, 0n, 'D']]);
+});
+
+test('part payments clear the payable to exactly zero; overpaying is refused', () => {
+  // Invoice CNY 3,000.03 at 100.5 = NGN 301,503.0150 -> booked 30,150,302 kobo. Three payments of CNY 1,000.01:
+  // 1st 30,150,302 x 1/3 = 10,050,100.67 -> 10,050,101; 2nd 20,100,201 x 1/2 = 10,050,100.5 -> 10,050,101; 3rd takes the remaining 10,050,100.
+  let payable = { balanceMinor: 300_003n, costNgn: convert(300_003n, parseRate('100.500000')) }; // fixture invoice rate
+  assert.equal(payable.costNgn, 30_150_302n);
+  let pool = { balanceMinor: 10_000_000n, costNgn: 1_000_000_000n };
+  const settledNgn: bigint[] = [];
+  for (let i = 0; i < 3; i++) {
+    const r = payPayableFromPool({ ...supplier, pool, payable, currency: 'CNY', amountMinor: 100_001n, spot: SPOT_CBN });
+    settledNgn.push(r.lines[0]?.debit ?? 0n);
+    ({ pool, payable } = r);
+  }
+  assert.deepEqual(settledNgn, [10_050_101n, 10_050_101n, 10_050_100n]);
+  assert.deepEqual(payable, { balanceMinor: 0n, costNgn: 0n }, 'no kobo stranded on a settled payable');
+  assert.throws(() => payPayableFromPool({ ...supplier, pool, payable: { balanceMinor: 100n, costNgn: 100n }, currency: 'CNY', amountMinor: 101n, spot: SPOT_CBN }), /exceeds what is owed to this supplier for this car/);
+});
+
+test('a reversed invoice or payment drops out of the car cost exactly', () => {
+  const mirror = (lines: Line[]): Line[] => lines.map((l) => ({ ...l, debit: l.credit, credit: l.debit }));
+  // Invoice, reverse it, re-enter it: the car cost is one invoice, not two.
+  const history = [...invoiceD, ...mirror(invoiceD), ...invoiceD];
+  assert.deepEqual(jobPosition(history, 'D'), { carCurrency: 'CNY', carMinor: 2_000_000n, carNgn: 210_000_000n, costNgn: 210_000_000n, fundsHeldNgn: 0n });
+  assert.equal(spotCarCost(history, 'D'), 216_000_000n, 'CNY 20,000.00 x spot 108');
+  // Paying and then reversing the payment of the invoice leaves the car cost at the invoice.
+  const settled = payPayableFromPool({ ...supplier, pool: { balanceMinor: 10_000_000n, costNgn: 1_000_000_000n }, payable: { balanceMinor: 2_000_000n, costNgn: 210_000_000n }, currency: 'CNY', amountMinor: 2_000_000n, spot: SPOT_CBN }).lines;
+  assert.equal(jobPosition([...invoiceD, ...settled, ...mirror(settled)], 'D').carNgn, 210_000_000n);
+  // A pool payment that was reversed leaves no cost behind.
+  const paid = payFromPool({ pool: { balanceMinor: 15_000_000n, costNgn: 1_600_000_000n }, currency: 'CNY', amountMinor: 2_000_000n, vehicleId: 'E', spot: SPOT_CBN }).lines;
+  assert.deepEqual(jobPosition([...paid, ...mirror(paid)], 'E'), { carCurrency: 'CNY', carMinor: 0n, carNgn: 0n, costNgn: 0n, fundsHeldNgn: 0n });
+  assert.equal(spotCarCost([...paid, ...mirror(paid)], 'E'), 0n);
+});
+
+// Spot basis (ADR 0009: what clients see). Car A: CNY 40,000.00 paid from the pool on a day the CBN spot rate was 108 ->
+// spot-basis cost NGN 4,320,000.00 (pool basis 4,266,666.67). Car D: invoiced CNY 20,000.00 on a day spot was 108 ->
+// NGN 2,160,000.00 (the agent's invoice rate of 105 gives the firm's booked 2,100,000.00).
+test('spot basis: each foreign cost at the spot rate on its own transaction day', () => {
+  const a = payFromPool({ pool: { balanceMinor: 15_000_000n, costNgn: 1_600_000_000n }, currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines;
+  assert.equal(spotCarCost(a, 'A'), 432_000_000n);
+  assert.equal(jobPosition(a, 'A').carNgn, 426_666_667n, 'pool basis, for the firm only');
+  assert.equal(spotCarCost(invoiceD, 'D'), 216_000_000n);
+  assert.equal(spotCarCost(a, 'nobody'), 0n);
+  // A cost line with no spot rate (e.g. posted before ADR 0009) counts at its booked NGN.
+  assert.equal(spotCarCost(historyX, 'X'), 120_000n);
+  const manual = payFromPool({ pool: { balanceMinor: 100n, costNgn: 10_000n }, currency: 'CNY', amountMinor: 100n, vehicleId: 'M', spot: { rate: parseRate('99.000000'), source: 'manual' } /* fixture */, rateNote: 'BDC receipt, CBN rate not yet published' });
+  const [, poolLine] = manual.lines;
+  assert.deepEqual([poolLine?.spotSource, poolLine?.rateNote], ['manual', 'BDC receipt, CBN rate not yet published']);
 });

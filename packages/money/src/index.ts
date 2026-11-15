@@ -20,6 +20,19 @@ export function parseRate(s: string): bigint {
   return rate;
 }
 
+/**
+ * A positive decimal string with any number of places (as published by a rate feed) -> rate scaled by 10^6,
+ * rounded half-up. Exact: never goes through a float. Rejects signs, exponents and zero.
+ */
+export function roundRate(s: string): bigint {
+  if (!/^\d+(?:\.\d+)?$/.test(s)) throw new Error(`invalid rate: ${s}`);
+  const [whole, frac = ''] = s.split('.') as [string, string?];
+  const digits = BigInt(whole + frac.padEnd(6, '0').slice(0, 6));
+  const rate = frac.charAt(6) >= '5' ? digits + 1n : digits; // charAt past the end is '', which is < '5'
+  if (rate === 0n) throw new Error('rate must be positive');
+  return rate;
+}
+
 /** n / d rounded half-up (away from zero for negatives). d must be positive. */
 export function divHalfUp(n: bigint, d: bigint): bigint {
   if (d <= 0n) throw new Error('divisor must be positive');

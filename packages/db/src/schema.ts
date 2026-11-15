@@ -95,6 +95,10 @@ export const journalLines = pgTable('journal_lines', {
   rate: numeric('rate', { precision: 18, scale: 6 }),
   rateSource: text('rate_source'),
   rateNote: text('rate_note'),
+  // Spot (reference) rate on the transaction day, confirmed by the user: required on pool payments (ADR 0009).
+  spotRate: numeric('spot_rate', { precision: 18, scale: 6 }),
+  // Where the spot rate came from: the stored CBN rate for the entry date, or typed in with a rate_note (ADR 0010).
+  spotSource: text('spot_source'),
   // Links filled from phase 2 (vehicles, counterparties, documents); present now so the hash payload never changes shape.
   evidenceDocumentId: uuid('evidence_document_id'),
   vehicleId: uuid('vehicle_id'),
@@ -105,16 +109,18 @@ export const journalLines = pgTable('journal_lines', {
   index('journal_lines_tenant_account').on(t.tenantId, t.accountId),
   index('journal_lines_entry').on(t.entryId),
   check('journal_lines_one_side', sql`${t.debitNgn} >= 0 and ${t.creditNgn} >= 0 and (${t.debitNgn} > 0) <> (${t.creditNgn} > 0)`),
-  // NGN lines: amount equals the NGN side, no rate. Foreign lines: rate + source required, and the NGN side
-  // must equal amount x rate rounded half-up to the kobo (same rule as packages/money convert(); ADR 0003).
-  // pool_average lines (out of the weighted-average pool): NGN is the exact pool cost and the rate only describes it (ADR 0008).
-  // coalesce(..., false): a CHECK that evaluates to NULL passes, so a missing rate or source must count as false.
+  // Shape of the spot fields (ADR 0009, 0010): NGN lines never carry one; otherwise rate and source come together, and a
+  // manual spot rate needs a note. Which lines must carry one is checked by the check_spot_source trigger (it knows reversals).
+  check('journal_lines_spot', sql`coalesce(case
+    when ${t.currency} = 'NGN' then ${t.spotRate} is null and ${t.spotSource} is null
+    else (${t.spotRate} is null) = (${t.spotSource} is null) and (${t.spotRate} is null or (${t.spotRate} > 0 and ${t.spotSource} in ('cbn', 'manual')))
+    end and (${t.spotSource} is distinct from 'manual' or btrim(${t.rateNote}) <> ''), false)`),
   check('journal_lines_fx', sql`coalesce(case when ${t.currency} = 'NGN'
     then ${t.rate} is null and ${t.rateSource} is null and ${t.amountMinor} = ${t.debitNgn} + ${t.creditNgn}
     else ${t.rate} > 0 and ${t.amountMinor} > 0
-      and ${t.rateSource} in ('bank_receipt', 'bdc_receipt', 'agent_invoice', 'manual', 'pool_average')
+      and ${t.rateSource} in ('bank_receipt', 'bdc_receipt', 'agent_invoice', 'manual', 'pool_average', 'payable_average')
       and (${t.rateSource} <> 'manual' or btrim(${t.rateNote}) <> '')
-      and case when ${t.rateSource} = 'pool_average'
+      and case when ${t.rateSource} in ('pool_average', 'payable_average')
         then ${t.rate} = round((${t.debitNgn} + ${t.creditNgn})::numeric / ${t.amountMinor}, 6)
         else ${t.debitNgn} + ${t.creditNgn} = round(${t.amountMinor} * ${t.rate})
       end
@@ -147,3 +153,24 @@ export const auditLog = pgTable('audit_log', {
   ip: inet('ip'),
   at: timestamp('at', { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [index('audit_log_tenant_at').on(t.tenantId, t.at)]);
+
+/**
+ * Daily reference (spot) rates, global, not per tenant (spec → Currency and FX, rule 7). They pre-fill forms and
+ * feed revaluation and the spot basis; the user always confirms the rate actually used. Append-only.
+ */
+export const fxReferenceRates = pgTable('fx_reference_rates', {
+  rateDate: date('rate_date').notNull(),
+  currency: char('currency', { length: 3 }).notNull().references(() => currencies.code),
+  rate: numeric('rate', { precision: 18, scale: 6 }).notNull(),
+  source: text('source').notNull(),
+  // A wrong rate is corrected by a higher revision for the same day and source; readers take the highest.
+  revision: smallint('revision').notNull().default(1),
+  fetchedAt: timestamp('fetched_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  unique('fx_reference_rates_day').on(t.rateDate, t.currency, t.source, t.revision),
+  check('fx_reference_rates_revision', sql`${t.revision} >= 1`),
+  check('fx_reference_rates_positive', sql`${t.rate} > 0`),
+  check('fx_reference_rates_not_ngn', sql`${t.currency} <> 'NGN'`),
+  // cbn: CBN central rate, the reference (revaluation, spot pre-fill, exceptions). market: mid-market feed, pre-fills rate paid only. ADR 0010.
+  check('fx_reference_rates_source', sql`${t.source} in ('cbn', 'market')`),
+]);

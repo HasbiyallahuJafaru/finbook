@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { add, sub, money, parseRate, convert, allocateEqual, allocateByWeight, divHalfUp, formatRate, poolSpend, rateOf, RATE_SCALE } from './index.ts';
+import { add, sub, money, parseRate, convert, allocateEqual, allocateByWeight, divHalfUp, formatRate, poolSpend, rateOf, roundRate, RATE_SCALE } from './index.ts';
 
 // Seeded PRNG so failures reproduce. Rates here are test fixtures, not real rates.
 let seed = 123456789n;
@@ -50,6 +50,16 @@ test('add/sub refuse mixed currencies', () => {
   assert.deepEqual(add(money(5n, 'NGN'), money(7n, 'NGN')), money(12n, 'NGN'));
   assert.deepEqual(sub(money(5n, 'NGN'), money(7n, 'NGN')), money(-2n, 'NGN'));
   assert.throws(() => add(money(1n, 'NGN'), money(1n, 'CNY')));
+});
+
+test('roundRate: feed decimals of any length, rounded half-up to 6 places without floats', () => {
+  assert.equal(roundRate('202.8406'), 202_840_600n);
+  assert.equal(roundRate('202.114499'), 202_114_499n);
+  assert.equal(roundRate('1550.4567895'), 1_550_456_790n); // 7th digit 5 -> up
+  assert.equal(roundRate('1550.4567894999'), 1_550_456_789n);
+  assert.equal(roundRate('0.0000005'), 1n);
+  assert.equal(roundRate('7'), 7_000_000n);
+  for (const bad of ['', '-1', '1e3', '.5', 'abc', '0', '0.0000004']) assert.throws(() => roundRate(bad), bad);
 });
 
 test('divHalfUp rounds exact halves away from zero', () => {

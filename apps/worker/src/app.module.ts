@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { BullModule } from '@nestjs/bullmq';
 import { redisClient } from './redis.js';
+import { FxProcessor } from './fx.processor.js';
 import { SystemProcessor } from './system.processor.js';
 
 @Module({
@@ -12,8 +13,8 @@ import { SystemProcessor } from './system.processor.js';
         return { connection: redisClient(url) };
       },
     }),
-    BullModule.registerQueue({ name: 'system' }),
+    BullModule.registerQueue({ name: 'system' }, { name: 'fx' }),
   ],
-  providers: [SystemProcessor],
+  providers: [SystemProcessor, FxProcessor],
 })
 export class AppModule {}

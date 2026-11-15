@@ -10,12 +10,13 @@ const MIGRATIONS_DIR = fileURLToPath(new URL('../migrations', import.meta.url));
 
 /**
  * Apply all pending forward-only migrations. Run with the OWNER connection, never the API's.
- * If apiPassword is given, it becomes the finbook_api login password (kept out of the migrations).
+ * Login passwords for finbook_api and finbook_rates are set here when given, so they never sit in a migration.
  */
-export async function migrate(ownerPool: pg.Pool, apiPassword?: string): Promise<void> {
+export async function migrate(ownerPool: pg.Pool, passwords: { api?: string; rates?: string } = {}): Promise<void> {
   await drizzleMigrate(drizzle(ownerPool), { migrationsFolder: MIGRATIONS_DIR });
-  if (apiPassword) {
-    const { rows } = await ownerPool.query<{ stmt: string }>("SELECT format('ALTER ROLE finbook_api PASSWORD %L', $1::text) AS stmt", [apiPassword]);
+  for (const [role, password] of [['finbook_api', passwords.api], ['finbook_rates', passwords.rates]] as const) {
+    if (!password) continue;
+    const { rows } = await ownerPool.query<{ stmt: string }>('SELECT format($1::text, $2::text) AS stmt', [`ALTER ROLE ${role} PASSWORD %L`, password]);
     await ownerPool.query(rows[0]?.stmt ?? '');
   }
 }
