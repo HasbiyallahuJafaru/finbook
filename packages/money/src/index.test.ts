@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { add, sub, money, parseRate, convert, allocateEqual, RATE_SCALE } from './index.ts';
+import { add, sub, money, parseRate, convert, allocateEqual, allocateByWeight, divHalfUp, formatRate, poolSpend, rateOf, RATE_SCALE } from './index.ts';
 
 // Seeded PRNG so failures reproduce. Rates here are test fixtures, not real rates.
 let seed = 123456789n;
@@ -50,4 +50,40 @@ test('add/sub refuse mixed currencies', () => {
   assert.deepEqual(add(money(5n, 'NGN'), money(7n, 'NGN')), money(12n, 'NGN'));
   assert.deepEqual(sub(money(5n, 'NGN'), money(7n, 'NGN')), money(-2n, 'NGN'));
   assert.throws(() => add(money(1n, 'NGN'), money(1n, 'CNY')));
+});
+
+test('divHalfUp rounds exact halves away from zero', () => {
+  assert.equal(divHalfUp(5n, 2n), 3n);
+  assert.equal(divHalfUp(-5n, 2n), -3n);
+  assert.equal(divHalfUp(4n, 3n), 1n);
+  assert.throws(() => divHalfUp(1n, 0n));
+});
+
+test('rateOf and formatRate: NGN 4,266,666.67 for CNY 40,000.00 is a rate of 106.666667', () => {
+  assert.equal(rateOf(426_666_667n, 4_000_000n), 106_666_667n);
+  assert.equal(formatRate(106_666_667n), '106.666667');
+  assert.equal(formatRate(500_000n), '0.500000');
+  assert.throws(() => formatRate(-1n), /negative/);
+});
+
+// Worked example (hand-computed, fixture rates): CNY 100,000.00 bought at 100 = NGN 10,000,000.00 and
+// CNY 50,000.00 at 120 = NGN 6,000,000.00 -> pool CNY 150,000.00 costing NGN 16,000,000.00.
+test('poolSpend: weighted-average cost out, and the pool empties to exactly zero', () => {
+  const a = poolSpend({ balanceMinor: 15_000_000n, costNgn: 1_600_000_000n }, 4_000_000n); // 16,000,000 x 40/150 = 4,266,666.666.. -> .67
+  assert.equal(a.costNgn, 426_666_667n);
+  assert.deepEqual(a.pool, { balanceMinor: 11_000_000n, costNgn: 1_173_333_333n });
+  const b = poolSpend(a.pool, 3_500_000n); // 11,733,333.33 x 35/110 = 3,733,333.33..
+  assert.equal(b.costNgn, 373_333_333n);
+  const c = poolSpend(b.pool, b.pool.balanceMinor); // empty it: takes the remainder, no drift
+  assert.deepEqual(c.pool, { balanceMinor: 0n, costNgn: 0n });
+  assert.equal(a.costNgn + b.costNgn + c.costNgn, 1_600_000_000n);
+  assert.throws(() => poolSpend(c.pool, 1n));
+  assert.throws(() => poolSpend(a.pool, 0n));
+});
+
+test('allocateByWeight: proportional, remainder on the first car, always sums to total', () => {
+  assert.deepEqual(allocateByWeight(100n, [1n, 1n, 1n]), [34n, 33n, 33n]);
+  assert.deepEqual(allocateByWeight(1_000_000_00n, [4_000_000n, 3_500_000n, 4_500_000n]), [33_333_334n, 29_166_666n, 37_500_000n]);
+  assert.throws(() => allocateByWeight(1n, []));
+  assert.throws(() => allocateByWeight(1n, [1n, 0n]));
 });

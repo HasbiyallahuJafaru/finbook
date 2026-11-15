@@ -107,13 +107,17 @@ export const journalLines = pgTable('journal_lines', {
   check('journal_lines_one_side', sql`${t.debitNgn} >= 0 and ${t.creditNgn} >= 0 and (${t.debitNgn} > 0) <> (${t.creditNgn} > 0)`),
   // NGN lines: amount equals the NGN side, no rate. Foreign lines: rate + source required, and the NGN side
   // must equal amount x rate rounded half-up to the kobo (same rule as packages/money convert(); ADR 0003).
+  // pool_average lines (out of the weighted-average pool): NGN is the exact pool cost and the rate only describes it (ADR 0008).
   // coalesce(..., false): a CHECK that evaluates to NULL passes, so a missing rate or source must count as false.
   check('journal_lines_fx', sql`coalesce(case when ${t.currency} = 'NGN'
     then ${t.rate} is null and ${t.rateSource} is null and ${t.amountMinor} = ${t.debitNgn} + ${t.creditNgn}
     else ${t.rate} > 0 and ${t.amountMinor} > 0
-      and ${t.rateSource} in ('bank_receipt', 'bdc_receipt', 'agent_invoice', 'manual')
+      and ${t.rateSource} in ('bank_receipt', 'bdc_receipt', 'agent_invoice', 'manual', 'pool_average')
       and (${t.rateSource} <> 'manual' or btrim(${t.rateNote}) <> '')
-      and ${t.debitNgn} + ${t.creditNgn} = round(${t.amountMinor} * ${t.rate})
+      and case when ${t.rateSource} = 'pool_average'
+        then ${t.rate} = round((${t.debitNgn} + ${t.creditNgn})::numeric / ${t.amountMinor}, 6)
+        else ${t.debitNgn} + ${t.creditNgn} = round(${t.amountMinor} * ${t.rate})
+      end
     end, false)`),
 ]);
 

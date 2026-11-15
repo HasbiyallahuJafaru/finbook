@@ -285,6 +285,9 @@ importers:
         specifier: ^8.23.1
         version: 8.23.1
     devDependencies:
+      '@app/ledger':
+        specifier: workspace:*
+        version: link:../ledger
       '@app/money':
         specifier: workspace:*
         version: link:../money
@@ -297,6 +300,12 @@ importers:
       drizzle-kit:
         specifier: ^0.31.11
         version: 0.31.11
+
+  packages/ledger:
+    dependencies:
+      '@app/money':
+        specifier: workspace:*
+        version: link:../money
 
   packages/money: {}
 

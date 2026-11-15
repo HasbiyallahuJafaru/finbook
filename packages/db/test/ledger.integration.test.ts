@@ -5,7 +5,8 @@ import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import pg from 'pg';
-import { convert, RATE_SCALE } from '@app/money';
+import { convert, parseRate, RATE_SCALE } from '@app/money';
+import { buyCurrency, completeAgentJob, customerReceipt, payFromPool, sharedCost, type Line as LedgerLine } from '@app/ledger';
 import { migrate, withTenant, type Actor, type Tx } from '../src/index.ts';
 
 type Line = {
@@ -77,7 +78,8 @@ async function freshTenant(name: string): Promise<{ id: string; period: string }
   accounts[id] = ids;
   const period = await tx(id, async (t) => {
     for (const [code, type, currency] of [['1000', 'asset', null], ['1010', 'asset', 'CNY'], ['2000', 'liability', null], ['3000', 'equity', null],
-      ['4000', 'income', null], ['5000', 'expense', null], ['6000', 'expense', null], ['7000', 'income', null]] as const) {
+      ['4000', 'income', null], ['5000', 'expense', null], ['6000', 'expense', null], ['7000', 'income', null],
+      ['1100', 'asset', null], ['1150', 'asset', null], ['2150', 'liability', null], ['4100', 'income', null], ['4200', 'income', null]] as const) {
       ids[code] = await one(t.client, 'INSERT INTO accounts (tenant_id, code, name, type, currency) VALUES ($1, $2, $3, $4, $5) RETURNING id',
         [id, code, `Account ${code}`, type, currency]);
     }
@@ -373,6 +375,132 @@ describe('tenant isolation', () => {
       await t.client.query('SELECT 1/0').catch(() => undefined); // a handler that swallows an error
     }), /rolled back/);
     assert.equal(await count(tenantA, 'journal_entries'), before);
+  });
+});
+
+describe('phase 2: posting rules through the database', () => {
+  const car: Record<string, string> = { A: '019a0000-0000-7000-8000-00000000000a', B: '019a0000-0000-7000-8000-00000000000b', C: '019a0000-0000-7000-8000-00000000000c' };
+  const customer = (v: string) => `019a0000-0000-7000-8000-0000000000c${v.toLowerCase()}`;
+  const job = (v: string) => ({ vehicleId: v, counterpartyId: v });
+
+  /** Persist one posting-rule result as one journal entry (what the API will do). */
+  const postLines = (tenant: string, period: string, lines: LedgerLine[]) => tx(tenant, async (t) => {
+    const ids = accounts[tenant] ?? {};
+    const entryId = await one(t.client,
+      "INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key) VALUES ($1, $2, '2026-01-10', 'posting rule', 'test', uuidv7(), $3) RETURNING id",
+      [tenant, period, `pr-${String(++keySeq)}`]);
+    for (const l of lines) {
+      await t.client.query(
+        `INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, vehicle_id, counterparty_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [tenant, entryId, ids[l.account], l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null,
+          l.vehicleId ? car[l.vehicleId] : null, l.counterpartyId ? customer(l.counterpartyId) : null]);
+    }
+  });
+  /** The pool is derived from the ledger, never stored (ADR 0008): the CNY lines on account 1010. */
+  const poolOf = (tenant: string) => tx(tenant, async (t) => {
+    const r = (await t.client.query<{ bal: string; cost: string }>(
+      "SELECT coalesce(sum(CASE WHEN debit_ngn > 0 THEN amount_minor ELSE -amount_minor END), 0)::text AS bal, coalesce(sum(debit_ngn - credit_ngn), 0)::text AS cost FROM journal_lines WHERE account_id = $1 AND currency = 'CNY'",
+      [accounts[tenant]?.['1010']])).rows[0];
+    return { balanceMinor: BigInt(r?.bal ?? 0), costNgn: BigInt(r?.cost ?? 0) };
+  });
+  const funded = async (name: string) => {
+    const t = await freshTenant(name);
+    await postLines(t.id, t.period, buyCurrency({ currency: 'CNY', amountMinor: 10_000_000n, rate: parseRate('100.000000'), rateSource: 'bdc_receipt' })); // FIXTURE_RATE_BUY_1
+    await postLines(t.id, t.period, buyCurrency({ currency: 'CNY', amountMinor: 5_000_000n, rate: parseRate('120.000000'), rateSource: 'bdc_receipt' })); // FIXTURE_RATE_BUY_2
+    return t;
+  };
+
+  test('the worked example posts cleanly and the balances match the hand-worked figures', async () => {
+    const { id, period } = await funded('Worked example');
+    for (const [v, amountNgn] of [['A', 600_000_000n], ['B', 500_000_000n], ['C', 650_000_000n]] as const) await postLines(id, period, customerReceipt({ ...job(v), amountNgn }));
+    for (const [v, amountMinor] of [['A', 4_000_000n], ['B', 3_500_000n], ['C', 4_500_000n]] as const) {
+      await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor, vehicleId: v }).lines);
+    }
+    await postLines(id, period, sharedCost({ amountNgn: 249_999_999n, vehicleIds: ['A', 'B', 'C'] }));
+    await postLines(id, period, sharedCost({ amountNgn: 100_000_000n, vehicleIds: ['A', 'B', 'C'] }));
+    await postLines(id, period, sharedCost({ amountNgn: 15_000_000n, vehicleIds: ['A'] }));
+    // Completion reads car A's history back from the database, nothing is typed in.
+    const history = await tx(id, async (t) => (await t.client.query<{ code: string; debit_ngn: string; credit_ngn: string; currency: string; amount_minor: string; vehicle_id: string | null }>(
+      'SELECT a.code, l.debit_ngn, l.credit_ngn, l.currency, l.amount_minor, l.vehicle_id FROM journal_lines l JOIN accounts a ON a.id = l.account_id WHERE l.vehicle_id = $1', [car.A])).rows
+      .map((r): LedgerLine => ({ account: r.code, debit: BigInt(r.debit_ngn), credit: BigInt(r.credit_ngn), currency: r.currency.trim(), amountMinor: BigInt(r.amount_minor), vehicleId: 'A' })));
+    await postLines(id, period, completeAgentJob({ ...job('A'), quote: { currency: 'CNY', sellingMinor: 4_500_000n, rate: parseRate('110.000000'), landingChargeNgn: 150_000_000n }, history }).lines); // FIXTURE_RATE_QUOTE
+
+    const rows = await tx(id, async (t) => (await t.client.query<{ code: string; net: string }>(
+      'SELECT a.code, sum(l.debit_ngn - l.credit_ngn)::text AS net FROM journal_lines l JOIN accounts a ON a.id = l.account_id GROUP BY a.code ORDER BY a.code')).rows);
+    assert.deepEqual(Object.fromEntries(rows.map((r) => [r.code, BigInt(r.net)])), {
+      '1000': -214_999_999n, '1010': 320_000_000n, '1100': 45_000_000n, '1150': 1_086_666_665n,
+      '2150': -1_150_000_000n, '4100': -55_000_000n, '4200': -18_333_333n, '7000': -13_333_333n,
+    });
+    assert.deepEqual(await poolOf(id), { balanceMinor: 3_000_000n, costNgn: 320_000_000n }, 'CNY 30,000.00 left at NGN 3,200,000.00');
+    const tb = await trialBalance(id);
+    assert.equal(tb.dr - tb.cr, 0n);
+    assert.deepEqual(await chainBreaks(id), []);
+  });
+
+  test('a pool_average line must be a credit at the exact pool cost, within the pool balance', async () => {
+    const { id, period } = await funded('Pool guard');
+    const pool = await poolOf(id); // CNY 150,000.00 / NGN 16,000,000.00
+    const good = payFromPool({ pool, currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A' }).lines;
+    const forged = (credit: bigint, amountMinor: bigint, rate: string): LedgerLine[] => [
+      { account: '6000', debit: credit, credit: 0n, currency: 'NGN', amountMinor: credit },
+      { account: '1010', debit: 0n, credit, currency: 'CNY', amountMinor, rate, rateSource: 'pool_average' },
+    ];
+    // Drain the pool NGN with one fen: rate 1600000000.000000 passes the self-check, but not the pool check.
+    await assert.rejects(postLines(id, period, forged(1_600_000_000n, 1n, '1600000000.000000')), /weighted-average cost: expected 107 kobo/);
+    // Cheap currency into the pool: pool_average is only ever a credit.
+    await assert.rejects(postLines(id, period, [
+      { account: '1010', debit: 50n, credit: 0n, currency: 'CNY', amountMinor: 100_000_000n, rate: '0.000001', rateSource: 'pool_average' },
+      { account: '1000', debit: 0n, credit: 50n, currency: 'NGN', amountMinor: 50n },
+    ]), /must be a credit/);
+    await assert.rejects(postLines(id, period, forged(1n, 15_000_001n, '0.000000')), /pool overspent/);
+    await postLines(id, period, good);
+    assert.deepEqual(await poolOf(id), { balanceMinor: 11_000_000n, costNgn: 1_173_333_333n });
+  });
+
+  test('a pool payment can be reversed exactly (pool restored), but only as a true mirror', async () => {
+    const { id, period } = await funded('Pool reversal');
+    const paid = payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A' }).lines;
+    await postLines(id, period, paid);
+    const original = await tx(id, async (t) => (await t.client.query<{ id: string }>('SELECT entry_id AS id FROM journal_lines WHERE vehicle_id = $1 LIMIT 1', [car.A])).rows[0]?.id ?? '');
+    const mirror = (vehicleId: string): LedgerLine[] => paid.map((l) => ({ ...l, debit: l.credit, credit: l.debit, vehicleId }));
+    const reverse = (lines: LedgerLine[]) => tx(id, async (t) => {
+      const entryId = await one(t.client, "INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, reverses_entry_id) VALUES ($1, $2, '2026-01-11', 'reversal', 'test', uuidv7(), $3, $4) RETURNING id",
+        [id, period, `rev-${String(++keySeq)}`, original]);
+      for (const l of lines) {
+        await t.client.query('INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, vehicle_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
+          [id, entryId, accounts[id]?.[l.account], l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null, l.vehicleId ? car[l.vehicleId] : null]);
+      }
+    });
+    await assert.rejects(reverse(mirror('B')), /does not mirror/);
+    await reverse(mirror('A'));
+    assert.deepEqual(await poolOf(id), { balanceMinor: 15_000_000n, costNgn: 1_600_000_000n }, 'pool back to CNY 150,000.00 / NGN 16,000,000.00');
+  });
+
+  test('two payments at the same moment cannot both spend the same pool', async () => {
+    const { id, period } = await funded('Pool race');
+    const stale = await poolOf(id); // both payments are prepared from the same view: CNY 150,000.00
+    let holding = (): void => undefined;
+    let release = (): void => undefined;
+    const firstHasLine = new Promise<void>((r) => { holding = r; });
+    const gate = new Promise<void>((r) => { release = r; });
+    const first = tx(id, async (t) => {
+      const lines = payFromPool({ pool: stale, currency: 'CNY', amountMinor: 10_000_000n, vehicleId: 'A' }).lines;
+      const entryId = await one(t.client, "INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key) VALUES ($1, $2, '2026-01-10', 'race 1', 'test', uuidv7(), 'race-1') RETURNING id", [id, period]);
+      for (const l of lines) {
+        await t.client.query('INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, vehicle_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
+          [id, entryId, accounts[id]?.[l.account], l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null, car.A]);
+      }
+      holding();
+      await gate; // keep the transaction open while the second payment tries
+    });
+    await firstHasLine;
+    const second = postLines(id, period, payFromPool({ pool: stale, currency: 'CNY', amountMinor: 10_000_000n, vehicleId: 'B' }).lines);
+    await new Promise((r) => setTimeout(r, 300)); // the second payment is now waiting on the tenant lock
+    release();
+    await first;
+    await assert.rejects(second, /pool overspent/);
+    assert.deepEqual(await poolOf(id), { balanceMinor: 5_000_000n, costNgn: 533_333_333n });
   });
 });
 

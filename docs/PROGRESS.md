@@ -6,9 +6,16 @@ _Last updated: 2026-11-15_
 
 ## Current phase
 
-**Phase 1 — Ledger core** (in progress). Gate: 10k random entries keep the trial balance at zero; a cross-tenant read returns zero rows. **Gate test passes locally** (`pnpm test:integration`, 31 tests, Testcontainers Postgres 18). Both reviews (ledger-auditor, security-reviewer) failed the first version; every finding is fixed in migrations 0002/0003 with a test each (ADR 0006 revised). Migrations 0000–0003 applied to staging Postgres via the one-off `migrate` service (2026-11-15). CI replaced by a local pre-push gate (ADR 0007, `.githooks/pre-push`); the gate's evidence is that hook's green run.
+**Phase 2 — Vehicles + FX** (in progress). Gate: a worked example (3 cars, 1 shared container, 3 different rates, 1 sale) matches the accountant's spreadsheet to the kobo.
 
-**Phase 0** is done except owner-blocked items: web staging deploy (Cloudflare login), CI (GitHub billing lock), Railway↔GitHub, Sentry DSNs (see `docs/deploy.md` → Open items).
+- Done (slice 1; ledger-auditor: pass with notes, every finding fixed with a test): `packages/money` pool/rate/weighted-allocation maths; `packages/ledger` posting rules for the customer-funded flow (receipt, buy currency, pay supplier from the pool, shared/per-car costs, agent-job and clearing-job completion); migration 0004 (`pool_average` rate source); the hand-worked example passes in `packages/ledger` and posts cleanly through Postgres. The DB re-computes every pool payment under the tenant lock (no forged cost, no overspend, no race); completion derives costs and funds held from the car's ledger history; receipts and receivables name car and customer. Also reconciled against the real C4 container from EMM's workbook (scratchpad only, not committed): landed costs tie to the cashbook to the kobo. ADR 0008 (pool derived from the ledger, no `fx_pools` table) needs the owner's OK.
+- **Gate blocker:** the accountant must re-perform the worked example (comment block at the top of `packages/ledger/src/index.test.ts`) and sign it off.
+- Still open from the audit (needs the vehicle/job tables): refuse cost postings to a completed job; record the allocation basis per split (`cost_allocations`).
+- Next slices: realized FX on payables, month-end revaluation (7100, auto-reverse), emm_funded (principal) path with approval, then the tables and API endpoints (vehicles with VIN check, job orders with gapless numbers and accepted-quote evidence, shipments, cost types) — the API endpoints need Clerk auth first (phase 0 item still open).
+
+**Phase 1 — Ledger core: done** (2026-11-15). Gate evidence: the local pre-push run (ADR 0007) — 31 integration tests incl. 10k entries netting to zero and zero-row cross-tenant reads; migrations applied to staging.
+
+**Phase 0** is done except owner-blocked items: web staging deploy (Cloudflare login), Railway↔GitHub, Sentry DSNs (see `docs/deploy.md` → Open items). Clerk auth is not wired yet.
 
 ## Done
 

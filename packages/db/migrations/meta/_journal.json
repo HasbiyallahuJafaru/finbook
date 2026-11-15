@@ -29,6 +29,13 @@
       "when": 1794732549509,
       "tag": "0003_ledger_guarantees_v2",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1794733784696,
+      "tag": "0004_pool_average_rate",
+      "breakpoints": true
     }
   ]
 }
