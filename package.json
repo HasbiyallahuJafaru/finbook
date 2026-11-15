@@ -1,0 +1,5 @@
+{
+  "name": "finbook",
+  "private": true,
+  "packageManager": "pnpm@12.8.1"
+}

@@ -1,0 +1,27 @@
+node_modules/
+.next/
+.open-next/
+.wrangler/
+.turbo/
+dist/
+build/
+coverage/
+*.log
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Claude Code: personal settings stay local; the shared .claude/ folder is committed
+.claude/settings.local.json
+
+# graphify output is rebuilt locally (git hooks + Stop hook)
+graphify-out/
+
+# Client data never enters the repo
+fixtures/private/
+bundles/
+uploads/
+*.xlsx
+*.xls

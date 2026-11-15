@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(pnpm *)",
+      "Bash(npx turbo *)",
+      "Bash(graphify *)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+      "Bash(docker ps*)",
+      "Bash(python3 .claude/hooks/*)"
+    ],
+    "ask": [
+      "Bash(git push*)",
+      "Bash(git commit*)",
+      "Bash(pnpm db:migrate*)",
+      "Bash(pnpm add *)",
+      "Bash(pnpm remove *)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./**/.env)",
+      "Read(./.env.local)",
+      "Read(./**/.env.local)",
+      "Read(./.env.production)",
+      "Read(./**/.env.production)",
+      "Read(./.env.staging)",
+      "Read(./**/.env.staging)",
+      "Read(./.env.development)",
+      "Read(./**/.env.development)",
+      "Read(./fixtures/private/**)",
+      "Read(./bundles/**)",
+      "Bash(cat *.env*)",
+      "Bash(printenv*)",
+      "Bash(railway up*)",
+      "Bash(railway run*)",
+      "Bash(railway deploy*)",
+      "Bash(railway variables*)",
+      "Bash(wrangler deploy*)",
+      "Bash(npx wrangler deploy*)",
+      "Bash(pnpm wrangler deploy*)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(*prisma migrate reset*)",
+      "Bash(*drizzle-kit push*)",
+      "Bash(rm -rf /*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session_start.py",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/protect_files.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/money_guard.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/graph_refresh.py",
+            "timeout": 180
+          }
+        ]
+      }
+    ]
+  }
+}

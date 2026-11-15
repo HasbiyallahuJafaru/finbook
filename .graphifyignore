@@ -1,0 +1,29 @@
+# Same syntax as .gitignore. Keeps the graph focused and keeps client data away from the Claude API.
+node_modules/
+.git/
+.next/
+.open-next/
+.wrangler/
+.turbo/
+dist/
+build/
+coverage/
+graphify-out/
+
+# Generated code: noise in the graph
+apps/web/src/lib/api-client/generated/
+packages/db/migrations/meta/
+*.lock
+pnpm-lock.yaml
+
+# Never send client data or secrets anywhere
+.env
+.env.*
+!.env.example
+fixtures/private/
+bundles/
+*.xlsx
+*.xls
+*.csv
+*.pdf
+uploads/
