@@ -15,3 +15,25 @@ test('GET /health returns ok', async () => {
     await app.close();
   }
 });
+
+test('an unhandled error returns 500 through the Sentry filter', async () => {
+  const { Controller, Get, Module } = await import('@nestjs/common');
+  const { APP_FILTER } = await import('@nestjs/core');
+  const { SentryGlobalFilter } = await import('@sentry/nestjs/setup');
+  @Controller('boom')
+  class Boom {
+    @Get()
+    boom(): never {
+      throw new Error('boom');
+    }
+  }
+  @Module({ controllers: [Boom], providers: [{ provide: APP_FILTER, useClass: SentryGlobalFilter }] })
+  class BoomModule {}
+  const app = await NestFactory.create(BoomModule, { logger: false });
+  await app.listen(0, '127.0.0.1');
+  try {
+    assert.equal((await fetch(`${await app.getUrl()}/boom`)).status, 500);
+  } finally {
+    await app.close();
+  }
+});
