@@ -4,14 +4,16 @@
 import 'reflect-metadata';
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHmac, generateKeyPairSync, randomBytes, randomUUID, sign, type KeyObject } from 'node:crypto';
+import { createHash, createHmac, generateKeyPairSync, randomBytes, randomUUID, sign, type KeyObject } from 'node:crypto';
 import { Controller, Get, Module, type INestApplication } from '@nestjs/common';
 import { APP_GUARD, NestFactory } from '@nestjs/core';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import pg from 'pg';
+import { GenericContainer, type StartedTestContainer } from 'testcontainers';
 import { migrate } from '@app/db';
 import { AppModule } from './app.module.js';
 import { AuthGuard } from './auth/auth.guard.js';
+import { permissionsOf } from './auth/permissions.js';
 import { poolProvider } from './db.js';
 
 const API_PASSWORD = 'test-only-password'; // fixture: the throwaway container's finbook_api login
@@ -24,6 +26,7 @@ const WEBHOOK_KEY = randomBytes(24); // fixture: a throwaway Svix signing secret
 const WEBHOOK_SECRET = `whsec_${WEBHOOK_KEY.toString('base64')}`;
 
 let container: StartedPostgreSqlContainer;
+let s3: StartedTestContainer; // S3Mock: an S3-compatible stand-in for R2 (it does not check signatures)
 let ownerPool: pg.Pool;
 let app: INestApplication;
 let url = '';
@@ -58,6 +61,11 @@ const bearer = (claims: Record<string, unknown>, extra: Record<string, string> =
 
 before(async () => {
   container = await new PostgreSqlContainer('postgres:18-alpine').start();
+  s3 = await new GenericContainer('adobe/s3mock:4.7.0').withEnvironment({ COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS: 'staging,evidence' }).withExposedPorts(9090).start();
+  Object.assign(process.env, {
+    R2_ENDPOINT: `http://${s3.getHost()}:${String(s3.getMappedPort(9090))}`, R2_ACCESS_KEY_ID: 'fixture', R2_SECRET_ACCESS_KEY: 'fixture', // fixture credentials
+    R2_STAGING_BUCKET: 'staging', R2_EVIDENCE_BUCKET: 'evidence',
+  });
   ownerPool = new pg.Pool({ connectionString: container.getConnectionUri(), max: 2 });
   await migrate(ownerPool, { api: API_PASSWORD, hook: HOOK_PASSWORD });
   const tenant = async (name: string, org: string) =>
@@ -86,6 +94,7 @@ after(async () => {
   await app.close();
   await ownerPool.end();
   await container.stop();
+  await s3.stop();
 });
 
 describe('GET /me', () => {
@@ -93,7 +102,7 @@ describe('GET /me', () => {
     for (const headers of [bearer({ sub: 'user_owner_a', o: { id: 'org_a' } }), bearer({ sub: 'user_owner_a', o: { id: 'org_a' } }, { 'x-tenant-id': tenantA })]) {
       const res = await get('/me', headers);
       assert.equal(res.status, 200);
-      assert.deepEqual(await res.json(), { tenantId: tenantA, legalName: 'Tenant A Ltd', userId: 'user_owner_a', role: 'client_owner', permissions: ['me.read', 'counterparties.read', 'counterparties.write', 'vehicles.read', 'vehicles.write'] });
+      assert.deepEqual(await res.json(), { tenantId: tenantA, legalName: 'Tenant A Ltd', userId: 'user_owner_a', role: 'client_owner', permissions: permissionsOf('client_owner') });
       assert.match(res.headers.get('x-request-id') ?? '', /^[0-9a-f-]{36}$/);
     }
   });
@@ -395,4 +404,122 @@ test('Redis counters: per caller, blocked once over the limit', async () => {
     client.disconnect();
     await redis.stop();
   }
+});
+
+describe('documents and job orders', () => {
+  const ownerA = { sub: 'user_owner_a', o: { id: 'org_a' } };
+  const ownerB = { sub: 'user_owner_b', o: { id: 'org_b' } };
+  const viewerA = { sub: 'user_viewer_a', o: { id: 'org_a' } };
+  const send = (method: string, path: string, claims: Record<string, unknown>, body?: unknown) =>
+    fetch(`${url}${path}`, { method, body: body === undefined ? undefined : JSON.stringify(body), headers: { ...bearer(claims), 'content-type': 'application/json', 'idempotency-key': randomUUID() } });
+  const PDF = Buffer.from('%PDF-1.7\n% fixture quote, accepted on WhatsApp\n%%EOF\n');
+  const sha = (b: Buffer) => createHash('sha256').update(b).digest('hex');
+  type Ticket = { document: { id: string; status: string }; upload: { url: string; headers: Record<string, string> } };
+
+  /** Upload as a client would: ask for a ticket, PUT the bytes to R2, confirm. */
+  async function evidence(claims: Record<string, unknown>, bytes: Buffer, declared: Partial<{ sha256: string; sizeBytes: number; mime: string; docType: string }> = {}) {
+    const ticket = (await (await send('POST', '/documents/uploads', claims, { docType: 'accepted_quote', mime: 'application/pdf', sizeBytes: bytes.length, sha256: sha(bytes), filename: 'quote.pdf', ...declared })).json()) as Ticket;
+    const put = await fetch(ticket.upload.url, { method: 'PUT', body: new Uint8Array(bytes), headers: ticket.upload.headers });
+    assert.equal(put.ok, true);
+    return { id: ticket.document.id, confirm: await send('POST', `/documents/${ticket.document.id}/confirm`, claims) };
+  }
+
+  let customerA = '';
+  before(async () => {
+    customerA = ((await (await send('POST', '/counterparties', ownerA, { kind: 'customer', name: 'Musa Ibrahim' })).json()) as { id: string }).id;
+    await ownerPool.query("INSERT INTO fx_reference_rates (rate_date, currency, rate, source) VALUES ('2026-01-08', 'CNY', '108.000000', 'cbn')"); // fixture rate
+  });
+
+  test('an upload is checked (size, SHA-256, real type) and stored; a stored file downloads, and every view is audited', async () => {
+    const { id, confirm } = await evidence(ownerA, PDF);
+    assert.equal(confirm.status, 200);
+    const again = await send('POST', `/documents/${id}/confirm`, ownerA); // a new key, already stored: same answer
+    assert.equal(again.status, 200);
+    assert.equal(((await confirm.json()) as { status: string }).status, 'stored');
+    const ticket = (await (await get(`/documents/${id}/download`, bearer(ownerA))).json()) as { url: string };
+    const file = await fetch(ticket.url);
+    assert.match(file.headers.get('content-disposition') ?? '', /^attachment; filename="[0-9a-f-]+\.pdf"$/);
+    assert.deepEqual(Buffer.from(await file.arrayBuffer()), PDF);
+    const views = await ownerPool.query("SELECT actor FROM audit_log WHERE entity = 'documents' AND entity_id = $1 AND action = 'view'", [id]);
+    assert.deepEqual(views.rows, [{ actor: 'user_owner_a' }]);
+  });
+
+  test('a file that is not what was declared is rejected for good, with the reason', async () => {
+    const wrongHash = await evidence(ownerA, PDF, { sha256: 'b'.repeat(64) });
+    assert.equal(wrongHash.confirm.status, 422);
+    assert.match(await wrongHash.confirm.text(), /SHA-256/);
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+    const disguised = await evidence(ownerA, png, { mime: 'application/pdf' }); // a PNG called a PDF
+    assert.match(await disguised.confirm.text(), /not a application\/pdf/);
+    assert.equal((await send('POST', `/documents/${disguised.id}/confirm`, ownerA)).status, 422); // final: still rejected, same answer
+    assert.equal((await get(`/documents/${disguised.id}/download`, bearer(ownerA))).status, 404);
+  });
+
+  test('confirming before uploading is a 404; uploads need a recorder; another tenant gets 404', async () => {
+    const ticket = (await (await send('POST', '/documents/uploads', ownerA, { docType: 'receipt', mime: 'image/png', sizeBytes: 10, sha256: 'c'.repeat(64), filename: 'r.png' })).json()) as Ticket;
+    assert.equal((await send('POST', `/documents/${ticket.document.id}/confirm`, ownerA)).status, 404);
+    assert.equal((await send('POST', '/documents/uploads', viewerA, { docType: 'receipt', mime: 'image/png', sizeBytes: 10, sha256: 'c'.repeat(64), filename: 'r.png' })).status, 403);
+    assert.equal((await send('POST', '/documents/uploads', ownerA, { docType: 'receipt', mime: 'application/zip', sizeBytes: 10, sha256: 'c'.repeat(64), filename: 'r.zip' })).status, 400);
+    const { id } = await evidence(ownerA, PDF);
+    assert.equal((await get(`/documents/${id}/download`, bearer(ownerB))).status, 404);
+    assert.equal((await send('POST', `/documents/${id}/confirm`, ownerB)).status, 404);
+  });
+
+  test('a job order takes a gapless number; a car purchase needs its price and quote rate', async () => {
+    const first = await send('POST', '/job-orders', ownerA, { customerId: customerA, jobType: 'clearing_only', orderedOn: '2026-01-08', landingChargeNgn: '150000000' });
+    assert.equal(first.status, 201);
+    const a = (await first.json()) as { number: number; status: string; landingChargeNgn: string };
+    assert.deepEqual([a.status, a.landingChargeNgn], ['draft', '150000000']);
+    const purchase = await send('POST', '/job-orders', ownerA, { customerId: customerA, jobType: 'car_purchase', orderedOn: '2026-01-09',
+      carPrice: { amountMinor: '9800000', currency: 'CNY' }, quoteRate: { rate: '108', source: 'cbn' }, landingChargeNgn: '250000000' });
+    const b = (await purchase.json()) as { number: number; quoteRate: { rate: string } };
+    assert.deepEqual([purchase.status, b.number, b.quoteRate.rate], [201, a.number + 1, '108.000000']);
+    assert.equal((await send('POST', '/job-orders', ownerA, { customerId: customerA, jobType: 'car_purchase', orderedOn: '2026-01-09', landingChargeNgn: '0' })).status, 400);
+    const wrongRate = await send('POST', '/job-orders', ownerA, { customerId: customerA, jobType: 'car_purchase', orderedOn: '2026-01-09',
+      carPrice: { amountMinor: '9800000', currency: 'CNY' }, quoteRate: { rate: '110.5', source: 'cbn' }, landingChargeNgn: '0' });
+    assert.equal(wrongRate.status, 422);
+    assert.match(await wrongRate.text(), /marked cbn/);
+    assert.equal((await send('POST', '/job-orders', ownerA, { customerId: customerA, jobType: 'clearing_only', orderedOn: '2026-01-08', landingChargeNgn: '1.5' })).status, 400); // money is whole minor units
+  });
+
+  test('the quote is accepted with stored evidence and at least one car; then the cars are fixed', async () => {
+    const job = (await (await send('POST', '/job-orders', ownerA, { customerId: customerA, jobType: 'clearing_only', orderedOn: '2026-01-08', landingChargeNgn: '100000000' })).json()) as { id: string };
+    const car = (await (await send('POST', '/vehicles', ownerA, { vin: 'SALGS2SE5LA000001', make: 'Land Rover', model: 'Range Rover', year: 2020 })).json()) as { id: string };
+    const quote = await evidence(ownerA, PDF);
+    assert.equal((await send('POST', `/job-orders/${job.id}/accept-quote`, ownerA, { documentId: quote.id })).status, 422); // no car yet
+    const added = await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: car.id });
+    assert.deepEqual([added.status, ((await added.json()) as { vehicleIds: string[] }).vehicleIds], [201, [car.id]]);
+    const accepted = await send('POST', `/job-orders/${job.id}/accept-quote`, ownerA, { documentId: quote.id });
+    assert.deepEqual([accepted.status, ((await accepted.json()) as { status: string }).status], [200, 'quote_accepted']);
+    const late = (await (await send('POST', '/vehicles', ownerA, { vin: 'SALGS2SE5LA000002', make: 'Land Rover', model: 'Range Rover', year: 2020 })).json()) as { id: string };
+    const job2 = (await (await send('POST', '/job-orders', ownerA, { customerId: customerA, jobType: 'clearing_only', orderedOn: '2026-01-08', landingChargeNgn: '0' })).json()) as { id: string };
+    await send('POST', `/job-orders/${job2.id}/vehicles`, ownerA, { vehicleId: late.id });
+    const reused = await send('POST', `/job-orders/${job2.id}/accept-quote`, ownerA, { documentId: quote.id });
+    assert.equal(reused.status, 409); // one acceptance backs one job
+    const late2 = (await (await send('POST', '/vehicles', ownerA, { vin: 'SALGS2SE5LA000005', make: 'Land Rover', model: 'Range Rover', year: 2020 })).json()) as { id: string };
+    const tooLate = await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: late2.id });
+    assert.equal(tooLate.status, 422);
+    assert.match(await tooLate.text(), /before its quote is accepted/);
+  });
+
+  test("another tenant's job, car, customer or document: the same 404 / 422 as one that doesn't exist; viewers can't see jobs", async () => {
+    const job = (await (await send('POST', '/job-orders', ownerA, { customerId: customerA, jobType: 'clearing_only', orderedOn: '2026-01-08', landingChargeNgn: '0' })).json()) as { id: string };
+    assert.equal((await get(`/job-orders/${job.id}`, bearer(ownerB))).status, 404);
+    assert.equal((await send('POST', `/job-orders/${job.id}/vehicles`, ownerB, { vehicleId: randomUUID() })).status, 404);
+    const bCar = (await (await send('POST', '/vehicles', ownerB, { vin: 'SALGS2SE5LA000003', make: 'x', model: 'y', year: 2020 })).json()) as { id: string };
+    assert.equal((await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: bCar.id })).status, 422);
+    const bCustomer = ((await (await send('POST', '/counterparties', ownerB, { kind: 'customer', name: 'B buyer' })).json()) as { id: string }).id;
+    const viaB = await send('POST', '/job-orders', ownerA, { customerId: bCustomer, jobType: 'clearing_only', orderedOn: '2026-01-08', landingChargeNgn: '0' });
+    assert.equal(viaB.status, 422);
+    assert.doesNotMatch(await viaB.text(), /B buyer/);
+    const listB = (await (await get('/job-orders', bearer(ownerB))).json()) as unknown[];
+    assert.equal(listB.length, 0);
+    const quoteA = await evidence(ownerA, PDF);
+    assert.equal((await send('POST', `/job-orders/${job.id}/accept-quote`, ownerB, { documentId: quoteA.id })).status, 404); // B on A's job
+    const quoteB = await evidence(ownerB, PDF);
+    const carA = (await (await send('POST', '/vehicles', ownerA, { vin: 'SALGS2SE5LA000004', make: 'x', model: 'y', year: 2020 })).json()) as { id: string };
+    await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: carA.id });
+    assert.equal((await send('POST', `/job-orders/${job.id}/accept-quote`, ownerA, { documentId: quoteB.id })).status, 422); // A with B's document
+    assert.equal((await get('/job-orders', bearer(viewerA))).status, 403);
+  });
 });

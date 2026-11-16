@@ -1,4 +1,5 @@
 import pg from 'pg';
+import { storageFromEnv } from './storage.js';
 
 export const POOL = 'PG_POOL';
 
@@ -19,3 +20,6 @@ export const hookPoolProvider = {
   provide: HOOK_POOL,
   useFactory: () => (process.env.WEBHOOK_DATABASE_URL ? new pg.Pool({ connectionString: process.env.WEBHOOK_DATABASE_URL, max: 2 }) : null),
 };
+
+export const STORAGE = 'R2_STORAGE';
+export const storageProvider = { provide: STORAGE, useFactory: storageFromEnv };

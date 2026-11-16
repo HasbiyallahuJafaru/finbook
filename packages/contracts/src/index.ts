@@ -60,3 +60,69 @@ export const Vehicle = z.object({
 });
 export type Vehicle = z.infer<typeof Vehicle>;
 export const ListVehiclesQuery = z.strictObject({ status: VehicleStatus.optional(), vinStatus: z.enum(['ok', 'vin_needs_correction']).optional() });
+
+/** Money in minor units (kobo, fen) as a string, so it survives JSON as an exact bigint (CLAUDE.md → Money). */
+export const MinorUnits = z.string().regex(/^(0|[1-9]\d{0,17})$/, 'a whole number of minor units, as a string');
+/** A rate as a decimal string, up to 6 places, positive (NUMERIC(18,6); parsed by @app/money parseRate). */
+export const RateString = z.string().regex(/^\d{1,12}(\.\d{1,6})?$/, 'a decimal rate with up to 6 places').refine((s) => /[1-9]/.test(s), 'rate must be positive');
+const ForeignCurrency = z.string().regex(/^[A-Z]{3}$/).refine((c) => c !== 'NGN', 'the car price is quoted in a foreign currency');
+
+export const DocumentType = z.enum(['accepted_quote', 'receipt', 'invoice', 'customs', 'bill_of_lading', 'photo', 'other']);
+export const DocumentMime = z.enum(['application/pdf', 'image/jpeg', 'image/png', 'image/heic']);
+export const DocumentStatus = z.enum(['pending', 'stored', 'rejected']);
+export const MAX_DOCUMENT_BYTES = 20 * 1024 * 1024;
+
+/** Step 1 of an upload: say what is coming; the answer carries a 10-minute presigned PUT for exactly that file. */
+export const CreateUpload = z.strictObject({
+  docType: DocumentType,
+  mime: DocumentMime,
+  sizeBytes: z.int().min(1).max(MAX_DOCUMENT_BYTES),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/, 'lower-case hex SHA-256 of the file'),
+  filename: z.string().trim().min(1).max(255),
+});
+export const Document = z.object({
+  id: z.uuid(), docType: DocumentType, status: DocumentStatus, mime: DocumentMime, sizeBytes: z.int(), sha256: z.string(),
+  filename: z.string(), rejectedReason: z.string().nullable(), uploadedBy: z.string(),
+});
+export type Document = z.infer<typeof Document>;
+export const UploadTicket = z.object({
+  document: Document,
+  upload: z.object({ method: z.literal('PUT'), url: z.url(), headers: z.record(z.string(), z.string()), expiresAt: z.iso.datetime() }),
+});
+export type UploadTicket = z.infer<typeof UploadTicket>;
+export const DownloadTicket = z.object({ url: z.url(), expiresAt: z.iso.datetime() });
+export type DownloadTicket = z.infer<typeof DownloadTicket>;
+
+export const JobType = z.enum(['car_purchase', 'clearing_only']);
+export const Funding = z.enum(['customer_funded', 'emm_funded']);
+export const JobStatus = z.enum(['draft', 'quote_accepted', 'completed', 'abandoned', 'cancelled']);
+export const QuoteRateSource = z.enum(['cbn', 'market', 'manual']);
+
+export const CreateJobOrder = z.strictObject({
+  customerId: z.uuid(),
+  jobType: JobType,
+  funding: Funding.default('customer_funded'),
+  fundingReason: z.string().trim().min(1).max(500).optional(),
+  orderedOn: isoDate,
+  carPrice: z.strictObject({ amountMinor: MinorUnits, currency: ForeignCurrency }).optional(),
+  quoteRate: z.strictObject({ rate: RateString, source: QuoteRateSource, note: z.string().trim().min(1).max(500).optional() }).optional(),
+  landingChargeNgn: MinorUnits,
+}).superRefine((j, ctx) => {
+  const purchase = j.jobType === 'car_purchase';
+  if (purchase !== (j.carPrice !== undefined)) ctx.addIssue({ code: 'custom', path: ['carPrice'], message: purchase ? 'a car purchase needs the car price' : 'clearing only has no car price' });
+  if (purchase !== (j.quoteRate !== undefined)) ctx.addIssue({ code: 'custom', path: ['quoteRate'], message: purchase ? 'a car purchase needs the quote-day rate' : 'clearing only has no quote rate' });
+  if (j.quoteRate?.source === 'manual' && !j.quoteRate.note) ctx.addIssue({ code: 'custom', path: ['quoteRate', 'note'], message: 'a manual rate needs a note' });
+  if (j.funding === 'emm_funded' && !j.fundingReason) ctx.addIssue({ code: 'custom', path: ['fundingReason'], message: 'EMM-funded needs a reason' });
+});
+export type CreateJobOrder = z.infer<typeof CreateJobOrder>;
+export const JobOrder = z.object({
+  id: z.uuid(), number: z.int(), customerId: z.uuid(), jobType: JobType, funding: Funding, fundingReason: z.string().nullable(),
+  status: JobStatus, orderedOn: isoDate,
+  carPrice: z.object({ amountMinor: MinorUnits, currency: z.string() }).nullable(),
+  quoteRate: z.object({ rate: z.string(), source: QuoteRateSource, note: z.string().nullable() }).nullable(),
+  landingChargeNgn: MinorUnits, acceptedQuoteDocumentId: z.uuid().nullable(), vehicleIds: z.array(z.uuid()),
+});
+export type JobOrder = z.infer<typeof JobOrder>;
+export const ListJobOrdersQuery = z.strictObject({ status: JobStatus.optional() });
+export const AddJobVehicle = z.strictObject({ vehicleId: z.uuid() });
+export const AcceptQuote = z.strictObject({ documentId: z.uuid() });

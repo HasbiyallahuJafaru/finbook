@@ -260,6 +260,7 @@ export const counterparties = pgTable('counterparties', {
   createdAt: createdAt(),
 }, (t) => [
   unique('counterparties_tenant_id_id').on(t.tenantId, t.id),
+  unique('counterparties_tenant_id_id_kind').on(t.tenantId, t.id, t.kind),
   index('counterparties_tenant_kind').on(t.tenantId, t.kind),
   check('counterparties_kind', sql`${t.kind} in ('supplier', 'agent', 'customer')`),
   check('counterparties_name', sql`btrim(${t.name}) <> ''`),
@@ -307,3 +308,101 @@ export const idempotencyKeys = pgTable('idempotency_keys', {
   response: jsonb('response').notNull(),
   createdAt: createdAt(),
 }, (t) => [primaryKey({ columns: [t.tenantId, t.key] })]);
+
+/**
+ * Evidence files (spec → Document storage). Postgres keeps metadata and the SHA-256; the bytes live in private R2.
+ * pending: a presigned upload was issued; stored: the bytes were checked and copied into the evidence bucket (then the
+ * row never changes again); rejected: the check failed. Never deleted; a wrong file is superseded by a new one.
+ */
+export const documents = pgTable('documents', {
+  id: id(),
+  tenantId: tenantId(),
+  docType: text('doc_type').notNull(),
+  status: text('status').notNull().default('pending'),
+  mime: text('mime').notNull(),
+  sizeBytes: integer('size_bytes').notNull(),
+  sha256: char('sha256', { length: 64 }).notNull(),
+  originalFilename: text('original_filename').notNull(),
+  evidenceKey: text('evidence_key'),
+  rejectedReason: text('rejected_reason'),
+  uploadedBy: text('uploaded_by').notNull().default(sql`app_user_id()`),
+  storedAt: timestamp('stored_at', { withTimezone: true }),
+  createdAt: createdAt(),
+}, (t) => [
+  unique('documents_tenant_id_id').on(t.tenantId, t.id),
+  index('documents_tenant_sha256').on(t.tenantId, t.sha256),
+  check('documents_doc_type', sql`${t.docType} in ('accepted_quote', 'receipt', 'invoice', 'customs', 'bill_of_lading', 'photo', 'other')`),
+  check('documents_status', sql`${t.status} in ('pending', 'stored', 'rejected')`),
+  check('documents_mime', sql`${t.mime} in ('application/pdf', 'image/jpeg', 'image/png', 'image/heic')`),
+  check('documents_size', sql`${t.sizeBytes} BETWEEN 1 AND 20971520`),
+  check('documents_sha256', sql`${t.sha256} ~ '^[0-9a-f]{64}$'`),
+  check('documents_stored', sql`(${t.status} = 'stored') = (${t.evidenceKey} IS NOT NULL AND ${t.storedAt} IS NOT NULL)`),
+  check('documents_rejected', sql`(${t.status} = 'rejected') = (${t.rejectedReason} IS NOT NULL)`),
+]);
+
+/** Gapless numbers per tenant and series (job orders now; invoices, receipts, vouchers later), never MAX()+1. */
+export const tenantCounters = pgTable('tenant_counters', {
+  tenantId: tenantId(),
+  series: text('series').notNull(),
+  last: integer('last').notNull(),
+}, (t) => [primaryKey({ columns: [t.tenantId, t.series] })]);
+
+/**
+ * A customer's order (spec → Vehicle module, ADR 0001, 0012): what they buy, at what quote, funded by whom. The cut is
+ * never typed in; it comes out at completion as quote minus actual cost. Nothing posts to a job without an accepted
+ * quote document. The quote-day rate (RMB → NGN) is locked here.
+ */
+export const jobOrders = pgTable('job_orders', {
+  id: id(),
+  tenantId: tenantId(),
+  number: integer('number').notNull(),
+  customerId: uuid('customer_id').notNull(),
+  customerKind: text('customer_kind').notNull().default('customer'),
+  jobType: text('job_type').notNull(),
+  funding: text('funding').notNull().default('customer_funded'),
+  fundingReason: text('funding_reason'),
+  status: text('status').notNull().default('draft'),
+  orderedOn: date('ordered_on').notNull(),
+  carPriceMinor: bigint('car_price_minor', { mode: 'bigint' }),
+  carPriceCurrency: currency('car_price_currency'),
+  quoteRate: numeric('quote_rate', { precision: 18, scale: 6 }),
+  quoteRateSource: text('quote_rate_source'),
+  quoteRateNote: text('quote_rate_note'),
+  landingChargeNgn: bigint('landing_charge_ngn', { mode: 'bigint' }).notNull(),
+  acceptedQuoteDocumentId: uuid('accepted_quote_document_id'),
+  acceptedAt: timestamp('accepted_at', { withTimezone: true }),
+  createdAt: createdAt(),
+}, (t) => [
+  unique('job_orders_tenant_number').on(t.tenantId, t.number),
+  unique('job_orders_tenant_id_id').on(t.tenantId, t.id),
+  index('job_orders_tenant_status').on(t.tenantId, t.status),
+  foreignKey({ name: 'job_orders_customer', columns: [t.tenantId, t.customerId, t.customerKind], foreignColumns: [counterparties.tenantId, counterparties.id, counterparties.kind] }),
+  foreignKey({ name: 'job_orders_quote_document', columns: [t.tenantId, t.acceptedQuoteDocumentId], foreignColumns: [documents.tenantId, documents.id] }),
+  check('job_orders_customer_kind', sql`${t.customerKind} = 'customer'`),
+  check('job_orders_job_type', sql`${t.jobType} in ('car_purchase', 'clearing_only')`),
+  check('job_orders_funding', sql`${t.funding} in ('customer_funded', 'emm_funded')`),
+  check('job_orders_funding_reason', sql`${t.funding} = 'customer_funded' OR btrim(coalesce(${t.fundingReason}, '')) <> ''`),
+  check('job_orders_status', sql`${t.status} in ('draft', 'quote_accepted', 'completed', 'abandoned', 'cancelled')`),
+  check('job_orders_number', sql`${t.number} > 0`),
+  check('job_orders_landing_charge', sql`${t.landingChargeNgn} >= 0`),
+  // A car purchase quotes the car's price in its foreign currency at the locked quote-day rate; clearing-only has neither.
+  check('job_orders_quote_shape', sql`CASE ${t.jobType}
+    WHEN 'car_purchase' THEN ${t.carPriceMinor} > 0 AND ${t.carPriceCurrency} IS NOT NULL AND ${t.carPriceCurrency} <> 'NGN' AND ${t.quoteRate} > 0 AND ${t.quoteRateSource} IS NOT NULL
+    ELSE ${t.carPriceMinor} IS NULL AND ${t.carPriceCurrency} IS NULL AND ${t.quoteRate} IS NULL AND ${t.quoteRateSource} IS NULL END`),
+  check('job_orders_quote_rate_source', sql`${t.quoteRateSource} in ('cbn', 'market', 'manual')`),
+  check('job_orders_quote_rate_note', sql`${t.quoteRateSource} IS DISTINCT FROM 'manual' OR btrim(coalesce(${t.quoteRateNote}, '')) <> ''`),
+  check('job_orders_accepted', sql`(${t.acceptedQuoteDocumentId} IS NULL) = (${t.acceptedAt} IS NULL) AND (${t.status} = 'draft') = (${t.acceptedAt} IS NULL)`),
+]);
+
+/** The cars on a job order (one order can cover five cars); a car belongs to one job order at most. */
+export const jobOrderVehicles = pgTable('job_order_vehicles', {
+  id: id(),
+  tenantId: tenantId(),
+  jobOrderId: uuid('job_order_id').notNull(),
+  vehicleId: uuid('vehicle_id').notNull(),
+  createdAt: createdAt(),
+}, (t) => [
+  unique('job_order_vehicles_one_job_per_car').on(t.tenantId, t.vehicleId),
+  foreignKey({ name: 'job_order_vehicles_job', columns: [t.tenantId, t.jobOrderId], foreignColumns: [jobOrders.tenantId, jobOrders.id] }),
+  foreignKey({ name: 'job_order_vehicles_vehicle', columns: [t.tenantId, t.vehicleId], foreignColumns: [vehicles.tenantId, vehicles.id] }),
+]);

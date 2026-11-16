@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { BadRequestException, ConflictException, UnprocessableEntityException } from '@nestjs/common';
+import { BadRequestException, ConflictException, HttpException, UnprocessableEntityException } from '@nestjs/common';
 import type pg from 'pg';
 import type { z } from 'zod';
 import { withTenant, type Tx } from '@app/db';
@@ -64,4 +64,21 @@ export function input<S extends z.ZodType>(schema: S, value: unknown): z.infer<S
   const parsed = schema.safeParse(value);
   if (!parsed.success) throw new BadRequestException({ message: 'invalid input', issues: parsed.error.issues.map((i) => ({ path: i.path.join('.'), message: i.message })) });
   return parsed.data;
+}
+
+/**
+ * Postgres errors in our own words: a named constraint maps to [status, message]; with ourChecks, a check_violation
+ * raised by our own triggers (no constraint name, the message is ours and about this tenant only) becomes a 422 with
+ * that message. Anything else stays an error (500, Sentry).
+ */
+export function pgErrors(byConstraint: Record<string, [number, string]>, ourChecks = false) {
+  return (err: unknown): never => {
+    if (err instanceof Error && 'code' in err) {
+      const constraint = 'constraint' in err && typeof err.constraint === 'string' ? err.constraint : undefined;
+      const known = constraint ? byConstraint[constraint] : undefined;
+      if (known) throw new HttpException(known[1], known[0]);
+      if (ourChecks && err.code === '23514' && !constraint) throw new UnprocessableEntityException(err.message);
+    }
+    throw err;
+  };
 }

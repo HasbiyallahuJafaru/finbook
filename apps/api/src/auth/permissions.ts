@@ -17,6 +17,10 @@ export const PERMISSIONS = {
   'counterparties.write': RECORDERS,
   'vehicles.read': READERS,
   'vehicles.write': RECORDERS,
+  'documents.upload': RECORDERS,
+  'documents.read': READERS,
+  'job_orders.read': READERS,
+  'job_orders.write': RECORDERS,
 } as const satisfies Record<string, readonly Role[]>;
 
 export type Permission = keyof typeof PERMISSIONS;

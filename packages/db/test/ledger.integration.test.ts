@@ -1353,3 +1353,102 @@ describe('vehicles (migrations 0011-0012)', () => {
     assert.equal(await tx(tenantB, async (t) => (await t.client.query('SELECT 1 FROM vehicles')).rowCount), 0);
   });
 });
+
+describe('job orders and documents (migration 0013)', () => {
+  const SHA = 'a'.repeat(64);
+  const customer = (tenant: string, kind = 'customer') => tx(tenant, (t) => one(t.client,
+    "INSERT INTO counterparties (tenant_id, kind, name) VALUES ($1, $2, 'Customer') RETURNING id", [tenant, kind]));
+  const job = (t: Tx, tenant: string, customerId: string, funding = 'customer_funded') => one(t.client,
+    `INSERT INTO job_orders (tenant_id, customer_id, job_type, funding, ordered_on, landing_charge_ngn)
+     VALUES ($1, $2, 'clearing_only', $3, '2026-01-08', 150000000) RETURNING id`, [tenant, customerId, funding]);
+  const numberOf = async (tenant: string, id: string) => (await tx(tenant, (t) => t.client.query<{ number: number }>('SELECT number FROM job_orders WHERE id = $1', [id]))).rows[0]?.number;
+  const doc = (tenant: string, type = 'accepted_quote') => tx(tenant, (t) => one(t.client,
+    "INSERT INTO documents (tenant_id, doc_type, mime, size_bytes, sha256, original_filename) VALUES ($1, $2, 'application/pdf', 100, $3, 'q.pdf') RETURNING id", [tenant, type, SHA]));
+  const store = (tenant: string, id: string) => tx(tenant, (t) => t.client.query(
+    "UPDATE documents SET status = 'stored', evidence_key = 'evidence/' || tenant_id || '/2026/01/' || id || '.pdf', stored_at = now() WHERE id = $1", [id]));
+
+  test('job numbers are gapless per tenant: a rolled-back order gives its number back; nobody chooses one', async () => {
+    const c = await customer(tenantA);
+    const first = await tx(tenantA, (t) => job(t, tenantA, c));
+    await assert.rejects(tx(tenantA, async (t) => { await job(t, tenantA, c); throw new Error('user cancelled'); }), /user cancelled/);
+    const second = await tx(tenantA, (t) => job(t, tenantA, c));
+    const [n1, n2] = [await numberOf(tenantA, first), await numberOf(tenantA, second)];
+    assert.equal(n2, (n1 ?? 0) + 1);
+    const cb = await customer(tenantB);
+    assert.equal(await numberOf(tenantB, await tx(tenantB, (t) => job(t, tenantB, cb))), 1); // each tenant has its own series
+    await assert.rejects(tx(tenantA, (t) => t.client.query("INSERT INTO job_orders (tenant_id, number, customer_id, job_type, ordered_on, landing_charge_ngn) VALUES ($1, 999, $2, 'clearing_only', '2026-01-08', 0)", [tenantA, c])), /permission denied/);
+    await assert.rejects(tx(tenantA, (t) => t.client.query("UPDATE tenant_counters SET last = last + 50")), /permission denied/); // no gaps by hand
+    const many = await Promise.all(Array.from({ length: 8 }, () => tx(tenantA, (t) => job(t, tenantA, c))));
+    const numbers = await Promise.all(many.map((id) => numberOf(tenantA, id)));
+    assert.equal(new Set(numbers).size, 8); // concurrent orders queue on the counter: no repeats
+  });
+
+  test('the customer must be a customer of this tenant', async () => {
+    const supplier = await customer(tenantA, 'supplier');
+    await assert.rejects(tx(tenantA, (t) => job(t, tenantA, supplier)), /job_orders_customer/);
+    const other = await customer(tenantB);
+    await assert.rejects(tx(tenantA, (t) => job(t, tenantA, other)), /job_orders_customer/);
+  });
+
+  test('a car purchase quotes a foreign price at a locked rate; cbn and market rates must match the stored rate', async () => {
+    const c = await customer(tenantA);
+    const purchase = (rate: string, source: string, note: string | null = null) => tx(tenantA, (t) => one(t.client,
+      `INSERT INTO job_orders (tenant_id, customer_id, job_type, ordered_on, car_price_minor, car_price_currency, quote_rate, quote_rate_source, quote_rate_note, landing_charge_ngn)
+       VALUES ($1, $2, 'car_purchase', '2026-01-09', 9800000, 'CNY', $3, $4, $5, 150000000) RETURNING id`, [tenantA, c, rate, source, note]));
+    assert.ok(await purchase(FIXTURE_RATE_SPOT, 'cbn')); // the stored CBN rate for 2026-01-08, one day before
+    await assert.rejects(purchase('109.000000', 'cbn'), /marked cbn but/);
+    await assert.rejects(purchase(FIXTURE_RATE_SPOT, 'market'), /no market rate/);
+    await assert.rejects(purchase('230.000000', 'manual'), /job_orders_quote_rate_note/);
+    assert.ok(await purchase('230.000000', 'manual', 'BDC rate quoted on WhatsApp'));
+    await assert.rejects(tx(tenantA, (t) => t.client.query(
+      "INSERT INTO job_orders (tenant_id, customer_id, job_type, ordered_on, car_price_minor, car_price_currency, landing_charge_ngn) VALUES ($1, $2, 'car_purchase', '2026-01-09', 1, 'CNY', 0)", [tenantA, c])), /job_orders_quote_shape/);
+    await assert.rejects(tx(tenantA, (t) => job(t, tenantA, c, 'emm_funded')), /job_orders_funding_reason/);
+  });
+
+  test('a quote is accepted once, with a stored accepted_quote document and at least one car; then the job is fixed', async () => {
+    const c = await customer(tenantA);
+    const j = await tx(tenantA, (t) => job(t, tenantA, c));
+    const accept = (d: string) => tx(tenantA, (t) => t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2, accepted_at = now() WHERE id = $1", [j, d]));
+    const pending = await doc(tenantA);
+    await assert.rejects(accept(pending), /stored accepted_quote document/);
+    const receipt = await doc(tenantA, 'receipt');
+    await store(tenantA, receipt);
+    await assert.rejects(accept(receipt), /stored accepted_quote document/);
+    await store(tenantA, pending);
+    await assert.rejects(accept(pending), /add its cars/);
+    const car = await tx(tenantA, (t) => one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, 'JM1BK32F781234567', 'Mazda', '3', 2019) RETURNING id", [tenantA]));
+    await tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id) VALUES ($1, $2, $3)', [tenantA, j, car]));
+    await accept(pending);
+    await assert.rejects(accept(pending), /not an allowed change/);
+    const j3 = await tx(tenantA, (t) => job(t, tenantA, c));
+    const car3 = await tx(tenantA, (t) => one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, 'JM1BK32F781234569', 'Mazda', '3', 2019) RETURNING id", [tenantA]));
+    await tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id) VALUES ($1, $2, $3)', [tenantA, j3, car3]));
+    await assert.rejects(tx(tenantA, (t) => t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2, accepted_at = now() WHERE id = $1", [j3, pending])), /job_orders_one_job_per_quote/);
+    await assert.rejects(tx(tenantA, (t) => t.client.query("UPDATE job_orders SET landing_charge_ngn = 1 WHERE id = $1", [j])), /permission denied/);
+    const car2 = await tx(tenantA, (t) => one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, 'JM1BK32F781234568', 'Mazda', '3', 2019) RETURNING id", [tenantA]));
+    await assert.rejects(tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id) VALUES ($1, $2, $3)', [tenantA, j, car2])), /only before its quote is accepted/);
+    const j2 = await tx(tenantA, (t) => job(t, tenantA, c));
+    await assert.rejects(tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id) VALUES ($1, $2, $3)', [tenantA, j2, car])), /one_job_per_car/);
+    const audit = await owner<{ action: string }>("SELECT action FROM audit_log WHERE entity = 'job_orders' AND entity_id = $1 ORDER BY at", [j]);
+    assert.deepEqual(audit.rows.map((r) => r.action), ['insert', 'update']);
+  });
+
+  test("evidence is checked once and never changes again; another tenant's document can't be attached", async () => {
+    const d = await doc(tenantA);
+    await store(tenantA, d);
+    await assert.rejects(tx(tenantA, (t) => t.client.query("UPDATE documents SET status = 'rejected', rejected_reason = 'x' WHERE id = $1", [d])), /never replaced/);
+    await assert.rejects(tx(tenantA, (t) => t.client.query("UPDATE documents SET sha256 = $2 WHERE id = $1", [d, 'b'.repeat(64)])), /permission denied/);
+    const other = await doc(tenantA);
+    await assert.rejects(tx(tenantA, (t) => t.client.query("UPDATE documents SET status = 'stored', evidence_key = 'evidence/' || $2 || '/x.pdf', stored_at = now() WHERE id = $1", [other, tenantB])), /documents_evidence_key_tenant/);
+    await assert.rejects(tx(tenantA, (t) => t.client.query('DELETE FROM documents WHERE id = $1', [d])), /permission denied/);
+    await assert.rejects(owner('DELETE FROM documents WHERE id = $1', [d]), /not allowed/); // not even the owner
+    const uploader = (await owner<{ uploaded_by: string }>('SELECT uploaded_by FROM documents WHERE id = $1', [d])).rows[0]?.uploaded_by;
+    assert.equal(uploader, USER);
+    const c = await customer(tenantB);
+    const jb = await tx(tenantB, (t) => job(t, tenantB, c));
+    await assert.rejects(tx(tenantB, (t) => t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2, accepted_at = now() WHERE id = $1", [jb, d])), /job_orders_quote_document|stored accepted_quote/);
+    for (const table of ['documents', 'job_orders', 'job_order_vehicles', 'tenant_counters']) {
+      assert.equal(await tx(tenantB, async (t) => (await t.client.query(`SELECT 1 FROM ${table} WHERE tenant_id = $1`, [tenantA])).rowCount), 0, table);
+    }
+  });
+});
