@@ -93,7 +93,7 @@ describe('GET /me', () => {
     for (const headers of [bearer({ sub: 'user_owner_a', o: { id: 'org_a' } }), bearer({ sub: 'user_owner_a', o: { id: 'org_a' } }, { 'x-tenant-id': tenantA })]) {
       const res = await get('/me', headers);
       assert.equal(res.status, 200);
-      assert.deepEqual(await res.json(), { tenantId: tenantA, legalName: 'Tenant A Ltd', userId: 'user_owner_a', role: 'client_owner', permissions: ['me.read'] });
+      assert.deepEqual(await res.json(), { tenantId: tenantA, legalName: 'Tenant A Ltd', userId: 'user_owner_a', role: 'client_owner', permissions: ['me.read', 'counterparties.read', 'counterparties.write', 'vehicles.read', 'vehicles.write'] });
       assert.match(res.headers.get('x-request-id') ?? '', /^[0-9a-f-]{36}$/);
     }
   });
@@ -263,4 +263,136 @@ describe('POST /webhooks/clerk', () => {
       process.env.CLERK_WEBHOOK_SIGNING_SECRET = WEBHOOK_SECRET;
     }
   });
+});
+
+describe('counterparties and vehicles', () => {
+  const ownerA = { sub: 'user_owner_a', o: { id: 'org_a' } };
+  const ownerB = { sub: 'user_owner_b', o: { id: 'org_b' } };
+  const viewerA = { sub: 'user_viewer_a', o: { id: 'org_a' } };
+  const post = (path: string, claims: Record<string, unknown>, body: unknown, key: string | null = randomUUID()) =>
+    fetch(`${url}${path}`, { method: 'POST', body: JSON.stringify(body), headers: { ...bearer(claims), 'content-type': 'application/json', ...(key ? { 'idempotency-key': key } : {}) } });
+  const car = { vin: '1M8GDM9AXKP042788', make: 'BYD', model: 'Song Plus', year: 2023, purchaseDate: '2026-01-08' };
+
+  before(() => ownerPool.query("INSERT INTO memberships (tenant_id, clerk_user_id, role) VALUES ($1, 'user_viewer_a', 'client_viewer')", [tenantA]));
+
+  test('a recorder adds a car; it reads back, flagged by the database, and its write is audited', async () => {
+    const res = await post('/vehicles', ownerA, { ...car, vin: ' 1m8gdm9axkp042788 ' });
+    assert.equal(res.status, 201);
+    const v = (await res.json()) as { id: string; vin: string; vinStatus: string; vinProblem: string | null; direction: string; status: string; purchaseDate: string };
+    assert.deepEqual([v.vin, v.vinStatus, v.vinProblem, v.direction, v.status, v.purchaseDate], ['1M8GDM9AXKP042788', 'ok', null, 'import', 'purchased', '2026-01-08']);
+    const again = await get(`/vehicles/${v.id}`, bearer(ownerA));
+    assert.equal(((await again.json()) as { id: string }).id, v.id);
+    const audit = await ownerPool.query("SELECT actor FROM audit_log WHERE entity = 'vehicles' AND entity_id = $1", [v.id]);
+    assert.deepEqual(audit.rows, [{ actor: 'user_owner_a' }]);
+  });
+
+  test('a VIN that fails the check is still recorded, flagged vin_needs_correction with the reason; a duplicate is 409', async () => {
+    const res = await post('/vehicles', ownerA, { ...car, vin: '1M8GDM9A1KP042788' });
+    assert.equal(res.status, 201);
+    const v = (await res.json()) as { vinStatus: string; vinProblem: string };
+    assert.deepEqual([v.vinStatus, v.vinProblem], ['vin_needs_correction', 'check digit (9th character) should be X']);
+    const dup = await post('/vehicles', ownerA, car);
+    assert.equal(dup.status, 409);
+    assert.match(await dup.text(), /already recorded/);
+    assert.equal((await post('/vehicles', ownerB, car)).status, 201); // VINs are unique per tenant, not across tenants
+    const flagged = (await (await get('/vehicles?vinStatus=vin_needs_correction', bearer(ownerA))).json()) as unknown[];
+    assert.equal(flagged.length, 1);
+  });
+
+  test('the same Idempotency-Key twice gives one effect and the same answer; reused for another body, 422; missing, 400', async () => {
+    const key = randomUUID();
+    const body = { kind: 'supplier', name: 'Guangzhou Auto Export Co' };
+    const first = await post('/counterparties', ownerA, body, key);
+    const second = await post('/counterparties', ownerA, body, key);
+    assert.deepEqual([first.status, second.status], [201, 201]);
+    assert.deepEqual(await second.json(), await first.json());
+    const [a, b] = await Promise.all([post('/counterparties', ownerA, { kind: 'agent', name: 'Racer' }, 'race-key-1'), post('/counterparties', ownerA, { kind: 'agent', name: 'Racer' }, 'race-key-1')]);
+    assert.deepEqual(await a.json(), await b.json()); // two copies at once: still one row
+    const rows = await ownerPool.query<{ n: number }>("SELECT count(*)::int AS n FROM counterparties WHERE name IN ('Guangzhou Auto Export Co', 'Racer')");
+    assert.equal(rows.rows[0]?.n, 2);
+    assert.equal((await post('/counterparties', ownerA, { kind: 'customer', name: 'Someone else' }, key)).status, 422);
+    assert.equal((await post('/counterparties', ownerA, body, null)).status, 400);
+  });
+
+  test('invalid input is a 400 that names the field', async () => {
+    const res = await post('/vehicles', ownerA, { ...car, year: 1900, extra: 'x' });
+    assert.equal(res.status, 400);
+    const text = await res.text();
+    assert.match(text, /year/);
+    assert.equal((await post('/counterparties', ownerA, { kind: 'bank', name: 'x' })).status, 400);
+    assert.equal((await get('/vehicles/not-a-uuid', bearer(ownerA))).status, 400);
+  });
+
+  test('a viewer (investor) neither writes nor reads the car list or the counterparty register (403)', async () => {
+    assert.equal((await post('/vehicles', viewerA, { ...car, vin: '11111111111111111' })).status, 403);
+    assert.equal((await post('/counterparties', viewerA, { kind: 'customer', name: 'x' })).status, 403);
+    assert.equal((await get('/vehicles', bearer(viewerA))).status, 403);
+    assert.equal((await get('/counterparties', bearer(viewerA))).status, 403);
+  });
+
+  test("an Idempotency-Key is per tenant and per user: reusing another's key gets its own answer or a 422", async () => {
+    const key = randomUUID();
+    const a = (await (await post('/counterparties', ownerA, { kind: 'customer', name: 'Same key' }, key)).json()) as { id: string };
+    const b = await post('/counterparties', ownerB, { kind: 'customer', name: 'Same key' }, key);
+    assert.equal(b.status, 201);
+    assert.notEqual(((await b.json()) as { id: string }).id, a.id); // B's own row, none of A's answer
+    await ownerPool.query("INSERT INTO memberships (tenant_id, clerk_user_id, role) VALUES ($1, 'user_staff_a', 'client_staff')", [tenantA]);
+    assert.equal((await post('/counterparties', { sub: 'user_staff_a', o: { id: 'org_a' } }, { kind: 'customer', name: 'Same key' }, key)).status, 422);
+  });
+
+  test('a write for another tenant is refused before anything is written', async () => {
+    const res = await fetch(`${url}/vehicles`, { method: 'POST', body: JSON.stringify({ ...car, vin: 'JH4KA8260MC000000' }),
+      headers: { ...bearer({ ...ownerB }, { 'x-tenant-id': tenantA }), 'content-type': 'application/json', 'idempotency-key': randomUUID() } });
+    assert.equal(res.status, 404);
+    assert.equal((await ownerPool.query("SELECT 1 FROM vehicles WHERE vin = 'JH4KA8260MC000000'")).rowCount, 0);
+  });
+
+  test('two copies of one car racing with one key: both get the first answer, one car', async () => {
+    const key = randomUUID();
+    const body = { ...car, vin: 'WVWZZZ1JZXW000001' };
+    const [x, y] = await Promise.all([post('/vehicles', ownerA, body, key), post('/vehicles', ownerA, body, key)]);
+    assert.deepEqual([x.status, y.status], [201, 201]);
+    assert.deepEqual(await x.json(), await y.json());
+  });
+
+  test('writes are limited per caller: the 61st in a minute is a 429', async () => {
+    await ownerPool.query("INSERT INTO memberships (tenant_id, clerk_user_id, role) VALUES ($1, 'user_rate_b', 'client_staff')", [tenantB]);
+    const rateB = { sub: 'user_rate_b', o: { id: 'org_b' } };
+    const statuses = [];
+    for (let i = 0; i < 61; i++) statuses.push((await post('/counterparties', rateB, { kind: 'customer', name: `Buyer ${String(i)}` })).status);
+    assert.deepEqual([statuses.filter((x) => x === 201).length, statuses.at(-1)], [60, 429]);
+    assert.equal((await get('/vehicles', bearer(rateB))).status, 200); // reads have their own, wider limit
+    assert.equal((await post('/counterparties', ownerA, { kind: 'customer', name: 'Another caller' })).status, 201);
+  });
+
+  test("another tenant's car is a 404 with no data, and lists never cross tenants", async () => {
+    const mine = (await (await post('/vehicles', ownerA, { ...car, vin: '11111111111111111' })).json()) as { id: string };
+    const res = await get(`/vehicles/${mine.id}`, bearer(ownerB));
+    assert.equal(res.status, 404);
+    assert.doesNotMatch(await res.text(), /11111111111111111/);
+    assert.equal(res.status, (await get('/vehicles/00000000-0000-7000-8000-000000000000', bearer(ownerB))).status);
+    const listB = (await (await get('/vehicles', bearer(ownerB))).json()) as { vin: string }[];
+    assert.ok(listB.every((v) => v.vin !== '11111111111111111'));
+    const cps = (await (await get('/counterparties', bearer(ownerB))).json()) as { name: string }[];
+    assert.ok(cps.every((c) => !['Guangzhou Auto Export Co', 'Racer'].includes(c.name))); // none of A's
+  });
+});
+
+test('Redis counters: per caller, blocked once over the limit', async () => {
+  const { GenericContainer } = await import('testcontainers');
+  const { Redis } = await import('ioredis');
+  const { RedisThrottlerStorage } = await import('./throttle.js');
+  const redis = await new GenericContainer('redis:8-alpine').withExposedPorts(6379).start();
+  const client = new Redis(redis.getMappedPort(6379), redis.getHost());
+  try {
+    const storage = new RedisThrottlerStorage(client);
+    const hits = [];
+    for (let i = 0; i < 3; i++) hits.push(await storage.increment('user:u1', 60_000, 2, 30_000, 'default'));
+    assert.deepEqual(hits.map((h) => [h.totalHits, h.isBlocked]), [[1, false], [2, false], [3, true]]);
+    assert.ok((hits[2]?.timeToBlockExpire ?? 0) > 0 && (hits[0]?.timeToExpire ?? 0) <= 60);
+    assert.equal((await storage.increment('user:u2', 60_000, 2, 30_000, 'default')).isBlocked, false); // per caller
+  } finally {
+    client.disconnect();
+    await redis.stop();
+  }
 });

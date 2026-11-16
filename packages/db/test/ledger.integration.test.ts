@@ -5,6 +5,7 @@ import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import pg from 'pg';
+import { vinProblem } from '@app/contracts';
 import { convert, formatRate, parseRate, RATE_SCALE } from '@app/money';
 import {
   arriveInYard, buyCurrency, completeAgentJob, convertToStock, customerReceipt, payFromPool, payPayableFromPool, refundStockDeposit, revalue, sellStockCar, sharedCost, stockDeposit,
@@ -1318,5 +1319,37 @@ describe('tenant access (migration 0009)', () => {
   test('access rows are audited', async () => {
     const rows = (await owner<{ entity: string }>("SELECT DISTINCT entity FROM audit_log WHERE tenant_id = $1 AND entity IN ('memberships', 'firm_access') ORDER BY entity", [tenantA])).rows;
     assert.deepEqual(rows.map((r) => r.entity), ['firm_access', 'memberships']);
+  });
+});
+
+describe('vehicles (migrations 0011-0012)', () => {
+  test('the database VIN check agrees with the one users see, on every rule and on random VINs', async () => {
+    const chars = '0123456789ABCDEFGHJKLMNPRSTUVWXYZIOQ-';
+    let seed = 7;
+    const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+    const vins = ['1M8GDM9AXKP042788', '11111111111111111', '1M8GDM9A1KP042788', '1M8GDM9AXKP04278', '1M8GDM9AXKP0427O8', 'LGXCE4CB1N0000001'];
+    for (let i = 0; i < 2000; i++) {
+      const v = Array.from({ length: 17 }, () => chars.charAt(rnd(i % 10 === 0 ? chars.length : 33))).join('');
+      // every other sample: set the 9th character to whichever check digit makes it valid, so both outcomes are tested
+      const fixed = i % 2 === 0 ? ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'X'].map((c) => v.slice(0, 8) + c + v.slice(9)).find((w) => vinProblem(w) === null) : undefined;
+      vins.push(fixed ?? v);
+    }
+    const { rows } = await owner<{ vin: string; status: string }>('SELECT v AS vin, vin_status_of(v) AS status FROM unnest($1::text[]) v', [vins]);
+    let valid = 0;
+    for (const r of rows) {
+      const expected = vinProblem(r.vin) === null ? 'ok' : 'vin_needs_correction';
+      if (expected === 'ok') valid++;
+      assert.equal(r.status, expected, r.vin);
+    }
+    assert.ok(valid > 100, 'the random sample includes valid VINs');
+  });
+
+  test('vin_status is computed by the database and cannot be supplied; VINs are unique per tenant', async () => {
+    await assert.rejects(tx(tenantA, (t) => t.client.query("INSERT INTO vehicles (tenant_id, vin, vin_status, make, model, year) VALUES ($1, '1M8GDM9A1KP042788', 'ok', 'x', 'y', 2020)", [tenantA])), /generated column|cannot insert/);
+    await tx(tenantA, (t) => t.client.query("INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, '1M8GDM9A1KP042788', 'x', 'y', 2020)", [tenantA]));
+    await assert.rejects(tx(tenantA, (t) => t.client.query("INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, '1M8GDM9A1KP042788', 'x', 'y', 2020)", [tenantA])), /vehicles_tenant_vin/);
+    await assert.rejects(tx(tenantA, (t) => t.client.query("INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, ' lower ', 'x', 'y', 2020)", [tenantA])), /vehicles_vin_shape/);
+    await assert.rejects(tx(tenantA, (t) => t.client.query("UPDATE vehicles SET vin = '11111111111111111'")), /permission denied/);
+    assert.equal(await tx(tenantB, async (t) => (await t.client.query('SELECT 1 FROM vehicles')).rowCount), 0);
   });
 });

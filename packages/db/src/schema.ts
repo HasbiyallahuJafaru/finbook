@@ -3,7 +3,7 @@
 // can't express them. ADR 0006.
 import { sql } from 'drizzle-orm';
 import {
-  bigint, boolean, char, check, date, foreignKey, index, inet, jsonb, numeric, pgTable, smallint, text, timestamp, unique, uuid,
+  bigint, boolean, char, check, date, foreignKey, index, inet, integer, jsonb, numeric, pgTable, primaryKey, smallint, text, timestamp, unique, uuid,
 } from 'drizzle-orm/pg-core';
 
 const id = () => uuid('id').primaryKey().default(sql`uuidv7()`);
@@ -247,3 +247,63 @@ export const firmAccess = pgTable('firm_access', {
   unique('firm_access_tenant_user').on(t.tenantId, t.clerkUserId),
   check('firm_access_role', sql`${t.role} in ('firm_admin', 'firm_accountant', 'firm_reviewer')`),
 ]);
+
+/** Suppliers, clearing agents and buyers (spec → Data model). Journal lines name them by counterparty_id. */
+export const counterparties = pgTable('counterparties', {
+  id: id(),
+  tenantId: tenantId(),
+  kind: text('kind').notNull(),
+  name: text('name').notNull(),
+  phone: text('phone'),
+  email: text('email'),
+  tin: text('tin'),
+  createdAt: createdAt(),
+}, (t) => [
+  unique('counterparties_tenant_id_id').on(t.tenantId, t.id),
+  index('counterparties_tenant_kind').on(t.tenantId, t.kind),
+  check('counterparties_kind', sql`${t.kind} in ('supplier', 'agent', 'customer')`),
+  check('counterparties_name', sql`btrim(${t.name}) <> ''`),
+]);
+
+/**
+ * One row per car, costed by specific identification (spec → Vehicle module). vin_status is computed by the
+ * database (vin_status_of, migration 0011): a VIN that fails the check is kept as typed, flagged vin_needs_correction.
+ */
+export const vehicles = pgTable('vehicles', {
+  id: id(),
+  tenantId: tenantId(),
+  vin: text('vin').notNull(),
+  vinStatus: text('vin_status').notNull().generatedAlwaysAs(sql`vin_status_of(vin)`),
+  make: text('make').notNull(),
+  model: text('model').notNull(),
+  year: smallint('year').notNull(),
+  colour: text('colour'),
+  mileage: integer('mileage'),
+  direction: text('direction').notNull().default('import'),
+  status: text('status').notNull().default('purchased'),
+  purchaseDate: date('purchase_date'),
+  soldDate: date('sold_date'),
+  createdAt: createdAt(),
+}, (t) => [
+  unique('vehicles_tenant_vin').on(t.tenantId, t.vin),
+  unique('vehicles_tenant_id_id').on(t.tenantId, t.id),
+  index('vehicles_tenant_status').on(t.tenantId, t.status),
+  check('vehicles_vin_shape', sql`${t.vin} = upper(btrim(${t.vin})) AND ${t.vin} <> ''`),
+  check('vehicles_year', sql`${t.year} BETWEEN 1950 AND 2100`),
+  check('vehicles_mileage', sql`${t.mileage} >= 0`),
+  check('vehicles_direction', sql`${t.direction} in ('import', 'export', 'local')`),
+  check('vehicles_status', sql`${t.status} in ('purchased', 'in_transit', 'at_port', 'in_yard', 'reserved', 'sold', 'delivered', 'written_off', 'returned')`),
+]);
+
+/**
+ * One row per write the API accepted with an Idempotency-Key, written in the same transaction as the write: a retry
+ * with the same key and body gets the stored answer, the same key with another body is refused.
+ */
+export const idempotencyKeys = pgTable('idempotency_keys', {
+  tenantId: tenantId(),
+  key: text('key').notNull(),
+  requestHash: text('request_hash').notNull(),
+  statusCode: smallint('status_code').notNull(),
+  response: jsonb('response').notNull(),
+  createdAt: createdAt(),
+}, (t) => [primaryKey({ columns: [t.tenantId, t.key] })]);

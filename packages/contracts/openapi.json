@@ -46,6 +46,790 @@
         }
       }
     },
+    "/counterparties": {
+      "get": {
+        "parameters": [
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "description": "The tenant to act for. Required for firm staff; client users may rely on their active organization."
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "supplier",
+                "agent",
+                "customer"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Counterparties, by name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "enum": [
+                          "supplier",
+                          "agent",
+                          "customer"
+                        ]
+                      },
+                      "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 200
+                      },
+                      "phone": {
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "email": {
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "tin": {
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "name",
+                      "phone",
+                      "email",
+                      "tin",
+                      "id"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error"
+          },
+          "401": {
+            "description": "Error"
+          },
+          "403": {
+            "description": "Error"
+          },
+          "404": {
+            "description": "Error"
+          },
+          "503": {
+            "description": "Error"
+          }
+        }
+      },
+      "post": {
+        "parameters": [
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "description": "The tenant to act for. Required for firm staff; client users may rely on their active organization."
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 8,
+              "maxLength": 200,
+              "pattern": "^[\\x21-\\x7e]+$"
+            },
+            "description": "Client-made id for this write; a retry with the same key and body returns the first answer, with no second effect."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "supplier",
+                      "agent",
+                      "customer"
+                    ]
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "phone": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "email": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "format": "email",
+                    "pattern": "^(?:[A-Za-z0-9_'+\\-]+\\.)*[A-Za-z0-9_'+\\-]*[A-Za-z0-9_+-]@(?:[A-Za-z0-9][A-Za-z0-9\\-]*\\.)+[A-Za-z]{2,}$"
+                  },
+                  "tin": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  }
+                },
+                "required": [
+                  "kind",
+                  "name"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "supplier",
+                        "agent",
+                        "customer"
+                      ]
+                    },
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 200
+                    },
+                    "phone": {
+                      "nullable": true,
+                      "type": "string"
+                    },
+                    "email": {
+                      "nullable": true,
+                      "type": "string"
+                    },
+                    "tin": {
+                      "nullable": true,
+                      "type": "string"
+                    },
+                    "id": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "name",
+                    "phone",
+                    "email",
+                    "tin",
+                    "id"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error"
+          },
+          "401": {
+            "description": "Error"
+          },
+          "403": {
+            "description": "Error"
+          },
+          "404": {
+            "description": "Error"
+          },
+          "409": {
+            "description": "Error"
+          },
+          "422": {
+            "description": "Error"
+          },
+          "429": {
+            "description": "Error"
+          },
+          "503": {
+            "description": "Error"
+          }
+        }
+      }
+    },
+    "/vehicles": {
+      "get": {
+        "parameters": [
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "description": "The tenant to act for. Required for firm staff; client users may rely on their active organization."
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "purchased",
+                "in_transit",
+                "at_port",
+                "in_yard",
+                "reserved",
+                "sold",
+                "delivered",
+                "written_off",
+                "returned"
+              ]
+            }
+          },
+          {
+            "name": "vinStatus",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "ok",
+                "vin_needs_correction"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Vehicles",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                      },
+                      "vin": {
+                        "type": "string"
+                      },
+                      "vinStatus": {
+                        "type": "string",
+                        "enum": [
+                          "ok",
+                          "vin_needs_correction"
+                        ]
+                      },
+                      "vinProblem": {
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "make": {
+                        "type": "string"
+                      },
+                      "model": {
+                        "type": "string"
+                      },
+                      "year": {
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "colour": {
+                        "nullable": true,
+                        "type": "string"
+                      },
+                      "mileage": {
+                        "nullable": true,
+                        "type": "integer",
+                        "minimum": -9007199254740991,
+                        "maximum": 9007199254740991
+                      },
+                      "direction": {
+                        "type": "string",
+                        "enum": [
+                          "import",
+                          "export",
+                          "local"
+                        ]
+                      },
+                      "status": {
+                        "type": "string",
+                        "enum": [
+                          "purchased",
+                          "in_transit",
+                          "at_port",
+                          "in_yard",
+                          "reserved",
+                          "sold",
+                          "delivered",
+                          "written_off",
+                          "returned"
+                        ]
+                      },
+                      "purchaseDate": {
+                        "nullable": true,
+                        "type": "string",
+                        "format": "date",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+                      },
+                      "soldDate": {
+                        "nullable": true,
+                        "type": "string",
+                        "format": "date",
+                        "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "vin",
+                      "vinStatus",
+                      "vinProblem",
+                      "make",
+                      "model",
+                      "year",
+                      "colour",
+                      "mileage",
+                      "direction",
+                      "status",
+                      "purchaseDate",
+                      "soldDate"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error"
+          },
+          "401": {
+            "description": "Error"
+          },
+          "403": {
+            "description": "Error"
+          },
+          "404": {
+            "description": "Error"
+          },
+          "503": {
+            "description": "Error"
+          }
+        }
+      },
+      "post": {
+        "parameters": [
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "description": "The tenant to act for. Required for firm staff; client users may rely on their active organization."
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 8,
+              "maxLength": 200,
+              "pattern": "^[\\x21-\\x7e]+$"
+            },
+            "description": "Client-made id for this write; a retry with the same key and body returns the first answer, with no second effect."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "vin": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "make": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 100
+                  },
+                  "model": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 100
+                  },
+                  "year": {
+                    "type": "integer",
+                    "minimum": 1950,
+                    "maximum": 2100
+                  },
+                  "colour": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200
+                  },
+                  "mileage": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 5000000
+                  },
+                  "direction": {
+                    "default": "import",
+                    "type": "string",
+                    "enum": [
+                      "import",
+                      "export",
+                      "local"
+                    ]
+                  },
+                  "purchaseDate": {
+                    "type": "string",
+                    "format": "date",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+                  }
+                },
+                "required": [
+                  "vin",
+                  "make",
+                  "model",
+                  "year",
+                  "direction"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Recorded; a VIN that fails the check is kept and flagged vin_needs_correction",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "vin": {
+                      "type": "string"
+                    },
+                    "vinStatus": {
+                      "type": "string",
+                      "enum": [
+                        "ok",
+                        "vin_needs_correction"
+                      ]
+                    },
+                    "vinProblem": {
+                      "nullable": true,
+                      "type": "string"
+                    },
+                    "make": {
+                      "type": "string"
+                    },
+                    "model": {
+                      "type": "string"
+                    },
+                    "year": {
+                      "type": "integer",
+                      "minimum": -9007199254740991,
+                      "maximum": 9007199254740991
+                    },
+                    "colour": {
+                      "nullable": true,
+                      "type": "string"
+                    },
+                    "mileage": {
+                      "nullable": true,
+                      "type": "integer",
+                      "minimum": -9007199254740991,
+                      "maximum": 9007199254740991
+                    },
+                    "direction": {
+                      "type": "string",
+                      "enum": [
+                        "import",
+                        "export",
+                        "local"
+                      ]
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "purchased",
+                        "in_transit",
+                        "at_port",
+                        "in_yard",
+                        "reserved",
+                        "sold",
+                        "delivered",
+                        "written_off",
+                        "returned"
+                      ]
+                    },
+                    "purchaseDate": {
+                      "nullable": true,
+                      "type": "string",
+                      "format": "date",
+                      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+                    },
+                    "soldDate": {
+                      "nullable": true,
+                      "type": "string",
+                      "format": "date",
+                      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "vin",
+                    "vinStatus",
+                    "vinProblem",
+                    "make",
+                    "model",
+                    "year",
+                    "colour",
+                    "mileage",
+                    "direction",
+                    "status",
+                    "purchaseDate",
+                    "soldDate"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error"
+          },
+          "401": {
+            "description": "Error"
+          },
+          "403": {
+            "description": "Error"
+          },
+          "404": {
+            "description": "Error"
+          },
+          "409": {
+            "description": "Error"
+          },
+          "422": {
+            "description": "Error"
+          },
+          "429": {
+            "description": "Error"
+          },
+          "503": {
+            "description": "Error"
+          }
+        }
+      }
+    },
+    "/vehicles/{id}": {
+      "get": {
+        "parameters": [
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "description": "The tenant to act for. Required for firm staff; client users may rely on their active organization."
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Vehicle",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "vin": {
+                      "type": "string"
+                    },
+                    "vinStatus": {
+                      "type": "string",
+                      "enum": [
+                        "ok",
+                        "vin_needs_correction"
+                      ]
+                    },
+                    "vinProblem": {
+                      "nullable": true,
+                      "type": "string"
+                    },
+                    "make": {
+                      "type": "string"
+                    },
+                    "model": {
+                      "type": "string"
+                    },
+                    "year": {
+                      "type": "integer",
+                      "minimum": -9007199254740991,
+                      "maximum": 9007199254740991
+                    },
+                    "colour": {
+                      "nullable": true,
+                      "type": "string"
+                    },
+                    "mileage": {
+                      "nullable": true,
+                      "type": "integer",
+                      "minimum": -9007199254740991,
+                      "maximum": 9007199254740991
+                    },
+                    "direction": {
+                      "type": "string",
+                      "enum": [
+                        "import",
+                        "export",
+                        "local"
+                      ]
+                    },
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "purchased",
+                        "in_transit",
+                        "at_port",
+                        "in_yard",
+                        "reserved",
+                        "sold",
+                        "delivered",
+                        "written_off",
+                        "returned"
+                      ]
+                    },
+                    "purchaseDate": {
+                      "nullable": true,
+                      "type": "string",
+                      "format": "date",
+                      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+                    },
+                    "soldDate": {
+                      "nullable": true,
+                      "type": "string",
+                      "format": "date",
+                      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "vin",
+                    "vinStatus",
+                    "vinProblem",
+                    "make",
+                    "model",
+                    "year",
+                    "colour",
+                    "mileage",
+                    "direction",
+                    "status",
+                    "purchaseDate",
+                    "soldDate"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error"
+          },
+          "401": {
+            "description": "Error"
+          },
+          "403": {
+            "description": "Error"
+          },
+          "404": {
+            "description": "Error"
+          },
+          "503": {
+            "description": "Error"
+          }
+        }
+      }
+    },
     "/me": {
       "get": {
         "parameters": [
