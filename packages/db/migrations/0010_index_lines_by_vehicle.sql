@@ -1,0 +1,1 @@
+CREATE INDEX "journal_lines_tenant_vehicle_account" ON "journal_lines" USING btree ("tenant_id","vehicle_id","account_id") WHERE "journal_lines"."vehicle_id" IS NOT NULL;

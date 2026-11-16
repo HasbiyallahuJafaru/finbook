@@ -11,7 +11,7 @@ import {
   supplierInvoice,
   type Line as LedgerLine, type RevaluationItem,
 } from '@app/ledger';
-import { migrate, withTenant, type Actor, type Tx } from '../src/index.ts';
+import { applyMembershipEvent, migrate, resolveAccess, revokeOrganization, withTenant, type Actor, type Tx } from '../src/index.ts';
 
 type Line = {
   account: string; debit?: bigint; credit?: bigint;
@@ -21,6 +21,7 @@ type Entry = { periodId: string; date: string; lines: Line[]; key?: string; memo
 
 const API_PASSWORD = 'test-only-password'; // fixture: the throwaway container's finbook_api login
 const RATES_PASSWORD = 'test-only-rates'; // fixture: the throwaway container's finbook_rates login
+const HOOK_PASSWORD = 'test-only-hook'; // fixture: the throwaway container's finbook_hook login
 const USER = 'user_test';
 let container: StartedPostgreSqlContainer;
 let ownerPool: pg.Pool; // the owner (superuser): migrations and admin only, like DATABASE_OWNER_URL
@@ -114,7 +115,7 @@ async function tamper(...statements: [string, unknown[]][]): Promise<void> {
 before(async () => {
   container = await new PostgreSqlContainer('postgres:18-alpine').start();
   ownerPool = new pg.Pool({ connectionString: container.getConnectionUri(), max: 2 });
-  await migrate(ownerPool, { api: API_PASSWORD, rates: RATES_PASSWORD });
+  await migrate(ownerPool, { api: API_PASSWORD, rates: RATES_PASSWORD, hook: HOOK_PASSWORD });
   apiPool = new pg.Pool({
     host: container.getHost(), port: container.getPort(), database: container.getDatabase(),
     user: 'finbook_api', password: API_PASSWORD, max: 4,
@@ -343,7 +344,7 @@ describe('tenant isolation', () => {
   });
 
   test('no tenant (empty) means no rows at all', async () => {
-    for (const table of ['tenants', 'accounts', 'periods', 'journal_entries', 'journal_lines', 'journal_entry_hashes', 'audit_log']) {
+    for (const table of ['tenants', 'accounts', 'periods', 'journal_entries', 'journal_lines', 'journal_entry_hashes', 'audit_log', 'memberships', 'firm_access']) {
       assert.equal(await withTenant(apiPool, as(''), async (t) => (await t.client.query(`SELECT 1 FROM ${table}`)).rowCount), 0, table);
     }
   });
@@ -1208,5 +1209,114 @@ describe('phase 1 gate', () => {
     assert.deepEqual(await chainBreaks(tenantA), []);
     assert.equal(await tx(tenantB, async (t) => (await t.client.query('SELECT 1 FROM journal_entries WHERE tenant_id = $1', [tenantA])).rowCount), 0,
       'cross-tenant read returns zero rows');
+  });
+});
+
+describe('tenant access (migration 0009)', () => {
+  let hookPool: pg.Pool; // finbook_hook: the Clerk webhook's own login
+  const ev = (clerkUserId: string, role: string | null, eventMs: bigint, clerkOrgId = 'org_a') => applyMembershipEvent(hookPool, { clerkOrgId, clerkUserId, role, eventMs });
+
+  before(async () => {
+    hookPool = new pg.Pool({ host: container.getHost(), port: container.getPort(), database: container.getDatabase(), user: 'finbook_hook', password: HOOK_PASSWORD, max: 2 });
+    await owner("UPDATE tenants SET clerk_org_id = 'org_a' WHERE id = $1", [tenantA]);
+    await owner("UPDATE tenants SET clerk_org_id = 'org_b' WHERE id = $1", [tenantB]);
+    await owner("INSERT INTO firm_staff (clerk_user_id) VALUES ('user_staff'), ('user_both')");
+    await owner("INSERT INTO memberships (tenant_id, clerk_user_id, role) VALUES ($1, 'user_owner_a', 'client_owner'), ($2, 'user_owner_b', 'client_owner')", [tenantA, tenantB]);
+    await owner("INSERT INTO firm_access (tenant_id, clerk_user_id, role, granted_by) VALUES ($1, 'user_staff', 'firm_accountant', 'user_admin')", [tenantA]);
+  });
+  after(() => hookPool.end());
+
+  test("a client role counts only while the token's live org is the tenant's org", async () => {
+    const ownerA = { tenantId: tenantA, role: 'client_owner' };
+    assert.deepEqual(await resolveAccess(apiPool, 'user_owner_a', { clerkOrgId: 'org_a' }, 'org_a'), ownerA);
+    assert.deepEqual(await resolveAccess(apiPool, 'user_owner_a', { tenantId: tenantA }, 'org_a'), ownerA);
+    assert.equal(await resolveAccess(apiPool, 'user_owner_a', { tenantId: tenantA }, undefined), null); // removed from the org in Clerk
+    assert.equal(await resolveAccess(apiPool, 'user_owner_a', { tenantId: tenantA }, 'org_b'), null);
+    assert.equal(await resolveAccess(apiPool, 'user_owner_a', { tenantId: tenantB }, 'org_a'), null); // another tenant's id
+    assert.equal(await resolveAccess(apiPool, 'user_owner_a', { clerkOrgId: 'org_b' }, 'org_b'), null); // another tenant's org
+    assert.equal(await resolveAccess(apiPool, 'user_owner_a', { clerkOrgId: 'org_none' }, 'org_none'), null);
+    assert.equal(await resolveAccess(apiPool, 'user_owner_a', { tenantId: '00000000-0000-7000-8000-000000000000' }, 'org_a'), null);
+  });
+
+  test('firm staff reach only the tenants they are assigned to', async () => {
+    assert.deepEqual(await resolveAccess(apiPool, 'user_staff', { tenantId: tenantA }, undefined), { tenantId: tenantA, role: 'firm_accountant' });
+    assert.equal(await resolveAccess(apiPool, 'user_staff', { tenantId: tenantB }, undefined), null);
+    assert.equal(await tx(tenantA, async (t) => (await t.client.query('SELECT 1 FROM memberships WHERE tenant_id = $1', [tenantB])).rowCount), 0);
+    assert.equal(await tx(tenantB, async (t) => (await t.client.query('SELECT 1 FROM firm_access')).rowCount), 0);
+  });
+
+  test('firm staff never hold a client role, whichever row came first, in any tenant', async () => {
+    // a client membership written before they were made firm staff, in a tenant where they also have firm_access
+    await owner("INSERT INTO memberships (tenant_id, clerk_user_id, role) VALUES ($1, 'user_both', 'client_owner')", [tenantB]);
+    await owner("INSERT INTO firm_access (tenant_id, clerk_user_id, role, granted_by) VALUES ($1, 'user_both', 'firm_reviewer', 'user_admin')", [tenantB]);
+    assert.deepEqual(await resolveAccess(apiPool, 'user_both', { tenantId: tenantB }, 'org_b'), { tenantId: tenantB, role: 'firm_reviewer' });
+    await owner("DELETE FROM firm_access WHERE clerk_user_id = 'user_both'"); // unassigned: no client role comes back
+    assert.equal(await resolveAccess(apiPool, 'user_both', { tenantId: tenantB }, 'org_b'), null);
+    assert.equal(await resolveAccess(apiPool, 'user_both', { clerkOrgId: 'org_b' }, 'org_b'), null);
+    // firm staff of tenant A invited into client B's org: never mirrored
+    assert.equal(await ev('user_staff', 'client_owner', 100n, 'org_b'), 'applied');
+    assert.equal(await resolveAccess(apiPool, 'user_staff', { clerkOrgId: 'org_b' }, 'org_b'), null);
+  });
+
+  test('a tenant that is not active gives no access', async () => {
+    await owner("UPDATE tenants SET status = 'suspended' WHERE id = $1", [tenantB]);
+    try {
+      assert.equal(await resolveAccess(apiPool, 'user_owner_b', { clerkOrgId: 'org_b' }, 'org_b'), null);
+    } finally {
+      await owner("UPDATE tenants SET status = 'active' WHERE id = $1", [tenantB]);
+    }
+    assert.deepEqual(await resolveAccess(apiPool, 'user_owner_b', { clerkOrgId: 'org_b' }, 'org_b'), { tenantId: tenantB, role: 'client_owner' });
+  });
+
+  test('membership events apply once, in order; on a tie a removal wins', async () => {
+    assert.equal(await ev('user_new', 'client_staff', 100n), 'applied');
+    assert.equal(await ev('user_new', 'client_staff', 100n), 'stale'); // the same delivery twice
+    assert.deepEqual(await resolveAccess(apiPool, 'user_new', { clerkOrgId: 'org_a' }, 'org_a'), { tenantId: tenantA, role: 'client_staff' });
+    assert.equal(await ev('user_new', null, 200n), 'applied'); // removed
+    assert.equal(await ev('user_new', 'client_owner', 150n), 'stale'); // a late, older delivery can't bring them back
+    assert.equal(await resolveAccess(apiPool, 'user_new', { clerkOrgId: 'org_a' }, 'org_a'), null);
+    assert.equal(await ev('user_late', null, 300n), 'applied'); // removal first: a tombstone
+    assert.equal(await ev('user_late', 'client_owner', 250n), 'stale');
+    assert.equal(await ev('user_tie', 'client_owner', 400n), 'applied');
+    assert.equal(await ev('user_tie', null, 400n), 'applied'); // same millisecond: the removal wins
+    assert.equal(await ev('user_tie', 'client_owner', 400n), 'stale');
+    assert.equal(await ev('user_down', 'client_owner', 500n), 'applied');
+    assert.equal(await ev('user_down', 'client_viewer', 500n), 'applied'); // same millisecond: the downgrade wins
+    assert.equal(await ev('user_down', 'client_owner', 500n), 'stale');
+    assert.deepEqual(await resolveAccess(apiPool, 'user_down', { clerkOrgId: 'org_a' }, 'org_a'), { tenantId: tenantA, role: 'client_viewer' });
+    assert.equal(await ev('user_x', 'client_owner', 100n, 'org_firm'), 'no_tenant');
+    await assert.rejects(ev('user_future', 'client_owner', 9_000_000_000_000_000n), /memberships_event_time/);
+    const audit = (await owner<{ n: string }>("SELECT count(*) AS n FROM audit_log WHERE entity = 'memberships' AND after->>'clerk_user_id' = 'user_new' AND actor = 'system:clerk-webhook'")).rows[0]?.n;
+    assert.equal(audit, '2'); // created, then revoked: both audited, as the webhook
+  });
+
+  test('deleting an organization revokes every membership of its tenant only', async () => {
+    assert.equal(await ev('user_c1', 'client_staff', 100n, 'org_b'), 'applied');
+    assert.equal(await revokeOrganization(hookPool, 'org_b', 500n), 'applied');
+    assert.equal(await resolveAccess(apiPool, 'user_c1', { clerkOrgId: 'org_b' }, 'org_b'), null);
+    assert.equal(await resolveAccess(apiPool, 'user_owner_b', { clerkOrgId: 'org_b' }, 'org_b'), null);
+    assert.deepEqual(await resolveAccess(apiPool, 'user_owner_a', { clerkOrgId: 'org_a' }, 'org_a'), { tenantId: tenantA, role: 'client_owner' });
+    assert.equal(await ev('user_c1', 'client_owner', 450n, 'org_b'), 'stale'); // a delayed pre-deletion event: no revival
+    assert.equal(await revokeOrganization(hookPool, 'org_none', 500n), 'no_tenant');
+  });
+
+  test('only the webhook login writes memberships; nobody deletes; the app writes no access rows', async () => {
+    assert.equal(await tx(tenantA, async (t) => (await t.client.query('SELECT 1 FROM tenants')).rowCount), 1); // org lookup scoped to one call
+    for (const sql of [
+      "INSERT INTO memberships (tenant_id, clerk_user_id, role) VALUES ($1, 'x', 'client_owner')",
+      "UPDATE memberships SET role = 'client_owner' WHERE tenant_id = $1",
+      "INSERT INTO firm_access (tenant_id, clerk_user_id, role, granted_by) VALUES ($1, 'user_staff', 'firm_admin', 'x')",
+      "INSERT INTO firm_staff (clerk_user_id) SELECT 'x' WHERE $1::uuid IS NOT NULL",
+    ]) await assert.rejects(tx(tenantA, (t) => t.client.query(sql, [tenantA])), /permission denied/, sql);
+    await assert.rejects(apiPool.query('SET ROLE finbook_sync'), /permission denied/); // the API login can't become the webhook
+    await assert.rejects(withTenant(hookPool, as(tenantA), (t) => t.client.query('DELETE FROM memberships'), 'finbook_sync'), /permission denied/);
+    await assert.rejects(withTenant(hookPool, as(tenantA), (t) => t.client.query("UPDATE memberships SET tenant_id = $1", [tenantB]), 'finbook_sync'), /permission denied/);
+    await assert.rejects(withTenant(hookPool, as(tenantA), (t) => t.client.query("INSERT INTO memberships (tenant_id, clerk_user_id, role) VALUES ($1, 'x', 'client_owner')", [tenantB]), 'finbook_sync'), /row-level security/);
+    assert.equal(await withTenant(hookPool, as(tenantA), async (t) => (await t.client.query('SELECT 1 FROM journal_lines')).rowCount, 'finbook_sync').catch((e: unknown) => String(e)), 'error: permission denied for table journal_lines');
+  });
+
+  test('access rows are audited', async () => {
+    const rows = (await owner<{ entity: string }>("SELECT DISTINCT entity FROM audit_log WHERE tenant_id = $1 AND entity IN ('memberships', 'firm_access') ORDER BY entity", [tenantA])).rows;
+    assert.deepEqual(rows.map((r) => r.entity), ['firm_access', 'memberships']);
   });
 });

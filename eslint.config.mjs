@@ -21,7 +21,7 @@ export default tseslint.config(
   },
   // tests may use Number() for loop counts and PRNG plumbing, never for money amounts
   {
-    files: ['**/*.test.ts'],
+    files: ['**/*.test.ts', '**/*.integration.ts'],
     rules: { 'no-restricted-globals': 'off', 'no-restricted-syntax': 'off', '@typescript-eslint/no-floating-promises': 'off' },
   },
   { files: ['**/*.mjs', '**/*.js'], ...tseslint.configs.disableTypeChecked },

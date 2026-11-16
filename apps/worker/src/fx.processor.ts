@@ -1,5 +1,5 @@
-import { type OnModuleInit } from '@nestjs/common';
-import { InjectQueue, Processor, WorkerHost } from '@nestjs/bullmq';
+import { Logger, type OnModuleInit } from '@nestjs/common';
+import { InjectQueue, OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import type { Job, Queue } from 'bullmq';
 import pg from 'pg';
 import { fetchRates, storeRates } from './rates.js';
@@ -30,5 +30,16 @@ export class FxProcessor extends WorkerHost implements OnModuleInit {
     } finally {
       await db.end();
     }
+  }
+
+  // The only trace of the daily run until Sentry has a DSN: one line per outcome in the Railway logs.
+  @OnWorkerEvent('completed')
+  completed(job: Job<unknown, { inserted: number }>): void {
+    Logger.log(`${job.name} done: ${String(job.returnvalue.inserted)} rate rows inserted`, 'FxProcessor');
+  }
+
+  @OnWorkerEvent('failed')
+  failed(job: Job | undefined, err: Error): void {
+    Logger.error(`${job?.name ?? 'job'} failed (attempt ${String(job?.attemptsMade ?? 0)}): ${err.message}`, 'FxProcessor');
   }
 }

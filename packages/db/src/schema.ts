@@ -108,6 +108,8 @@ export const journalLines = pgTable('journal_lines', {
   foreignKey({ name: 'journal_lines_account', columns: [t.tenantId, t.accountId], foreignColumns: [accounts.tenantId, accounts.id] }),
   index('journal_lines_tenant_account').on(t.tenantId, t.accountId),
   index('journal_lines_entry').on(t.entryId),
+  // The per-car checks (0006, 0008) scan a car's lines under the tenant lock; partial, since most lines name no car.
+  index('journal_lines_tenant_vehicle_account').on(t.tenantId, t.vehicleId, t.accountId).where(sql`${t.vehicleId} IS NOT NULL`),
   check('journal_lines_one_side', sql`${t.debitNgn} >= 0 and ${t.creditNgn} >= 0 and (${t.debitNgn} > 0) <> (${t.creditNgn} > 0)`),
   // Shape of the spot fields (ADR 0009, 0010): NGN lines never carry one; otherwise rate and source come together, and a
   // manual spot rate needs a note. Which lines must carry one is checked by the check_spot_source trigger (it knows reversals).
@@ -205,4 +207,43 @@ export const fxRevaluations = pgTable('fx_revaluations', {
   check('fx_revaluations_cbn', sql`${t.rateSource} = 'cbn'`),
   check('fx_revaluations_balance', sql`${t.balanceMinor} >= 0`),
   check('fx_revaluations_closing', sql`${t.closingNgn} = round(${t.balanceMinor} * ${t.rate})`),
+]);
+
+/**
+ * Who may act in a tenant, and as what (spec → Multi-tenancy). The API reads the role here on every request, under RLS.
+ * memberships: the client's own people, mirrored from the tenant's Clerk Organization by webhook.
+ * firm_access: firm staff assigned to this client by a firm admin; the only way staff reach a tenant.
+ */
+export const memberships = pgTable('memberships', {
+  id: id(),
+  tenantId: tenantId(),
+  clerkUserId: text('clerk_user_id').notNull(),
+  role: text('role'),
+  /** Set when Clerk removes the member (or the row must never grant access); rows are never deleted, so every change is audited. */
+  revokedAt: timestamp('revoked_at', { withTimezone: true }),
+  /** Clerk event time (ms) of the last event applied: an older or repeated delivery changes nothing. */
+  clerkEventMs: bigint('clerk_event_ms', { mode: 'bigint' }).notNull().default(sql`0`),
+  createdAt: createdAt(),
+}, (t) => [
+  unique('memberships_tenant_user').on(t.tenantId, t.clerkUserId),
+  check('memberships_role', sql`${t.role} in ('client_owner', 'client_staff', 'client_viewer')`),
+  check('memberships_role_or_revoked', sql`(${t.role} IS NULL) = (${t.revokedAt} IS NOT NULL)`),
+]);
+
+/** Global, not per tenant (no client data): the people who work for the firm. Firm staff never hold a client role. */
+export const firmStaff = pgTable('firm_staff', {
+  clerkUserId: text('clerk_user_id').primaryKey(),
+  createdAt: createdAt(),
+});
+
+export const firmAccess = pgTable('firm_access', {
+  id: id(),
+  tenantId: tenantId(),
+  clerkUserId: text('clerk_user_id').notNull().references(() => firmStaff.clerkUserId),
+  role: text('role').notNull(),
+  grantedBy: text('granted_by').notNull(),
+  createdAt: createdAt(),
+}, (t) => [
+  unique('firm_access_tenant_user').on(t.tenantId, t.clerkUserId),
+  check('firm_access_role', sql`${t.role} in ('firm_admin', 'firm_accountant', 'firm_reviewer')`),
 ]);

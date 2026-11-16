@@ -4,6 +4,8 @@ import assert from 'node:assert/strict';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module.js';
 
+process.env.DATABASE_URL ??= 'postgresql://unused@127.0.0.1:1/unused'; // the pool never connects in these tests
+
 test('GET /health returns ok', async () => {
   const app = await NestFactory.create(AppModule, { logger: false });
   await app.listen(0, '127.0.0.1');

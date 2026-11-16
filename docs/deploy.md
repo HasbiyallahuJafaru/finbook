@@ -31,9 +31,15 @@ Staging variables (values never printed or committed):
 | `SENTRY_ENVIRONMENT` | yes | yes | `staging` |
 | `SENTRY_DSN` | not yet | not yet | needs a Sentry project |
 | `DATABASE_URL` (api only) | yes | no | `postgresql://finbook_api:${{migrate.FINBOOK_API_DB_PASSWORD}}@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}` (non-superuser login, ADR 0006) |
+| `CLERK_JWT_KEY` (api only) | not yet | no | the Clerk instance's PEM public key (Dashboard → API keys → JWT public key). Unset: guarded routes answer 503 (ADR 0013) |
+| `CLERK_ISSUER` (api only) | not yet | no | the Clerk instance's Frontend API URL (exact `iss` claim) |
+| `CLERK_WEBHOOK_SIGNING_SECRET` (api only) | not yet | no | the signing secret of the Clerk webhook endpoint `https://<api>/webhooks/clerk`. Unset: the webhook answers 503 and Clerk retries |
+| `CLERK_AUTHORIZED_PARTIES` (api only) | not yet | no | comma-separated web origins allowed as `azp`, e.g. the staging web URL |
 | `DATABASE_OWNER_URL` (migrate only) | no | no | `${{Postgres.DATABASE_URL}}`: the owner; never on api or worker |
 | `FINBOOK_API_DB_PASSWORD` (migrate only) | no | no | random, generated locally and piped in with `--stdin`; never printed |
 | `FINBOOK_RATES_DB_PASSWORD` (migrate only) | no | no | random, generated locally and piped in with `--stdin`; never printed. `migrate` sets it as the `finbook_rates` login's password |
+| `FINBOOK_HOOK_DB_PASSWORD` (migrate only) | no | no | random, generated locally and piped in with `--stdin`; never printed. `migrate` sets it as the `finbook_hook` login's password (ADR 0013) |
+| `WEBHOOK_DATABASE_URL` (api only) | not yet | no | `postgresql://finbook_hook:${{migrate.FINBOOK_HOOK_DB_PASSWORD}}@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}`: only the Clerk webhook writes memberships through it. Unset: the webhook answers 503 |
 | `RATES_DATABASE_URL` (worker only) | no | yes | `postgresql://finbook_rates:${{migrate.FINBOOK_RATES_DB_PASSWORD}}@${{Postgres.PGHOST}}:${{Postgres.PGPORT}}/${{Postgres.PGDATABASE}}` (reference rates only, no tenant data) |
 
 Build and start commands are set as Railpack variables because the installed Railway CLI (5.41.2) silently ignores `railway environment edit --service-config`. Node 24 comes from `engines` in the root `package.json`.

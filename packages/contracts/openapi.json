@@ -1,0 +1,132 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "FinBook API",
+    "version": "0"
+  },
+  "components": {
+    "securitySchemes": {
+      "clerk": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  },
+  "security": [
+    {
+      "clerk": []
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Liveness"
+          }
+        }
+      }
+    },
+    "/webhooks/clerk": {
+      "post": {
+        "security": [],
+        "description": "Clerk organization-membership events, authenticated by their Svix signature (ADR 0013).",
+        "responses": {
+          "200": {
+            "description": "applied, stale, no_tenant or ignored"
+          },
+          "400": {
+            "description": "Bad signature"
+          },
+          "503": {
+            "description": "Not configured"
+          }
+        }
+      }
+    },
+    "/me": {
+      "get": {
+        "parameters": [
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "description": "The tenant to act for. Required for firm staff; client users may rely on their active organization."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The caller in this tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tenantId": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "legalName": {
+                      "type": "string"
+                    },
+                    "userId": {
+                      "type": "string"
+                    },
+                    "role": {
+                      "type": "string",
+                      "enum": [
+                        "firm_admin",
+                        "firm_accountant",
+                        "firm_reviewer",
+                        "client_owner",
+                        "client_staff",
+                        "client_viewer"
+                      ]
+                    },
+                    "permissions": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": [
+                    "tenantId",
+                    "legalName",
+                    "userId",
+                    "role",
+                    "permissions"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error"
+          },
+          "401": {
+            "description": "Error"
+          },
+          "403": {
+            "description": "Error"
+          },
+          "404": {
+            "description": "Error"
+          },
+          "503": {
+            "description": "Error"
+          }
+        }
+      }
+    }
+  }
+}

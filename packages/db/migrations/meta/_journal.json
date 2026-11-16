@@ -64,6 +64,20 @@
       "when": 1794770449957,
       "tag": "0008_inventory_guards",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1794853119022,
+      "tag": "0009_tenant_access",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1794853120289,
+      "tag": "0010_index_lines_by_vehicle",
+      "breakpoints": true
     }
   ]
 }

@@ -19,7 +19,8 @@
     "test:integration": "turbo run test:integration",
     "db:new": "pnpm --filter @app/db exec drizzle-kit generate --custom --name",
     "db:generate": "pnpm --filter @app/db generate",
-    "db:migrate": "pnpm --filter @app/db migrate"
+    "db:migrate": "pnpm --filter @app/db migrate",
+    "openapi": "pnpm --filter @app/contracts openapi"
   },
   "engines": {
     "node": ">=24"

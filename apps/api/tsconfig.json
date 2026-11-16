@@ -5,6 +5,7 @@
     "outDir": "dist",
     "noEmit": false,
     "allowImportingTsExtensions": false,
+    "rewriteRelativeImportExtensions": true,
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
     "strictPropertyInitialization": false
