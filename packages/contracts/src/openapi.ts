@@ -2,7 +2,7 @@
 import { writeFileSync } from 'node:fs';
 import { z } from 'zod';
 import {
-  AcceptQuote, AddJobVehicle, SignOffFlag, Counterparty, CreateCounterparty, CreateJobOrder, CreateUpload, CreateVehicle, Document, DownloadTicket, IdempotencyKeyHeader, JobOrder,
+  AcceptQuote, AddJobVehicle, SignOffFlag, Counterparty, CreateCounterparty, CreateJobOrder, CreatePosting, Posting, CreateUpload, CreateVehicle, Document, DownloadTicket, IdempotencyKeyHeader, JobOrder,
   ListCounterpartiesQuery, ListJobOrdersQuery, ListVehiclesQuery, MeResponse, TenantIdHeader, UploadTicket, Vehicle,
 } from './index.ts';
 
@@ -54,6 +54,8 @@ const doc = {
       responses: { 200: ok('Quote accepted; the quote and cars are now fixed', JobOrder), ...writeErrors } } },
     '/job-orders/{id}/sign-offs': { post: { parameters: [tenantHeader, idempotencyHeader, idPath], requestBody: body(SignOffFlag),
       responses: { 201: ok('One flag signed off by a firm reviewer or admin; who and when are stamped by the database', JobOrder), ...writeErrors } } },
+    '/postings': { post: { parameters: [tenantHeader, idempotencyHeader], requestBody: body(CreatePosting),
+      responses: { 201: ok('Posted: the lines the rule built from the facts and the ledger, and any flags the entry raised', Posting), ...writeErrors } } },
     '/me': { get: { parameters: [tenantHeader], responses: { 200: { description: 'The caller in this tenant', content: { 'application/json': { schema: json(MeResponse) } } }, ...errors } } },
   },
 };

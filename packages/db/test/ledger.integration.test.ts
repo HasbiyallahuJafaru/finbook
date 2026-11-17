@@ -3,6 +3,7 @@
 // finding from the ledger-auditor and security-reviewer passes (ADR 0006). Needs Docker.
 import { after, before, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import pg from 'pg';
 import { vinProblem } from '@app/contracts';
@@ -82,6 +83,7 @@ const suppliers: Record<string, string> = {}; // tenant -> its test supplier (a 
 const counterpartyIn = (tenant: string, id: string) => (id === SUPPLIER ? (suppliers[tenant] ?? '') : id);
 const rateString = (scaled: bigint) => `${String(scaled / RATE_SCALE)}.${String(scaled % RATE_SCALE).padStart(6, '0')}`;
 
+const randomHex = () => randomBytes(32).toString('hex'); // a fake sha256: tests only
 const as = (tenantId: string, userId = USER): Actor => ({ tenantId, userId });
 const tx = <T>(tenantId: string, fn: (t: Tx) => Promise<T>) => withTenant(apiPool, as(tenantId), fn);
 const owner = <T extends pg.QueryResultRow = Record<string, unknown>>(sql: string, params: unknown[] = []) => ownerPool.query<T>(sql, params);
@@ -121,7 +123,7 @@ const chainBreaks = (tenant: string) => tx(tenant, async (t) =>
 
 /** A fresh tenant with the test chart and an open January 2026 period. 1010 (the pool) has no account currency, as in production; 1020 is a CNY account. */
 async function freshTenant(name: string): Promise<{ id: string; period: string }> {
-  const id = (await owner<{ id: string }>('INSERT INTO tenants (legal_name) VALUES ($1) RETURNING id', [name])).rows[0]?.id ?? '';
+  const id = (await owner<{ id: string }>("INSERT INTO tenants (legal_name, go_live_on) VALUES ($1, '2025-12-01') RETURNING id", [name])).rows[0]?.id ?? '';
   const ids: Record<string, string> = {};
   accounts[id] = ids;
   const period = await tx(id, async (t) => {
@@ -501,10 +503,11 @@ describe('phase 2: posting rules through the database', () => {
       [tenant, period, opts.date ?? '2026-01-10', opts.sourceType ?? (opts.reverses ? null : entryTypeOf(lines)), `pr-${String(++keySeq)}`, opts.reverses ?? null]);
     for (const l of lines) {
       await c.query(
-        `INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, spot_rate, spot_source, rate_note, vehicle_id, counterparty_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+        `INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, spot_rate, spot_source, rate_note, vehicle_id, counterparty_id,
+           evidence_document_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
         [tenant, entryId, ids[l.account], l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null, l.spotRate ?? null, l.spotSource ?? null, l.rateNote ?? null,
-          l.vehicleId ? carOf(tenant, l.vehicleId) : null, l.counterpartyId ? (l.counterpartyId.length === 36 ? counterpartyIn(tenant, l.counterpartyId) : customer(tenant, l.counterpartyId)) : null]);
+          l.vehicleId ? carOf(tenant, l.vehicleId) : null, l.counterpartyId ? (l.counterpartyId.length === 36 ? counterpartyIn(tenant, l.counterpartyId) : customer(tenant, l.counterpartyId)) : null,
+          l.evidenceDocumentId ?? null]);
     }
     return entryId;
   };
@@ -1520,13 +1523,15 @@ describe('phase 2: posting rules through the database', () => {
     await postLines(id, period, receivableReceipt({ ...job('B'), amountNgn: 90_000_000n, history: await historyOf(id, 'B') }));
     // Undoing B's completion now would leave the customer's payment with no bill: reverse the payment first.
     await assert.rejects(postLines(id, period, swap(doneB), { reverses: doneBId }), owes);
+    // More money in from B's customer after the completion: it posts, flagged (most likely meant for a balance owed).
+    await postLines(id, period, customerReceipt({ ...job('B'), amountNgn: 1_000n }));
     // C: the supplier credits NGN 20,000.00, then the customer walks away: the car still converts to stock (it never completed).
     await postLines(id, period, customerReceipt({ ...job('C'), amountNgn: 200_000_000n }));
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'C', spot: SPOT_CBN }).lines);
     await postLines(id, period, sharedCost({ amountNgn: 5_000_000n, vehicleIds: ['C'] }));
     await postLines(id, period, supplierCredit({ vehicleId: 'C', amountNgn: 2_000_000n, history: await historyOf(id, 'C') }));
     await postLines(id, period, convertToStock({ ...job('C'), history: await historyOf(id, 'C') }));
-    assert.deepEqual(await flags(id), [['converted_to_stock', 'C'], ['cost_credited', 'C'], ['negative_cut', 'B']]);
+    assert.deepEqual(await flags(id), [['converted_to_stock', 'C'], ['cost_credited', 'C'], ['funds_after_completion', 'B'], ['negative_cut', 'B']]);
     const tb = await trialBalance(id);
     assert.equal(tb.dr - tb.cr, 0n);
     assert.deepEqual(await chainBreaks(id), []);
@@ -1541,6 +1546,20 @@ describe('phase 2: posting rules through the database', () => {
     assert.equal(done.find((l) => l.account === '4100')?.debit, 110_000_000n);
     await postLines(id, period, done);
     assert.deepEqual(await flags(id), [['negative_cut', 'A']]);
+  });
+
+  test("four eyes: a reviewer who uploaded a receipt's evidence doesn't sign off that car's flags (0016)", async () => {
+    const { id, period } = await funded('Four eyes on evidence', { held: false });
+    // The client paid the supplier for A before its customer paid: flagged.
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
+    // The firm reviewer uploads the customer's bank slip; the receipt carries it on its cash line, which names no car.
+    const slip = await withTenant(apiPool, as(id, REVIEWER), async (t) => {
+      const d = await one(t.client, "INSERT INTO documents (tenant_id, doc_type, mime, size_bytes, sha256, original_filename) VALUES ($1, 'receipt', 'application/pdf', 100, $2, 'slip.pdf') RETURNING id", [id, randomHex()]);
+      await t.client.query("UPDATE documents SET status = 'stored', evidence_key = 'evidence/' || tenant_id || '/2026/01/' || id || '.pdf', stored_at = now() WHERE id = $1", [d]);
+      return d;
+    });
+    await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 200_000_000n, evidenceDocumentId: slip }));
+    await assert.rejects(approve(id, 'A', 'supplier_cost_not_covered'), /signed off by someone who touched nothing it is about/);
   });
 
   test('a sign-off answers one flag, by a firm reviewer or admin who touched nothing the flag is about (0014)', async () => {
@@ -1886,6 +1905,93 @@ describe('phase 1 gate', () => {
     assert.deepEqual(await chainBreaks(tenantA), []);
     assert.equal(await tx(tenantB, async (t) => (await t.client.query('SELECT 1 FROM journal_entries WHERE tenant_id = $1', [tenantA])).rowCount), 0,
       'cross-tenant read returns zero rows');
+  });
+});
+
+describe('default chart of accounts (migration 0016)', () => {
+  test('a new client gets the default chart once; existing accounts are kept; only the owner seeds it', async () => {
+    const tenant = (await owner<{ id: string }>("INSERT INTO tenants (legal_name) VALUES ('Chart seed') RETURNING id")).rows[0]?.id ?? '';
+    const seed = async () => {
+      const c = await ownerPool.connect();
+      try {
+        await c.query('BEGIN');
+        await c.query("SELECT set_config('app.user_id', 'user_firm_admin', true)");
+        await c.query('SELECT seed_default_chart($1)', [tenant]);
+        await c.query('COMMIT');
+      } finally {
+        c.release();
+      }
+    };
+    // Firm staff already set up 1000 under the client's own bank name: the seed leaves it as it is.
+    await tx(tenant, (t) => t.client.query("INSERT INTO accounts (tenant_id, code, name, type) VALUES ($1, '1000', 'Cash – GTBank', 'asset')", [tenant]));
+    await seed();
+    await seed();
+    const chart = (await tx(tenant, (t) => t.client.query<{ code: string; name: string; type: string; is_system: boolean }>('SELECT code, name, type, is_system FROM accounts ORDER BY code'))).rows;
+    assert.deepEqual(chart.map((a) => a.code), ['1000', '1010', '1019', '1100', '1150', '1200', '1210', '1300', '2000', '2009', '2100', '2150', '2200', '3000', '3100', '4000', '4100', '4200', '5000', '6000', '7000', '7100']);
+    assert.equal(chart[0]?.name, 'Cash – GTBank');
+    assert.deepEqual(chart.filter((a) => !a.is_system).map((a) => a.code), ['1000', '1300', '2200', '3000', '3100', '6000']);
+    assert.equal(await count(tenant, 'accounts'), 22);
+    await assert.rejects(tx(tenant, (t) => t.client.query('SELECT seed_default_chart($1)', [tenant])), /permission denied for function seed_default_chart/);
+  });
+
+  test('a client\'s books take entries from its go-live date to today; no month opens behind a locked one (0016)', async () => {
+    const entry = (date: string, sourceType = 'manual_journal') => tx(tenantA, (t) => insertEntry(t.client, tenantA, { ...simple(periodA, 100n, date), sourceType }));
+    await assert.rejects(tx(tenantA, (t) => insertEntry(t.client, tenantA, simple(lockedA, 100n, '2025-11-30'))), /entry date 2025-11-30 is before this business went live \(2025-12-01\)/);
+    const tomorrow = (await owner<{ d: string }>("SELECT to_char((now() AT TIME ZONE 'Africa/Lagos')::date + 1, 'YYYY-MM-DD') AS d")).rows[0]?.d ?? '';
+    await assert.rejects(entry(tomorrow), new RegExp(`entry date ${tomorrow} is in the future`));
+    await entry('2026-01-20');
+    const unlive = (await owner<{ id: string }>("INSERT INTO tenants (legal_name) VALUES ('Not live yet') RETURNING id")).rows[0]?.id ?? '';
+    await assert.rejects(tx(unlive, async (t) => {
+      const acct = async (code: string) => one(t.client, "INSERT INTO accounts (tenant_id, code, name, type) VALUES ($1, $2, 'x', 'asset') RETURNING id", [unlive, code]);
+      const [a, b] = [await acct('1000'), await acct('3000')];
+      const per = await one(t.client, "INSERT INTO periods (tenant_id, starts_on, ends_on) VALUES ($1, '2026-01-01', '2026-01-31') RETURNING id", [unlive]);
+      const e = await one(t.client, "INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key) VALUES ($1, $2, '2026-01-05', 'x', 'manual_journal', uuidv7(), 'k') RETURNING id", [unlive, per]);
+      await t.client.query("INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, amount_minor) VALUES ($1, $2, $3, 1, 0, 1), ($1, $2, $4, 0, 1, 1)", [unlive, e, a, b]);
+    }), /no go-live date yet/);
+    await assert.rejects(tx(tenantA, (t) => t.client.query("INSERT INTO periods (tenant_id, starts_on, ends_on) VALUES ($1, '2025-11-01', '2025-11-30')", [tenantA])),
+      /period 2025-11-01 to 2025-11-30 is before this business went live \(2025-12-01\)/);
+    // January open, March locked, February never had an entry: February can't open behind March's lock; April can.
+    const { id: gaps } = await freshTenant('Gap month');
+    await tx(gaps, async (t) => {
+      const march = await one(t.client, "INSERT INTO periods (tenant_id, starts_on, ends_on) VALUES ($1, '2026-03-01', '2026-03-31') RETURNING id", [gaps]);
+      await t.client.query("UPDATE periods SET status = 'locked', locked_by = 'user_admin', locked_at = now() WHERE id = $1", [march]);
+    });
+    await assert.rejects(tx(gaps, (t) => t.client.query("INSERT INTO periods (tenant_id, starts_on, ends_on) VALUES ($1, '2026-02-01', '2026-02-28')", [gaps])),
+      /period 2026-02-01 to 2026-02-28 would open behind a locked period/);
+    await tx(gaps, (t) => t.client.query("INSERT INTO periods (tenant_id, starts_on, ends_on) VALUES ($1, '2026-04-01', '2026-04-30')", [gaps]));
+  });
+
+  test('the seed refuses a system account set up with another type (0016)', async () => {
+    const tenant = (await owner<{ id: string }>("INSERT INTO tenants (legal_name) VALUES ('Mistyped chart') RETURNING id")).rows[0]?.id ?? '';
+    await tx(tenant, (t) => t.client.query("INSERT INTO accounts (tenant_id, code, name, type) VALUES ($1, '2150', 'Deposits', 'income')", [tenant]));
+    const c = await ownerPool.connect();
+    try {
+      await c.query('BEGIN');
+      await c.query("SELECT set_config('app.user_id', 'user_firm_admin', true)");
+      await assert.rejects(c.query('SELECT seed_default_chart($1)', [tenant]), /account 2150 already exists with another type/);
+    } finally {
+      await c.query('ROLLBACK');
+      c.release();
+    }
+  });
+
+  test("a line's evidence is one of this tenant's own stored documents (0016)", async () => {
+    const doc = (status: 'pending' | 'stored') => tx(tenantA, async (t) => {
+      const d = await one(t.client, "INSERT INTO documents (tenant_id, doc_type, mime, size_bytes, sha256, original_filename) VALUES ($1, 'receipt', 'application/pdf', 100, $2, 'r.pdf') RETURNING id",
+        [tenantA, randomHex()]);
+      if (status === 'stored') await t.client.query("UPDATE documents SET status = 'stored', evidence_key = 'evidence/' || tenant_id || '/2026/01/' || id || '.pdf', stored_at = now() WHERE id = $1", [d]);
+      return d;
+    });
+    const withEvidence = (documentId: string) => tx(tenantA, async (t) => {
+      const entryId = await insertEntry(t.client, tenantA, { ...simple(periodA, 100n), lines: [] });
+      await t.client.query("INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, evidence_document_id) VALUES ($1, $2, $3, 100, 0, 'NGN', 100, $4), ($1, $2, $5, 0, 100, 'NGN', 100, NULL)",
+        [tenantA, entryId, accounts[tenantA]?.['1000'], documentId, accounts[tenantA]?.['3000']]);
+    });
+    await assert.rejects(withEvidence(await doc('pending')), /evidence must be a stored document/);
+    await assert.rejects(withEvidence('019a0000-0000-7000-8000-00000000dead'), /^error: evidence must be a stored document: confirm the upload first$/);
+    const bDoc = await tx(tenantB, (t) => one(t.client, "INSERT INTO documents (tenant_id, doc_type, mime, size_bytes, sha256, original_filename) VALUES ($1, 'receipt', 'application/pdf', 100, $2, 'r.pdf') RETURNING id", [tenantB, randomHex()]));
+    await assert.rejects(withEvidence(bDoc), /^error: evidence must be a stored document: confirm the upload first$/); // another tenant's: the same answer
+    await withEvidence(await doc('stored'));
   });
 });
 

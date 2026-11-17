@@ -13,6 +13,7 @@
   "dependencies": {
     "@app/contracts": "workspace:*",
     "@app/db": "workspace:*",
+    "@app/ledger": "workspace:*",
     "@app/money": "workspace:*",
     "@aws-sdk/client-s3": "3.1169.0",
     "@aws-sdk/s3-request-presigner": "3.1169.0",

@@ -69,9 +69,19 @@ before(async () => {
   ownerPool = new pg.Pool({ connectionString: container.getConnectionUri(), max: 2 });
   await migrate(ownerPool, { api: API_PASSWORD, hook: HOOK_PASSWORD });
   const tenant = async (name: string, org: string) =>
-    (await ownerPool.query<{ id: string }>('INSERT INTO tenants (legal_name, clerk_org_id) VALUES ($1, $2) RETURNING id', [name, org])).rows[0]?.id ?? '';
+    (await ownerPool.query<{ id: string }>("INSERT INTO tenants (legal_name, clerk_org_id, go_live_on) VALUES ($1, $2, '2026-01-01') RETURNING id", [name, org])).rows[0]?.id ?? '';
   tenantA = await tenant('Tenant A Ltd', 'org_a');
   tenantB = await tenant('Tenant B Ltd', 'org_b');
+  // Each client's default chart of accounts, as onboarding seeds it (0016).
+  const seeding = await ownerPool.connect();
+  try {
+    await seeding.query('BEGIN');
+    await seeding.query("SELECT set_config('app.user_id', 'user_admin', true)");
+    await seeding.query('SELECT seed_default_chart(id) FROM tenants');
+    await seeding.query('COMMIT');
+  } finally {
+    seeding.release();
+  }
   const suspended = await tenant('Tenant S Ltd', 'org_s');
   await ownerPool.query("UPDATE tenants SET status = 'suspended' WHERE id = $1", [suspended]);
   await ownerPool.query("INSERT INTO memberships (tenant_id, clerk_user_id, role) VALUES ($1, 'user_owner_s', 'client_owner')", [suspended]);
@@ -546,9 +556,8 @@ describe('documents and job orders', () => {
     const owner = await ownerPool.connect();
     try {
       await owner.query('BEGIN');
-      const account = async (code: string, type: string) => (await owner.query<{ id: string }>(
-        'INSERT INTO accounts (tenant_id, code, name, type) VALUES ($1, $2, $3, $4) RETURNING id', [tenantA, code, `Account ${code}`, type])).rows[0]?.id;
-      const [cash, transit] = [await account('1000', 'asset'), await account('1200', 'asset')];
+      const account = async (code: string) => (await owner.query<{ id: string }>('SELECT id FROM accounts WHERE tenant_id = $1 AND code = $2', [tenantA, code])).rows[0]?.id;
+      const [cash, transit] = [await account('1000'), await account('1200')];
       const period = (await owner.query<{ id: string }>("INSERT INTO periods (tenant_id, starts_on, ends_on) VALUES ($1, '2026-01-01', '2026-01-31') RETURNING id", [tenantA])).rows[0]?.id;
       const entry = (await owner.query<{ id: string }>(
         `INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, created_by)
@@ -577,5 +586,95 @@ describe('documents and job orders', () => {
     const audit = await ownerPool.query("SELECT l.actor FROM audit_log l JOIN job_order_sign_offs s ON s.id = l.entity_id WHERE l.entity = 'job_order_sign_offs' AND s.flag_id = $1", [approval.flagId]);
     assert.deepEqual(audit.rows, [{ actor: 'user_reviewer' }]);
     assert.equal((await get(`/job-orders/${job.id}`, bearer(ownerB))).status, 404);
+  });
+
+  // ── POST /postings (ADR 0017): customer money. One clearing-only job for car K, quote accepted, landing NGN 1,000,000.00.
+  describe('POST /postings: customer money', () => {
+    let car = '';
+    const post = (claims: Record<string, unknown>, body: unknown, key: string = randomUUID()) => fetch(`${url}/postings`, {
+      method: 'POST', body: JSON.stringify(body), headers: { ...bearer(claims), 'content-type': 'application/json', 'idempotency-key': key } });
+    const receipt = (amountNgn: string, extra: Record<string, unknown> = {}) => ({ type: 'customer_receipt', vehicleId: car, amountNgn, entryDate: '2026-02-03', ...extra });
+    before(async () => {
+      const job = (await (await send('POST', '/job-orders', ownerA, { customerId: customerA, jobType: 'clearing_only', orderedOn: '2026-02-01', landingChargeNgn: '100000000' })).json()) as { id: string };
+      car = ((await (await send('POST', '/vehicles', ownerA, { vin: 'SALGS2SE5LA000010', make: 'Toyota', model: 'Camry', year: 2019 })).json()) as { id: string }).id;
+      await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: car, landingChargeNgn: '100000000' });
+      assert.equal((await send('POST', `/job-orders/${job.id}/accept-quote`, ownerA, { documentId: (await evidence(ownerA, PDF)).id })).status, 200);
+    });
+
+    test('a customer receipt posts the rule\'s lines for the job\'s own customer, opens the month, and is audited; a retry posts nothing more', async () => {
+      const key = randomUUID();
+      const first = await post(ownerA, receipt('50000000'), key);
+      assert.equal(first.status, 201);
+      const posted = (await first.json()) as { entryId: string; type: string; memo: string; lines: unknown[]; flags: unknown[] };
+      assert.deepEqual([posted.type, posted.memo, posted.flags], ['customer_receipt', 'Customer receipt', []]);
+      assert.deepEqual(posted.lines, [
+        { account: '1000', debitNgn: '50000000', creditNgn: '0', currency: 'NGN', amountMinor: '50000000', vehicleId: null, counterpartyId: null },
+        { account: '2150', debitNgn: '0', creditNgn: '50000000', currency: 'NGN', amountMinor: '50000000', vehicleId: car, counterpartyId: customerA },
+      ]);
+      const retry = await post(ownerA, receipt('50000000'), key);
+      assert.deepEqual([retry.status, await retry.json()], [201, posted]);
+      const rows = await ownerPool.query<{ source_type: string; created_by: string; starts_on: string; ends_on: string }>(
+        `SELECT e.source_type, e.created_by, to_char(p.starts_on, 'YYYY-MM-DD') AS starts_on, to_char(p.ends_on, 'YYYY-MM-DD') AS ends_on
+           FROM journal_entries e JOIN periods p ON p.id = e.period_id WHERE e.tenant_id = $1 AND e.memo = 'Customer receipt'`, [tenantA]);
+      assert.deepEqual(rows.rows, [{ source_type: 'customer_receipt', created_by: 'user_owner_a', starts_on: '2026-02-01', ends_on: '2026-02-28' }]);
+      const audit = await ownerPool.query("SELECT actor FROM audit_log WHERE entity = 'journal_entries' AND entity_id = $1", [posted.entryId]);
+      assert.deepEqual(audit.rows, [{ actor: 'user_owner_a' }]);
+      // The entry's source is the posting's facts, kept for good.
+      const source = await ownerPool.query<{ type: string; facts: { amountNgn: string; vehicleId: string }; created_by: string }>(
+        'SELECT p.type, p.facts, p.created_by FROM postings p JOIN journal_entries e ON e.source_id = p.id WHERE e.id = $1', [posted.entryId]);
+      assert.deepEqual(source.rows.map((r) => [r.type, r.facts.amountNgn, r.facts.vehicleId, r.created_by]), [['customer_receipt', '50000000', car, 'user_owner_a']]);
+    });
+
+    test('the request carries facts, never lines, types or customers; refunds and balances owed are capped by the ledger', async () => {
+      for (const bad of [receipt('1.5'), receipt('-1'), { ...receipt('100'), lines: [] }, { ...receipt('100'), sourceType: 'manual_journal' }, { ...receipt('100'), counterpartyId: customerA },
+        { ...receipt('100'), type: 'manual_journal' }, { ...receipt('100'), entryDate: '03/02/2026' }]) {
+        assert.equal((await post(ownerA, bad)).status, 400);
+      }
+      assert.equal((await post(ownerA, receipt('0'))).status, 422); // the rule: a receipt is positive
+      const refund = (amountNgn: string) => ({ ...receipt(amountNgn), type: 'customer_refund' });
+      const tooMuch = await post(ownerA, refund('50000001'));
+      assert.deepEqual([tooMuch.status, ((await tooMuch.json()) as { message: string }).message], [422, 'refund exceeds the customer funds held for this job']);
+      const back = await post(ownerA, refund('1000'));
+      assert.equal(back.status, 201);
+      const owed = await post(ownerA, { ...receipt('1000'), type: 'receivable_receipt' });
+      assert.deepEqual([owed.status, ((await owed.json()) as { message: string }).message], [422, 'receipt exceeds what this customer owes for this car']); // nothing billed yet
+    });
+
+    test('evidence is a stored document of yours; a locked month refuses; viewers can\'t post; another tenant\'s car is no car', async () => {
+      // A pending upload, a document that doesn't exist and another tenant's stored document: one answer, nothing revealed.
+      const pending = ((await (await send('POST', '/documents/uploads', ownerA, { docType: 'receipt', mime: 'application/pdf', sizeBytes: PDF.length, sha256: sha(PDF), filename: 'r.pdf' })).json()) as Ticket).document.id;
+      const theirs = (await evidence(ownerB, PDF, { docType: 'receipt' })).id;
+      for (const documentId of [pending, randomUUID(), theirs]) {
+        const refused = await post(ownerA, receipt('100', { evidenceDocumentId: documentId }));
+        assert.deepEqual([refused.status, await refused.json()], [422, { message: 'evidence must be a stored document: confirm the upload first', error: 'Unprocessable Entity', statusCode: 422 }]);
+      }
+      const stored = (await evidence(ownerA, PDF, { docType: 'receipt' })).id;
+      assert.equal((await post(ownerA, receipt('100', { evidenceDocumentId: stored }))).status, 201);
+      await ownerPool.query("INSERT INTO periods (tenant_id, starts_on, ends_on, status, locked_by, locked_at) VALUES ($1, '2026-03-01', '2026-03-31', 'locked', 'user_admin', now())", [tenantA]);
+      const locked = await post(ownerA, receipt('100', { entryDate: '2026-03-05' }));
+      assert.deepEqual([locked.status, ((await locked.json()) as { message: string }).message], [422, 'period 2026-03-01 to 2026-03-31 is locked; post the correction in an open period']);
+      assert.equal((await post(viewerA, receipt('100'))).status, 403);
+      // Firm staff: an accountant of this business posts; a reviewer doesn't record; staff with no access to it reach nothing.
+      const staff = (sub: string) => fetch(`${url}/postings`, { method: 'POST', body: JSON.stringify(receipt('100')),
+        headers: { ...bearer({ sub, fva: [1, 1] }, { 'x-tenant-id': tenantA }), 'content-type': 'application/json', 'idempotency-key': randomUUID() } });
+      assert.equal((await staff('user_staff')).status, 201);
+      assert.equal((await staff('user_reviewer')).status, 403);
+      const outsider = await fetch(`${url}/postings`, { method: 'POST', body: JSON.stringify(receipt('100')),
+        headers: { ...bearer({ sub: 'user_staff', fva: [1, 1] }, { 'x-tenant-id': tenantB }), 'content-type': 'application/json', 'idempotency-key': randomUUID() } });
+      assert.equal(outsider.status, 404);
+      // Before go-live, or in the future: refused, and no month opens.
+      const early = await post(ownerA, receipt('100', { entryDate: '2025-12-31' }));
+      assert.deepEqual([early.status, ((await early.json()) as { message: string }).message], [422, 'period 2025-12-01 to 2025-12-31 is before this business went live (2026-01-01): earlier history comes in with the opening balances']);
+      assert.equal((await post(ownerA, receipt('100', { entryDate: '2099-01-02' }))).status, 422);
+      const months = await ownerPool.query("SELECT count(*)::int AS n FROM periods WHERE tenant_id = $1 AND (starts_on < '2026-01-01' OR starts_on > '2030-01-01')", [tenantA]);
+      assert.deepEqual(months.rows, [{ n: 0 }]);
+      const fromB = await post(ownerB, receipt('100'));
+      const text = await fromB.text();
+      assert.equal(fromB.status, 422);
+      assert.match(text, /that car is not on one of your job orders/);
+      assert.equal((await post(ownerB, receipt('100', { vehicleId: randomUUID() }))).status, 422); // the same answer as a car that doesn't exist
+      const entries = await ownerPool.query('SELECT count(*)::int AS n FROM journal_entries WHERE tenant_id = $1', [tenantB]);
+      assert.deepEqual(entries.rows, [{ n: 0 }]);
+    });
   });
 });

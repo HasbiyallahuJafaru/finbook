@@ -26,6 +26,8 @@ export const tenants = pgTable('tenants', {
   legalName: text('legal_name').notNull(),
   functionalCurrency: currency('functional_currency').notNull().default('NGN'),
   status: text('status').notNull().default('active'),
+  /** The first day these books cover (spec → onboarding). Nothing posts before it, or after today; set by the owner at onboarding (0016). */
+  goLiveOn: date('go_live_on'),
   createdAt: createdAt(),
 }, (t) => [check('tenants_status', sql`${t.status} in ('active', 'suspended', 'closed')`)]);
 
@@ -106,6 +108,11 @@ export const journalLines = pgTable('journal_lines', {
 }, (t) => [
   foreignKey({ name: 'journal_lines_entry', columns: [t.tenantId, t.entryId], foreignColumns: [journalEntries.tenantId, journalEntries.id] }),
   foreignKey({ name: 'journal_lines_account', columns: [t.tenantId, t.accountId], foreignColumns: [accounts.tenantId, accounts.id] }),
+  // Evidence is one of this tenant's documents (0016; a trigger also requires it stored, i.e. checked, never a pending upload).
+  foreignKey({ name: 'journal_lines_evidence', columns: [t.tenantId, t.evidenceDocumentId], foreignColumns: [documents.tenantId, documents.id] }),
+  // A line's car and counterparty are this tenant's own (0016, security review): the definer checks read past RLS.
+  foreignKey({ name: 'journal_lines_vehicle', columns: [t.tenantId, t.vehicleId], foreignColumns: [vehicles.tenantId, vehicles.id] }),
+  foreignKey({ name: 'journal_lines_counterparty', columns: [t.tenantId, t.counterpartyId], foreignColumns: [counterparties.tenantId, counterparties.id] }),
   index('journal_lines_tenant_account').on(t.tenantId, t.accountId),
   index('journal_lines_entry').on(t.entryId),
   // The per-car checks (0006, 0008) scan a car's lines under the tenant lock; partial, since most lines name no car.
@@ -439,7 +446,7 @@ export const jobOrderFlags = pgTable('job_order_flags', {
   index('job_order_flags_tenant_job').on(t.tenantId, t.jobOrderId),
   foreignKey({ name: 'job_order_flags_job_car', columns: [t.tenantId, t.jobOrderId, t.vehicleId], foreignColumns: [jobOrderVehicles.tenantId, jobOrderVehicles.jobOrderId, jobOrderVehicles.vehicleId] }),
   foreignKey({ name: 'job_order_flags_entry', columns: [t.tenantId, t.entryId], foreignColumns: [journalEntries.tenantId, journalEntries.id] }),
-  check('job_order_flags_kind', sql`${t.kind} in ('emm_funded', 'converted_to_stock', 'posted_before_quote', 'supplier_cost_not_covered', 'cost_after_completion', 'completion_unverified', 'cost_credited', 'negative_cut')`),
+  check('job_order_flags_kind', sql`${t.kind} in ('emm_funded', 'converted_to_stock', 'posted_before_quote', 'supplier_cost_not_covered', 'cost_after_completion', 'completion_unverified', 'cost_credited', 'negative_cut', 'funds_after_completion')`),
 ]);
 
 /**
@@ -459,3 +466,16 @@ export const jobOrderSignOffs = pgTable('job_order_sign_offs', {
   foreignKey({ name: 'job_order_sign_offs_flag', columns: [t.tenantId, t.flagId], foreignColumns: [jobOrderFlags.tenantId, jobOrderFlags.id] }),
   check('job_order_sign_offs_reason', sql`btrim(${t.reason}) <> ''`),
 ]);
+
+/**
+ * The business event a posting recorded, exactly as it was asked for (0016, ADR 0017): the entry's source_id points here, so
+ * an auditor can follow every entry back to the facts the rule was given. Append-only; who and when come from the database.
+ */
+export const postings = pgTable('postings', {
+  id: id(),
+  tenantId: tenantId(),
+  type: text('type').notNull(),
+  facts: jsonb('facts').notNull(),
+  createdBy: text('created_by').notNull().default(sql`app_user_id()`),
+  createdAt: createdAt(),
+}, (t) => [unique('postings_tenant_id_id').on(t.tenantId, t.id)]);

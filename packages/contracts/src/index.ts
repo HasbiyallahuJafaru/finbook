@@ -98,7 +98,7 @@ export const Funding = z.enum(['customer_funded', 'emm_funded']);
 export const JobStatus = z.enum(['draft', 'quote_accepted', 'completed', 'abandoned', 'cancelled']);
 export const QuoteRateSource = z.enum(['cbn', 'market', 'manual']);
 /** A question about how we book something the client recorded, raised by the database as the entry commits; a firm sign-off answers it, and never unlocks a posting (ADR 0016). */
-export const FlagKind = z.enum(['emm_funded', 'converted_to_stock', 'posted_before_quote', 'supplier_cost_not_covered', 'cost_after_completion', 'cost_credited', 'negative_cut']);
+export const FlagKind = z.enum(['emm_funded', 'converted_to_stock', 'posted_before_quote', 'supplier_cost_not_covered', 'cost_after_completion', 'cost_credited', 'negative_cut', 'funds_after_completion']);
 
 export const CreateJobOrder = z.strictObject({
   customerId: z.uuid(),
@@ -140,3 +140,29 @@ export const ListJobOrdersQuery = z.strictObject({ status: JobStatus.optional() 
 export const AddJobVehicle = z.strictObject({ vehicleId: z.uuid(), carPriceMinor: MinorUnits.optional(), landingChargeNgn: MinorUnits });
 export const AcceptQuote = z.strictObject({ documentId: z.uuid() });
 export const SignOffFlag = z.strictObject({ flagId: z.uuid(), reason: z.string().trim().min(1).max(500) });
+
+/**
+ * One business event to post (ADR 0017; owner 2026-11-17: one route, a typed body). The request carries the facts only: the
+ * customer, funding, history and amounts already held come from the database, the rule in packages/ledger builds the lines,
+ * and the entry type comes from the rule. More types join this union batch by batch.
+ */
+const postingFacts = { entryDate: isoDate, memo: z.string().trim().min(1).max(500).optional(), evidenceDocumentId: z.uuid().optional() };
+export const CreatePosting = z.discriminatedUnion('type', [
+  /** The job's customer pays towards a car: held in 2150 until the job completes. */
+  z.strictObject({ type: z.literal('customer_receipt'), vehicleId: z.uuid(), amountNgn: MinorUnits, ...postingFacts }),
+  /** Customer funds paid back from what is held for the car (an overpayment, or an abandoned job: never forfeited). */
+  z.strictObject({ type: z.literal('customer_refund'), vehicleId: z.uuid(), amountNgn: MinorUnits, ...postingFacts }),
+  /** The customer pays what they owe (1100) after the car's completion or sale. */
+  z.strictObject({ type: z.literal('receivable_receipt'), vehicleId: z.uuid(), amountNgn: MinorUnits, ...postingFacts }),
+]);
+export type CreatePosting = z.infer<typeof CreatePosting>;
+export const Posting = z.object({
+  entryId: z.uuid(), type: z.string(), entryDate: isoDate, memo: z.string(),
+  lines: z.array(z.object({
+    account: z.string(), debitNgn: MinorUnits, creditNgn: MinorUnits, currency: z.string(), amountMinor: MinorUnits,
+    vehicleId: z.uuid().nullable(), counterpartyId: z.uuid().nullable(),
+  })),
+  /** Flags the database raised as this entry committed, for a firm reviewer (ADR 0016). */
+  flags: z.array(z.object({ id: z.uuid(), kind: FlagKind, vehicleId: z.uuid() })),
+});
+export type Posting = z.infer<typeof Posting>;

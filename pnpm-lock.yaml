@@ -193,6 +193,9 @@ importers:
       '@app/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@app/ledger':
+        specifier: workspace:*
+        version: link:../../packages/ledger
       '@app/money':
         specifier: workspace:*
         version: link:../../packages/money

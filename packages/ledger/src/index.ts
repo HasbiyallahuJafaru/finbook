@@ -16,7 +16,10 @@ export type EntryType =
   | 'job_completion' | 'stock_deposit' | 'stock_deposit_refund' | 'yard_arrival' | 'stock_sale' | 'stock_conversion'
   | 'fx_revaluation' | 'manual_journal';
 
-export type RateSource ='bank_receipt' | 'bdc_receipt' | 'agent_invoice' | 'manual' | 'pool_average' | 'payable_average';
+/** A rule refusing the event's own figures (a refund larger than what is held, say): the API answers it as a 422 in these words. */
+export class RuleError extends Error {}
+
+export type RateSource = 'bank_receipt' | 'bdc_receipt' | 'agent_invoice' | 'manual' | 'pool_average' | 'payable_average';
 /** The day's spot (reference) rate, and where it came from: the stored CBN rate, or typed in with a note (ADR 0009, 0010). */
 export type Spot = { rate: bigint; source: 'cbn' | 'manual' };
 export type Line = {
@@ -46,7 +49,7 @@ const costAccount = (f: Funding | undefined) => (f === 'emm_funded' ? '1200' : '
 type Job = { vehicleId: string; counterpartyId: string };
 
 const positive = (n: bigint, what: string) => {
-  if (n <= 0n) throw new Error(`${what} must be positive`);
+  if (n <= 0n) throw new RuleError(`${what} must be positive`);
 };
 const tagged = (t: Tags): Tags => ({
   ...(t.vehicleId && { vehicleId: t.vehicleId }),
@@ -70,7 +73,7 @@ export function customerReceipt(e: Job & { amountNgn: bigint; evidenceDocumentId
 /** Pay a customer back from their funds held (they overpaid, or walked away: owner 2026-11-15, never forfeited). Dr 2150 / Cr cash. */
 export function customerRefund(e: Job & { amountNgn: bigint; history: readonly Line[]; evidenceDocumentId?: string }): Line[] {
   positive(e.amountNgn, 'refund');
-  if (e.amountNgn > -carBalance(e.history, e.vehicleId, '2150')) throw new Error('refund exceeds the customer funds held for this job');
+  if (e.amountNgn > -carBalance(e.history, e.vehicleId, '2150')) throw new RuleError('refund exceeds the customer funds held for this job');
   return [...ngn('2150', e.amountNgn, e), ...ngn('1000', -e.amountNgn, { evidenceDocumentId: e.evidenceDocumentId })];
 }
 
@@ -78,7 +81,7 @@ export function customerRefund(e: Job & { amountNgn: bigint; history: readonly L
 export function receivableReceipt(e: Job & { amountNgn: bigint; history: readonly Line[]; evidenceDocumentId?: string }): Line[] {
   positive(e.amountNgn, 'receipt');
   const owed = carBalance(e.history.filter((l) => l.counterpartyId === e.counterpartyId), e.vehicleId, '1100');
-  if (e.amountNgn > owed) throw new Error('receipt exceeds what this customer owes for this car');
+  if (e.amountNgn > owed) throw new RuleError('receipt exceeds what this customer owes for this car');
   return [...ngn('1000', e.amountNgn, { evidenceDocumentId: e.evidenceDocumentId }), ...ngn('1100', -e.amountNgn, e)];
 }
 
@@ -89,7 +92,7 @@ export function receivableReceipt(e: Job & { amountNgn: bigint; history: readonl
  */
 export function supplierCredit(e: { vehicleId: string; amountNgn: bigint; history: readonly Line[]; supplierId?: string; evidenceDocumentId?: string }): Line[] {
   positive(e.amountNgn, 'credit');
-  if (e.amountNgn > carBalance(e.history, e.vehicleId, '1150')) throw new Error('credit exceeds the job costs recorded for this car');
+  if (e.amountNgn > carBalance(e.history, e.vehicleId, '1150')) throw new RuleError('credit exceeds the job costs recorded for this car');
   const against = e.supplierId
     ? ngn('2000', e.amountNgn, { vehicleId: e.vehicleId, counterpartyId: e.supplierId, evidenceDocumentId: e.evidenceDocumentId })
     : ngn('1000', e.amountNgn, { evidenceDocumentId: e.evidenceDocumentId });
@@ -122,7 +125,7 @@ export function payFromPool(e: { pool: Pool; currency: string; amountMinor: bigi
 /** The spot fields of a line. A manual spot rate needs a note saying why it differs from the CBN rate. */
 function spotOf(spot: Spot, rateNote: string | undefined): Pick<Line, 'spotRate' | 'spotSource' | 'rateNote'> {
   positive(spot.rate, 'spot rate');
-  if (spot.source === 'manual' && !rateNote?.trim()) throw new Error('a manual spot rate needs a note');
+  if (spot.source === 'manual' && !rateNote?.trim()) throw new RuleError('a manual spot rate needs a note');
   return { spotRate: formatRate(spot.rate), spotSource: spot.source, ...(rateNote && { rateNote }) };
 }
 
@@ -132,7 +135,7 @@ function poolOut(e: { pool: Pool; currency: string; amountMinor: bigint; spot: S
   const { costNgn, pool } = poolSpend(e.pool, e.amountMinor);
   // ponytail: a pool left holding currency with no NGN cost (rounding at extreme rates) refuses payments. 1010 takes no NGN
   // lines (migration 0006) and revaluation only moves 1019, so clearing it needs its own entry type; add one if it ever happens.
-  if (costNgn === 0n) throw new Error('pool payment rounds to zero kobo');
+  if (costNgn === 0n) throw new RuleError('pool payment rounds to zero kobo');
   return {
     pool,
     line: {
@@ -172,7 +175,7 @@ export function supplierInvoice(e: SupplierBill & { currency: string; amountMino
 export function payPayableFromPool(e: SupplierBill & {
   pool: Pool; payable: Pool; currency: string; amountMinor: bigint; spot: Spot; rateNote?: string; evidenceDocumentId?: string;
 }): { lines: Line[]; pool: Pool; payable: Pool } {
-  if (e.amountMinor > e.payable.balanceMinor) throw new Error('payment exceeds what is owed to this supplier for this car');
+  if (e.amountMinor > e.payable.balanceMinor) throw new RuleError('payment exceeds what is owed to this supplier for this car');
   const settled = poolSpend(e.payable, e.amountMinor);
   const out = poolOut(e, { counterpartyId: e.supplierId, evidenceDocumentId: e.evidenceDocumentId });
   const tags = tagged({ vehicleId: e.vehicleId, counterpartyId: e.supplierId, evidenceDocumentId: e.evidenceDocumentId });
@@ -215,8 +218,8 @@ export const spotCarCost = (history: readonly Line[], vehicleId: string): bigint
 /** An NGN cost for one or more cars (a container charge, or one car's IDEC bill), split equally in kobo, remainder on the first car. */
 export function sharedCost(e: { amountNgn: bigint; vehicleIds: readonly string[]; evidenceDocumentId?: string; funding?: Funding }): Line[] {
   positive(e.amountNgn, 'cost');
-  if (e.vehicleIds.length === 0) throw new Error('a cost needs at least one car');
-  if (new Set(e.vehicleIds).size !== e.vehicleIds.length) throw new Error('a car can appear only once in a cost split');
+  if (e.vehicleIds.length === 0) throw new RuleError('a cost needs at least one car');
+  if (new Set(e.vehicleIds).size !== e.vehicleIds.length) throw new RuleError('a car can appear only once in a cost split');
   const shares = allocateEqual(e.amountNgn, e.vehicleIds.length);
   // ponytail: one funding for every car in the split; split a container holding both kinds of car into two costs.
   return [...shares.flatMap((share, i) => ngn(costAccount(e.funding), share, { vehicleId: e.vehicleIds[i] })), ...ngn('1000', -e.amountNgn, { evidenceDocumentId: e.evidenceDocumentId })];
@@ -226,7 +229,7 @@ export function sharedCost(e: { amountNgn: bigint; vehicleIds: readonly string[]
 export function jobPosition(history: readonly Line[], vehicleId: string) {
   const mine = history.filter((l) => l.vehicleId === vehicleId);
   const car = carCost(history, vehicleId);
-  if (car.currencies.size > 1) throw new Error('a car must be paid for in one currency');
+  if (car.currencies.size > 1) throw new RuleError('a car must be paid for in one currency');
   const net = (account: string) => mine.filter((l) => l.account === account).reduce((s, l) => s + l.debit - l.credit, 0n);
   return {
     carCurrency: [...car.currencies][0],
@@ -239,7 +242,7 @@ export function jobPosition(history: readonly Line[], vehicleId: string) {
 
 /** Settle an invoice from the customer's funds held, with any balance owed going to receivables. Both lines name the job. */
 function settle(invoiceNgn: bigint, fundsHeldNgn: bigint, job: Job): Line[] {
-  if (fundsHeldNgn < 0n) throw new Error('customer funds held for this job are negative');
+  if (fundsHeldNgn < 0n) throw new RuleError('customer funds held for this job are negative');
   const fromFunds = fundsHeldNgn < invoiceNgn ? fundsHeldNgn : invoiceNgn;
   return [...ngn('2150', fromFunds, job), ...ngn('1100', invoiceNgn - fromFunds, job)];
 }
@@ -255,11 +258,11 @@ export function completeAgentJob(e: Job & {
   history: readonly Line[];
 }): { lines: Line[]; invoiceNgn: bigint } {
   positive(e.quote.sellingMinor, 'selling price');
-  if (e.quote.landingChargeNgn < 0n) throw new Error('landing charge cannot be negative');
+  if (e.quote.landingChargeNgn < 0n) throw new RuleError('landing charge cannot be negative');
   notStock(e.history, e.vehicleId);
   const p = jobPosition(e.history, e.vehicleId);
-  if (p.carMinor === 0n) throw new Error('no supplier payment recorded for this car');
-  if (p.carCurrency !== e.quote.currency) throw new Error(`quote is in ${e.quote.currency} but the car was paid in ${String(p.carCurrency)}`);
+  if (p.carMinor === 0n) throw new RuleError('no supplier payment recorded for this car');
+  if (p.carCurrency !== e.quote.currency) throw new RuleError(`quote is in ${e.quote.currency} but the car was paid in ${String(p.carCurrency)}`);
   const landedNgn = p.costNgn - p.carNgn;
   const sellingNgn = convert(e.quote.sellingMinor, e.quote.rate);
   const carAtQuoteNgn = convert(p.carMinor, e.quote.rate);
@@ -301,7 +304,7 @@ const touched = (history: readonly Line[], vehicleId: string, accounts: readonly
   accounts.some((a) => carBalance(history, vehicleId, a) !== 0n);
 /** A car in inventory, or sold from it, is EMM stock (EMM-funded or converted): it is sold, never completed as a job (migration 0008). */
 function notStock(history: readonly Line[], vehicleId: string) {
-  if (touched(history, vehicleId, ['1200', '1210', '4000', '5000'])) throw new Error('this car is EMM stock: sell it (sellStockCar), it is not completed as a job');
+  if (touched(history, vehicleId, ['1200', '1210', '4000', '5000'])) throw new RuleError('this car is EMM stock: sell it (sellStockCar), it is not completed as a job');
 }
 
 /** A buyer's deposit towards an EMM-funded stock car (principal): theirs until the sale, held in 2100 customer deposits. */
@@ -314,7 +317,7 @@ export function stockDeposit(e: Job & { amountNgn: bigint; evidenceDocumentId?: 
 export function refundStockDeposit(e: Job & { amountNgn: bigint; history: readonly Line[]; evidenceDocumentId?: string }): Line[] {
   positive(e.amountNgn, 'refund');
   const paid = -carBalance(e.history.filter((l) => l.counterpartyId === e.counterpartyId), e.vehicleId, '2100');
-  if (e.amountNgn > paid) throw new Error('refund exceeds what this buyer paid towards this car');
+  if (e.amountNgn > paid) throw new RuleError('refund exceeds what this buyer paid towards this car');
   return [...ngn('2100', e.amountNgn, e), ...ngn('1000', -e.amountNgn, { evidenceDocumentId: e.evidenceDocumentId })];
 }
 
@@ -334,12 +337,12 @@ export function arriveInYard(e: { vehicleId: string; history: readonly Line[] })
  */
 export function sellStockCar(e: Job & { priceNgn: bigint; history: readonly Line[] }): Line[] {
   positive(e.priceNgn, 'price');
-  if (carBalance(e.history, e.vehicleId, '1200') !== 0n) throw new Error('the car is still in transit: record its arrival in the yard first');
+  if (carBalance(e.history, e.vehicleId, '1200') !== 0n) throw new RuleError('the car is still in transit: record its arrival in the yard first');
   const cost = carBalance(e.history, e.vehicleId, '1210');
   positive(cost, 'cost in the yard');
   // Only this buyer's deposits on this car: another buyer's deposit stays theirs (refundStockDeposit).
   const deposits = -carBalance(e.history.filter((l) => l.counterpartyId === e.counterpartyId), e.vehicleId, '2100');
-  if (deposits > e.priceNgn) throw new Error('deposits exceed the price: refund the difference first (refundStockDeposit)');
+  if (deposits > e.priceNgn) throw new RuleError('deposits exceed the price: refund the difference first (refundStockDeposit)');
   const car = { vehicleId: e.vehicleId };
   return [
     ...ngn('2100', deposits, e), ...ngn('1100', e.priceNgn - deposits, e), ...ngn('4000', -e.priceNgn, car),
@@ -355,12 +358,12 @@ export function sellStockCar(e: Job & { priceNgn: bigint; history: readonly Line
 export function convertToStock(e: Job & { history: readonly Line[]; evidenceDocumentId?: string }): Line[] {
   // ponytail: a completion at a zero cut posts no 4100/4200 line, and a flat line history can't show which 1150 credit was a
   // completion; the database refuses that case (migration 0008 reads entries). Pass job status here once job_orders exists.
-  if (touched(e.history, e.vehicleId, ['4100', '4200'])) throw new Error('this job is already completed: it cannot be converted to stock');
+  if (touched(e.history, e.vehicleId, ['4100', '4200'])) throw new RuleError('this job is already completed: it cannot be converted to stock');
   notStock(e.history, e.vehicleId);
   const p = jobPosition(e.history, e.vehicleId);
   positive(p.costNgn, 'job cost');
-  if (p.carMinor === 0n) throw new Error('only a car EMM paid the supplier for can become stock: a clearing-only job is the customer\'s own car');
-  if (p.fundsHeldNgn < 0n) throw new Error('customer funds held for this job are negative');
+  if (p.carMinor === 0n) throw new RuleError('only a car EMM paid the supplier for can become stock: a clearing-only job is the customer\'s own car');
+  if (p.fundsHeldNgn < 0n) throw new RuleError('customer funds held for this job are negative');
   const car = { vehicleId: e.vehicleId };
   return [
     ...ngn('1200', p.costNgn, car), ...ngn('1150', -p.costNgn, car),
@@ -389,11 +392,11 @@ export type RevaluationItem = {
 export function revalue(items: readonly RevaluationItem[]): { lines: Line[]; reversal: Line[]; rows: (RevaluationItem & { closingNgn: bigint })[] } {
   const seen = new Set<string>();
   const rows = items.map((i) => {
-    if (i.currency === 'NGN') throw new Error('NGN is not revalued');
-    if (i.balanceMinor < 0n) throw new Error(`the ${i.currency} ${i.item} balance cannot be negative`);
+    if (i.currency === 'NGN') throw new RuleError('NGN is not revalued');
+    if (i.balanceMinor < 0n) throw new RuleError(`the ${i.currency} ${i.item} balance cannot be negative`);
     positive(i.closingRate, 'closing rate');
     const key = `${i.currency} ${i.item}`;
-    if (seen.has(key)) throw new Error(`the ${key} is listed twice`);
+    if (seen.has(key)) throw new RuleError(`the ${key} is listed twice`);
     seen.add(key);
     return { ...i, closingNgn: convert(i.balanceMinor, i.closingRate) };
   });

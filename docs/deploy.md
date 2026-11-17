@@ -66,6 +66,20 @@ railway service status -s api -e staging
 pnpm --filter @app/web exec vinext-cloudflare deploy      # after `pnpm --filter @app/web exec cf login`
 ```
 
+## Adding a client (until the phase-3 onboarding endpoint)
+
+The owner, on the database's owner connection, in one transaction:
+
+```sql
+BEGIN;
+SELECT set_config('app.user_id', '<your Clerk user id>', true);           -- every audit row names who did it
+INSERT INTO tenants (legal_name, clerk_org_id, go_live_on) VALUES ('<legal name>', '<Clerk org id>', '<first day of the books>') RETURNING id;
+SELECT seed_default_chart('<that id>');                                    -- the default chart of accounts (migration 0016)
+COMMIT;
+```
+
+Periods need no setup: the first posting dated in a month opens that month. Entries are taken from the go-live date to today (Lagos time); a client with no go-live date takes none. Locking a month waits for the phase-4 close.
+
 ## Open items (need the owner, in a browser)
 
 1. **Cloudflare login:** run `pnpm --filter @app/web exec cf login` in a terminal (it opens a browser). Then Claude deploys `finbook-web-staging`.

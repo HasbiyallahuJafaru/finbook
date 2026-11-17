@@ -21,6 +21,8 @@ export const PERMISSIONS = {
   'documents.read': READERS,
   'job_orders.read': READERS,
   'job_orders.write': RECORDERS,
+  // Recording a business event in the ledger (ADR 0017): the same people who record the business.
+  'postings.write': RECORDERS,
   // A firm reviewer or admin signs off a flag the database raised on a client's job (owner 2026-11-17). It clears that flag and
   // never unlocks a posting. The database checks the role too, and refuses anyone who touched what the flag is about (0014).
   'job_orders.sign_off': ['firm_reviewer', 'firm_admin'],
