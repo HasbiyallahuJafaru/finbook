@@ -27,7 +27,7 @@ import assert from 'node:assert/strict';
 import { convert, parseRate, type Pool } from '@app/money';
 import {
   arriveInYard, buyCurrency, completeAgentJob, completeClearingJob, convertToStock, customerReceipt, jobPosition, payFromPool, payPayableFromPool, revalue, sellStockCar,
-  refundStockDeposit, sharedCost, spotCarCost, stockDeposit, supplierInvoice, type Line,
+  customerRefund, receivableReceipt, refundStockDeposit, sharedCost, supplierCredit, spotCarCost, stockDeposit, supplierInvoice, type Line,
 } from './index.ts';
 
 const FIXTURE_RATE_BUY_1 = parseRate('100.000000');
@@ -242,8 +242,13 @@ test('a reversed invoice or payment drops out of the car cost exactly', () => {
   assert.equal(jobPosition([...invoiceD, ...settled, ...mirror(settled)], 'D').carNgn, 210_000_000n);
   // A pool payment that was reversed leaves no cost behind.
   const paid = payFromPool({ pool: { balanceMinor: 15_000_000n, costNgn: 1_600_000_000n }, currency: 'CNY', amountMinor: 2_000_000n, vehicleId: 'E', spot: SPOT_CBN }).lines;
-  assert.deepEqual(jobPosition([...paid, ...mirror(paid)], 'E'), { carCurrency: 'CNY', carMinor: 0n, carNgn: 0n, costNgn: 0n, fundsHeldNgn: 0n });
+  assert.deepEqual(jobPosition([...paid, ...mirror(paid)], 'E'), { carCurrency: undefined, carMinor: 0n, carNgn: 0n, costNgn: 0n, fundsHeldNgn: 0n });
   assert.equal(spotCarCost([...paid, ...mirror(paid)], 'E'), 0n);
+  // A payment in the wrong currency, reversed, then the right one: the car is paid in CNY and completes (ledger audit of 0015).
+  const usd = payFromPool({ pool: { balanceMinor: 100_000n, costNgn: 150_000_000n }, currency: 'USD', amountMinor: 100_000n, vehicleId: 'E', spot: SPOT_CBN }).lines;
+  const history2 = [...usd, ...mirror(usd), ...paid];
+  assert.equal(jobPosition(history2, 'E').carCurrency, 'CNY');
+  assert.ok(completeAgentJob({ ...job('E'), quote: { ...quoteA, landingChargeNgn: 0n }, history: history2 }).lines.length > 0);
 });
 
 // Spot basis (ADR 0009: what clients see). Car A: CNY 40,000.00 paid from the pool on a day the CBN spot rate was 108 ->
@@ -392,4 +397,27 @@ test('a car is a job or stock, never both; deposits belong to their buyer and ca
 test('a clearing-only job is the customer\'s own car: it cannot become stock', () => {
   const clearing = [...customerReceipt({ ...job('K'), amountNgn: 200_000_000n }), ...sharedCost({ amountNgn: 150_000_000n, vehicleIds: ['K'] })];
   assert.throws(() => convertToStock({ ...job('K'), history: clearing }), /clearing-only job is the customer's own car/);
+});
+
+test('customer refund, receivable receipt and supplier credit: each within what the ledger says, naming the job', () => {
+  const held = customerReceipt({ ...job('R'), amountNgn: 500_000n });
+  assert.deepEqual(only(customerRefund({ ...job('R'), amountNgn: 500_000n, history: held })), [['2150', 500_000n, 0n, 'R'], ['1000', 0n, 500_000n, null]]);
+  assert.throws(() => customerRefund({ ...job('R'), amountNgn: 500_001n, history: held }), /refund exceeds the customer funds held/);
+  assert.throws(() => customerRefund({ ...job('R'), amountNgn: 0n, history: held }), /refund must be positive/);
+  // Job A completed with NGN 450,000.00 still owed (the worked example's figures, on a fresh pool).
+  const jobA = [...customerReceipt({ ...job('A'), amountNgn: 600_000_000n }), ...payFromPool({ pool: { balanceMinor: 15_000_000n, costNgn: 1_600_000_000n }, currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines,
+    ...sharedCost({ amountNgn: 131_666_667n, vehicleIds: ['A'] })];
+  const owed = [...jobA, ...completeAgentJob({ ...job('A'), quote: quoteA, history: jobA }).lines];
+  assert.deepEqual(only(receivableReceipt({ ...job('A'), amountNgn: 45_000_000n, history: owed })), [['1000', 45_000_000n, 0n, null], ['1100', 0n, 45_000_000n, 'A']]);
+  assert.throws(() => receivableReceipt({ ...job('A'), amountNgn: 45_000_001n, history: owed }), /exceeds what this customer owes/);
+  assert.throws(() => receivableReceipt({ vehicleId: 'A', counterpartyId: 'someone-else', amountNgn: 1n, history: owed }), /exceeds what this customer owes/);
+  assert.throws(() => receivableReceipt({ ...job('A'), amountNgn: 0n, history: owed }), /receipt must be positive/);
+  // A supplier's credit on car K's NGN costs: off what is owed to them for K, or as cash back; never more than K's job costs.
+  const costs = sharedCost({ amountNgn: 150_000n, vehicleIds: ['K'] });
+  const credit = supplierCredit({ vehicleId: 'K', amountNgn: 50_000n, history: costs, supplierId: 'supplier-1' });
+  assert.deepEqual(only(credit), [['2000', 50_000n, 0n, 'K'], ['1150', 0n, 50_000n, 'K']]);
+  assert.equal(credit[0]?.counterpartyId, 'supplier-1');
+  assert.deepEqual(only(supplierCredit({ vehicleId: 'K', amountNgn: 150_000n, history: costs })), [['1000', 150_000n, 0n, null], ['1150', 0n, 150_000n, 'K']]);
+  assert.throws(() => supplierCredit({ vehicleId: 'K', amountNgn: 150_001n, history: costs }), /credit exceeds the job costs/);
+  assert.throws(() => supplierCredit({ vehicleId: 'K', amountNgn: 0n, history: costs }), /credit must be positive/);
 });

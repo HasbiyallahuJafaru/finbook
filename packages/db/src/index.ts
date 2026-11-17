@@ -36,6 +36,9 @@ export async function withTenant<T>(pool: pg.Pool, actor: Actor, fn: (tx: Tx) =>
   try {
     await client.query('BEGIN');
     await client.query(role === 'finbook_sync' ? 'SET LOCAL ROLE finbook_sync' : 'SET LOCAL ROLE finbook_app');
+    // No transaction waits long for a lock (the tenant's posting lock included) or sits idle holding one: a stuck request
+    // fails fast instead of freezing the tenant's postings (security review of 0015). Writes are idempotent, so a retry is safe.
+    await client.query("SET LOCAL lock_timeout = '5s'; SET LOCAL idle_in_transaction_session_timeout = '30s'");
     await client.query("SELECT set_config('app.tenant_id', $1, true), set_config('app.user_id', $2, true)", [actor.tenantId, actor.userId]);
     const db = drizzle(client, { schema });
     // drizzle's db.transaction() would send a real COMMIT and end this transaction early.

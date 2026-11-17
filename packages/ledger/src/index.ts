@@ -5,7 +5,18 @@
 // currency; add bank-account and per-currency pool accounts when the API needs them.
 import { allocateEqual, convert, formatRate, parseRate, poolSpend, rateOf, type Pool } from '@app/money';
 
-export type RateSource = 'bank_receipt' | 'bdc_receipt' | 'agent_invoice' | 'manual' | 'pool_average' | 'payable_average';
+/**
+ * The entry type (journal_entries.source_type) each rule's lines post as. The database holds one shape per type and refuses
+ * an entry that doesn't fit it (migration 0015, entry_shapes); a reversal keeps the type it reverses. manual_journal names no
+ * car and keeps off the accounts these rules own.
+ */
+export type EntryType =
+  | 'customer_receipt' | 'customer_refund' | 'receivable_receipt'
+  | 'currency_purchase' | 'pool_payment' | 'supplier_invoice' | 'supplier_settlement' | 'car_cost' | 'supplier_credit'
+  | 'job_completion' | 'stock_deposit' | 'stock_deposit_refund' | 'yard_arrival' | 'stock_sale' | 'stock_conversion'
+  | 'fx_revaluation' | 'manual_journal';
+
+export type RateSource ='bank_receipt' | 'bdc_receipt' | 'agent_invoice' | 'manual' | 'pool_average' | 'payable_average';
 /** The day's spot (reference) rate, and where it came from: the stored CBN rate, or typed in with a note (ADR 0009, 0010). */
 export type Spot = { rate: bigint; source: 'cbn' | 'manual' };
 export type Line = {
@@ -54,6 +65,35 @@ function ngn(account: string, signed: bigint, tags: Tags = {}): Line[] {
 export function customerReceipt(e: Job & { amountNgn: bigint; evidenceDocumentId?: string }): Line[] {
   positive(e.amountNgn, 'receipt');
   return [...ngn('1000', e.amountNgn, { evidenceDocumentId: e.evidenceDocumentId }), ...ngn('2150', -e.amountNgn, e)];
+}
+
+/** Pay a customer back from their funds held (they overpaid, or walked away: owner 2026-11-15, never forfeited). Dr 2150 / Cr cash. */
+export function customerRefund(e: Job & { amountNgn: bigint; history: readonly Line[]; evidenceDocumentId?: string }): Line[] {
+  positive(e.amountNgn, 'refund');
+  if (e.amountNgn > -carBalance(e.history, e.vehicleId, '2150')) throw new Error('refund exceeds the customer funds held for this job');
+  return [...ngn('2150', e.amountNgn, e), ...ngn('1000', -e.amountNgn, { evidenceDocumentId: e.evidenceDocumentId })];
+}
+
+/** The customer pays what they owe after a completion or stock sale (1100). Dr cash / Cr 1100, never more than is owed. */
+export function receivableReceipt(e: Job & { amountNgn: bigint; history: readonly Line[]; evidenceDocumentId?: string }): Line[] {
+  positive(e.amountNgn, 'receipt');
+  const owed = carBalance(e.history.filter((l) => l.counterpartyId === e.counterpartyId), e.vehicleId, '1100');
+  if (e.amountNgn > owed) throw new Error('receipt exceeds what this customer owes for this car');
+  return [...ngn('1000', e.amountNgn, { evidenceDocumentId: e.evidenceDocumentId }), ...ngn('1100', -e.amountNgn, e)];
+}
+
+/**
+ * A supplier's NGN credit note or refund on a customer job (flagged cost_credited for a reviewer, 0014): the car's job costs
+ * come down, off what is owed to that supplier for that car (Dr 2000, naming both), or as cash back (Dr 1000).
+ * ponytail: NGN, customer-funded and before completion only; a foreign or EMM-funded credit, or one after completion, needs its own rule (ADR 0016).
+ */
+export function supplierCredit(e: { vehicleId: string; amountNgn: bigint; history: readonly Line[]; supplierId?: string; evidenceDocumentId?: string }): Line[] {
+  positive(e.amountNgn, 'credit');
+  if (e.amountNgn > carBalance(e.history, e.vehicleId, '1150')) throw new Error('credit exceeds the job costs recorded for this car');
+  const against = e.supplierId
+    ? ngn('2000', e.amountNgn, { vehicleId: e.vehicleId, counterpartyId: e.supplierId, evidenceDocumentId: e.evidenceDocumentId })
+    : ngn('1000', e.amountNgn, { evidenceDocumentId: e.evidenceDocumentId });
+  return [...against, ...ngn('1150', -e.amountNgn, { vehicleId: e.vehicleId })];
 }
 
 /** Buy foreign currency at the rate on the receipt: it joins the weighted-average pool (1010). */
@@ -156,8 +196,10 @@ function carCost(history: readonly Line[], vehicleId: string) {
   const isCost = (l: Line) => (l.account === '1010' && l.rateSource !== 'payable_average') || (l.account === '2000' && l.rateSource === 'agent_invoice');
   const lines = history.filter((l) => l.vehicleId === vehicleId && l.currency !== 'NGN' && isCost(l));
   const sign = (l: Line) => (l.credit > 0n ? 1n : -1n);
+  const net = (c: string) => lines.filter((l) => l.currency === c).reduce((s, l) => s + sign(l) * l.amountMinor, 0n);
   return {
-    currencies: new Set(lines.map((l) => l.currency)),
+    // a currency whose payments were all reversed nets to nothing and doesn't count (as the database, migration 0015)
+    currencies: new Set(lines.map((l) => l.currency).filter((c) => net(c) !== 0n)),
     minor: lines.reduce((s, l) => s + sign(l) * l.amountMinor, 0n),
     ngn: lines.reduce((s, l) => s + l.credit - l.debit, 0n),
     spotNgn: lines.reduce((s, l) => s + sign(l) * (l.spotRate ? convert(l.amountMinor, parseRate(l.spotRate)) : l.credit + l.debit), 0n),

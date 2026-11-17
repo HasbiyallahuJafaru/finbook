@@ -98,7 +98,7 @@ export const Funding = z.enum(['customer_funded', 'emm_funded']);
 export const JobStatus = z.enum(['draft', 'quote_accepted', 'completed', 'abandoned', 'cancelled']);
 export const QuoteRateSource = z.enum(['cbn', 'market', 'manual']);
 /** A question about how we book something the client recorded, raised by the database as the entry commits; a firm sign-off answers it, and never unlocks a posting (ADR 0016). */
-export const FlagKind = z.enum(['emm_funded', 'converted_to_stock', 'posted_before_quote', 'supplier_cost_not_covered', 'cost_after_completion']);
+export const FlagKind = z.enum(['emm_funded', 'converted_to_stock', 'posted_before_quote', 'supplier_cost_not_covered', 'cost_after_completion', 'cost_credited', 'negative_cut']);
 
 export const CreateJobOrder = z.strictObject({
   customerId: z.uuid(),
@@ -123,8 +123,8 @@ export const JobOrder = z.object({
   carPrice: z.object({ amountMinor: MinorUnits, currency: z.string() }).nullable(),
   quoteRate: z.object({ rate: z.string(), source: QuoteRateSource, note: z.string().nullable() }).nullable(),
   landingChargeNgn: MinorUnits, acceptedQuoteDocumentId: z.uuid().nullable(),
-  /** Each car with its own quoted price (car purchases; null on clearing-only), in the job's car currency. */
-  vehicles: z.array(z.object({ vehicleId: z.uuid(), carPriceMinor: MinorUnits.nullable() })),
+  /** Each car with its own quoted price (car purchases; null on clearing-only), in the job's car currency, and its own landing charge in kobo. */
+  vehicles: z.array(z.object({ vehicleId: z.uuid(), carPriceMinor: MinorUnits.nullable(), landingChargeNgn: MinorUnits })),
   /** Flags the database raised as entries committed, each with its firm sign-off once given (ADR 0016). */
   flags: z.array(z.object({
     id: z.uuid(), kind: FlagKind, vehicleId: z.uuid(), entryId: z.uuid(), raisedAt: z.string(),
@@ -133,7 +133,10 @@ export const JobOrder = z.object({
 });
 export type JobOrder = z.infer<typeof JobOrder>;
 export const ListJobOrdersQuery = z.strictObject({ status: JobStatus.optional() });
-/** A car on a car purchase needs its own quoted price; a clearing-only car has none (the database checks both). */
-export const AddJobVehicle = z.strictObject({ vehicleId: z.uuid(), carPriceMinor: MinorUnits.optional() });
+/**
+ * A car on a car purchase needs its own quoted price; a clearing-only car has none. Every car has its own landing charge; the
+ * cars' charges add up to the job's when the quote is accepted (owner 2026-11-17; the database checks all three).
+ */
+export const AddJobVehicle = z.strictObject({ vehicleId: z.uuid(), carPriceMinor: MinorUnits.optional(), landingChargeNgn: MinorUnits });
 export const AcceptQuote = z.strictObject({ documentId: z.uuid() });
 export const SignOffFlag = z.strictObject({ flagId: z.uuid(), reason: z.string().trim().min(1).max(500) });

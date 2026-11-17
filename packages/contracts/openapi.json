@@ -1425,11 +1425,16 @@
                               "nullable": true,
                               "type": "string",
                               "pattern": "^(0|[1-9]\\d{0,17})$"
+                            },
+                            "landingChargeNgn": {
+                              "type": "string",
+                              "pattern": "^(0|[1-9]\\d{0,17})$"
                             }
                           },
                           "required": [
                             "vehicleId",
-                            "carPriceMinor"
+                            "carPriceMinor",
+                            "landingChargeNgn"
                           ],
                           "additionalProperties": false
                         }
@@ -1451,7 +1456,8 @@
                                 "converted_to_stock",
                                 "posted_before_quote",
                                 "supplier_cost_not_covered",
-                                "cost_after_completion"
+                                "cost_after_completion",
+                                "cost_credited"
                               ]
                             },
                             "vehicleId": {
@@ -1790,11 +1796,16 @@
                             "nullable": true,
                             "type": "string",
                             "pattern": "^(0|[1-9]\\d{0,17})$"
+                          },
+                          "landingChargeNgn": {
+                            "type": "string",
+                            "pattern": "^(0|[1-9]\\d{0,17})$"
                           }
                         },
                         "required": [
                           "vehicleId",
-                          "carPriceMinor"
+                          "carPriceMinor",
+                          "landingChargeNgn"
                         ],
                         "additionalProperties": false
                       }
@@ -1816,7 +1827,8 @@
                               "converted_to_stock",
                               "posted_before_quote",
                               "supplier_cost_not_covered",
-                              "cost_after_completion"
+                              "cost_after_completion",
+                              "cost_credited"
                             ]
                           },
                           "vehicleId": {
@@ -2063,11 +2075,16 @@
                             "nullable": true,
                             "type": "string",
                             "pattern": "^(0|[1-9]\\d{0,17})$"
+                          },
+                          "landingChargeNgn": {
+                            "type": "string",
+                            "pattern": "^(0|[1-9]\\d{0,17})$"
                           }
                         },
                         "required": [
                           "vehicleId",
-                          "carPriceMinor"
+                          "carPriceMinor",
+                          "landingChargeNgn"
                         ],
                         "additionalProperties": false
                       }
@@ -2089,7 +2106,8 @@
                               "converted_to_stock",
                               "posted_before_quote",
                               "supplier_cost_not_covered",
-                              "cost_after_completion"
+                              "cost_after_completion",
+                              "cost_credited"
                             ]
                           },
                           "vehicleId": {
@@ -2229,10 +2247,15 @@
                   "carPriceMinor": {
                     "type": "string",
                     "pattern": "^(0|[1-9]\\d{0,17})$"
+                  },
+                  "landingChargeNgn": {
+                    "type": "string",
+                    "pattern": "^(0|[1-9]\\d{0,17})$"
                   }
                 },
                 "required": [
-                  "vehicleId"
+                  "vehicleId",
+                  "landingChargeNgn"
                 ],
                 "additionalProperties": false
               }
@@ -2364,11 +2387,16 @@
                             "nullable": true,
                             "type": "string",
                             "pattern": "^(0|[1-9]\\d{0,17})$"
+                          },
+                          "landingChargeNgn": {
+                            "type": "string",
+                            "pattern": "^(0|[1-9]\\d{0,17})$"
                           }
                         },
                         "required": [
                           "vehicleId",
-                          "carPriceMinor"
+                          "carPriceMinor",
+                          "landingChargeNgn"
                         ],
                         "additionalProperties": false
                       }
@@ -2390,7 +2418,8 @@
                               "converted_to_stock",
                               "posted_before_quote",
                               "supplier_cost_not_covered",
-                              "cost_after_completion"
+                              "cost_after_completion",
+                              "cost_credited"
                             ]
                           },
                           "vehicleId": {
@@ -2670,11 +2699,16 @@
                             "nullable": true,
                             "type": "string",
                             "pattern": "^(0|[1-9]\\d{0,17})$"
+                          },
+                          "landingChargeNgn": {
+                            "type": "string",
+                            "pattern": "^(0|[1-9]\\d{0,17})$"
                           }
                         },
                         "required": [
                           "vehicleId",
-                          "carPriceMinor"
+                          "carPriceMinor",
+                          "landingChargeNgn"
                         ],
                         "additionalProperties": false
                       }
@@ -2696,7 +2730,8 @@
                               "converted_to_stock",
                               "posted_before_quote",
                               "supplier_cost_not_covered",
-                              "cost_after_completion"
+                              "cost_after_completion",
+                              "cost_credited"
                             ]
                           },
                           "vehicleId": {
@@ -2982,11 +3017,16 @@
                             "nullable": true,
                             "type": "string",
                             "pattern": "^(0|[1-9]\\d{0,17})$"
+                          },
+                          "landingChargeNgn": {
+                            "type": "string",
+                            "pattern": "^(0|[1-9]\\d{0,17})$"
                           }
                         },
                         "required": [
                           "vehicleId",
-                          "carPriceMinor"
+                          "carPriceMinor",
+                          "landingChargeNgn"
                         ],
                         "additionalProperties": false
                       }
@@ -3008,7 +3048,8 @@
                               "converted_to_stock",
                               "posted_before_quote",
                               "supplier_cost_not_covered",
-                              "cost_after_completion"
+                              "cost_after_completion",
+                              "cost_credited"
                             ]
                           },
                           "vehicleId": {

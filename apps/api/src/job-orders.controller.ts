@@ -14,7 +14,7 @@ import { idempotentWrite, input, pgErrors } from './write.js';
 const SELECT = `SELECT j.id, j.number, j.customer_id, j.job_type, j.funding, j.funding_reason, j.status, to_char(j.ordered_on, 'YYYY-MM-DD') AS ordered_on,
     j.car_price_minor::text AS car_price_minor, j.car_price_currency, j.quote_rate::text AS quote_rate, j.quote_rate_source, j.quote_rate_note,
     j.landing_charge_ngn::text AS landing_charge_ngn, j.accepted_quote_document_id,
-    coalesce((SELECT json_agg(json_build_object('vehicleId', v.vehicle_id, 'carPriceMinor', v.car_price_minor::text) ORDER BY v.created_at)
+    coalesce((SELECT json_agg(json_build_object('vehicleId', v.vehicle_id, 'carPriceMinor', v.car_price_minor::text, 'landingChargeNgn', v.landing_charge_ngn::text) ORDER BY v.created_at)
       FROM job_order_vehicles v WHERE v.job_order_id = j.id), '[]') AS vehicles,
     coalesce((SELECT json_agg(json_build_object('id', f.id, 'kind', f.kind, 'vehicleId', f.vehicle_id, 'entryId', f.entry_id, 'raisedAt', f.raised_at,
         'signOff', CASE WHEN s.id IS NULL THEN NULL ELSE json_build_object('reason', s.reason, 'signedBy', s.signed_by, 'signedAt', s.signed_at) END) ORDER BY f.id)
@@ -96,10 +96,11 @@ export class JobOrdersController {
   @Throttle(WRITE_LIMIT)
   async addVehicle(@Req() req: { caller: Caller }, @Param('id') id: string, @Headers('idempotency-key') key: string | undefined, @Body() body: unknown, @Res({ passthrough: true }) res: Status): Promise<JobOrder> {
     const jobId = input(z.uuid(), id);
-    const { vehicleId, carPriceMinor } = input(AddJobVehicle, body);
-    const out = await idempotentWrite(this.pool, req.caller, key, { route: 'POST /job-orders/:id/vehicles', body: [jobId, vehicleId, carPriceMinor] }, async (t) => {
+    const { vehicleId, carPriceMinor, landingChargeNgn } = input(AddJobVehicle, body);
+    const out = await idempotentWrite(this.pool, req.caller, key, { route: 'POST /job-orders/:id/vehicles', body: [jobId, vehicleId, carPriceMinor, landingChargeNgn] }, async (t) => {
       await one(t, jobId); // 404 before anything else for another tenant's job
-      await t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, car_price_minor) VALUES ($1, $2, $3, $4)', [req.caller.tenantId, jobId, vehicleId, carPriceMinor ?? null]).catch(JOB_ERRORS);
+      await t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, car_price_minor, landing_charge_ngn) VALUES ($1, $2, $3, $4, $5)',
+        [req.caller.tenantId, jobId, vehicleId, carPriceMinor ?? null, landingChargeNgn]).catch(JOB_ERRORS);
       return { status: 201, body: await one(t, jobId) };
     });
     res.status(out.status);

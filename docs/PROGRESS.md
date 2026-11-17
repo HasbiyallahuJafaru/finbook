@@ -2,28 +2,36 @@
 
 Read this first in every new session. Update it before you stop: current phase, what's built, what's next, open questions. Keep it a snapshot of now, not a diary; history lives in git, decisions in `docs/decisions/`.
 
-_Last updated: 2026-11-17 (session: job orders in the ledger, record-then-flag, sign-offs)_
+_Last updated: 2026-11-17 (session: allowed entry shapes, completion re-performed by the database, landing charge per car)_
 
 **We are the clients' bookkeepers, never part of their business** (CLAUDE.md → Who we are). The books record what the client did; the database refuses only what would make them wrong or untraceable, and flags policy questions for a firm reviewer.
 
 ## Start here (next session)
 
-1. **Where the code is:** `main` and `phase2-revaluation` are both at `f5e6405` (fast-forwarded and pushed 2026-11-17, owner's instruction); ask the owner before pushing or merging again. New since `69860c7`: the ledger side of job orders (migration 0014, ADR 0016).
-   - Every car an entry names must be on a job order, and funding decides the side (1150 vs 1200).
-   - Customer funds held (2150) come in only as a cash receipt from the job's customer, and leave only in a completion, a refund or a conversion.
-   - The cut posts only in a completion that clears 1150 and needs the accepted quote. Revenue always names its car.
-   - Each car on a car purchase has its own quoted price.
-   - The database raises flags (`job_order_flags`) as each entry commits: EMM-funded, converted to stock, posted before the quote, supplier paid beyond the customer's funds, cost after completion. A flag never changes or disappears; a firm reviewer or admin who touched nothing it is about signs it off (`POST /job-orders/:id/sign-offs`). `job_order_exceptions` is the open worklist.
-   - Reviews: four ledger audits (all FAIL) and four security reviews (all PASS WITH NOTES). Every finding is fixed, or recorded in ADR 0016 → Consequences as closed by the next slice (owner, 2026-11-17).
+1. **Where the code is:** `main` is at `f5e6405`. `phase2-revaluation` adds allowed entry shapes (migration 0015, ADR 0017), not yet pushed; ask the owner before pushing or merging.
+   - Every posting rule is a named entry type (`source_type`). `entry_shapes` holds one shape per type, and the database refuses any entry that doesn't fit it. A reversal keeps its type. A manual journal names no car and keeps off the job, pool and inventory accounts.
+   - The database re-performs every completion from the car's own price, its own landing charge (owner, 2026-11-17: per car, summing to the job's) and its ledger. `completion_unverified` is gone. The ledger moves a job to `completed` with its last car.
+   - `packages/ledger` adds `EntryType`, `customerRefund`, `receivableReceipt` and `supplierCredit`. The job-order API takes `landingChargeNgn` per car.
+   - Tests: a job fuzz walk (200 cars, every rule, about 3,000 postings, tampered and mistyped entries refused, each car ties to the kobo). The phase-1 10k fuzz test now posts by type.
+   - Reviews of 0015: security PASS WITH NOTES (fixed: a clear refusal when the app tries to complete a job itself, a test that the revoked helpers stay revoked, and the lock-order rule for endpoints in ADR 0017 §7). Ledger audit FAIL, fixed:
+     - receivables (1100) never below zero and naming the job's customer;
+     - a supplier credit no longer blocks conversion;
+     - a reversed wrong-currency payment no longer blocks completion;
+     - new `negative_cut` flag;
+     - manual journals keep off 1100;
+     - a half-kobo tie worked example;
+     - reversals and supplier credits in the job fuzz.
+   - Ledger re-audit of the fixes: PASS WITH NOTES. Every note fixed: tamper cases reach the cut re-check, a paid completion can't be reversed before its payment, a negative markup test, and ADR notes on stale flags and split-recorded cases.
+   - Lock timeouts (security review): `withTenant` sets `lock_timeout` 5 s and `idle_in_transaction_session_timeout` 30 s; a timed-out write returns 503 (retry with the same key).
 
-   **Next: allowed shapes** (owner, 2026-11-17, ADR 0016 → Consequences). Every posting rule becomes a named entry type with one shape the database checks. Manual journals can't touch the job accounts. The 10k fuzz test covers job postings. It is built with the posting endpoints. **Then** shipments/containers, cost types and `cost_allocations`, with `POST /costs`. Owner defaults (memory, ADR 0016):
+   **Next: the posting endpoints.** Owner, 2026-11-17: one `POST /postings` route with a typed body (Zod discriminated union), plus `POST /postings/:entryId/reversal` for firm roles only. Build in batches: customer money, then FX, then costs/completion/reversal, then stock. Details: memory `posting-endpoints-shape` (one per entry type; each sets `source_type` from the rule it ran, reads the car's history and pool from the ledger, and maps Postgres check messages before showing them, see Endpoints slice below). **Then** shipments/containers, cost types and `cost_allocations`, with `POST /costs`. Owner defaults (memory, ADR 0016):
    - split by value at pool cost;
    - evidence may be pending unless the cost type requires a receipt;
    - containers close for good;
    - every cash-paid car cost carries a cost type.
 
    The firm-admin endpoint for `firm_access` waits for phase 3; until then the owner adds `firm_staff`/`firm_access` rows on staging.
-2. **Staging is on 0000–0008**; 0009–0014 are not applied yet (apply with the next api deploy). The API needs `CLERK_JWT_KEY`, `CLERK_ISSUER`, `CLERK_AUTHORIZED_PARTIES`, `CLERK_WEBHOOK_SIGNING_SECRET` and `WEBHOOK_DATABASE_URL` (plus `FINBOOK_HOOK_DB_PASSWORD` on migrate), and R2 buckets + the `R2_*` variables for documents (owner: create the Clerk application, the three custom org roles and the webhook endpoint, ADR 0013 → Consequences; until then guarded routes and the webhook answer 503). **FX snapshot check still open:** the worker logged nothing for the 2026-11-16 10:30 run (it logged no job outcomes at all, and Sentry has no DSN); psql isn't installed here to read `fx_reference_rates`. The worker now logs each job's outcome: after the next deploy, read `railway logs --service worker`.
+2. **Staging is on 0000–0008**; 0009–0015 are not applied yet (apply with the next api deploy). The API needs `CLERK_JWT_KEY`, `CLERK_ISSUER`, `CLERK_AUTHORIZED_PARTIES`, `CLERK_WEBHOOK_SIGNING_SECRET` and `WEBHOOK_DATABASE_URL` (plus `FINBOOK_HOOK_DB_PASSWORD` on migrate), and R2 buckets + the `R2_*` variables for documents (owner: create the Clerk application, the three custom org roles and the webhook endpoint, ADR 0013 → Consequences; until then guarded routes and the webhook answer 503). **FX snapshot check still open:** the worker logged nothing for the 2026-11-16 10:30 run (it logged no job outcomes at all, and Sentry has no DSN); psql isn't installed here to read `fx_reference_rates`. The worker now logs each job's outcome: after the next deploy, read `railway logs --service worker`.
 3. **Owner rulings:**
    - (a) 2026-11-15: an abandoned job's customer funds are always refunded, never forfeited. Enforced in 0014: 2150 never leaves as income.
    - (b) 2026-11-17, superseding the 2026-11-15 "approval first" ruling: **record, then flag.** A conversion to stock, an EMM-funded job and a supplier payment the customer's funds don't cover all post. Each shows on `job_order_exceptions` until a firm reviewer or admin signs it off, or the customer pays.
@@ -39,7 +47,7 @@ _Last updated: 2026-11-17 (session: job orders in the ledger, record-then-flag, 
 | --- | --- |
 | 0 Foundations | Done, except owner-blocked items (below). Clerk auth built (guard, permission map, `GET /me`); needs the Clerk app's keys on staging and the membership webhook |
 | 1 Ledger core | **Done.** Gate evidence: local pre-push run (ADR 0007): 10k random entries net to zero, cross-tenant reads return zero rows |
-| 2 Vehicles + FX | **In progress.** Gate approved by the owner (2026-11-15, provisional: the accountant still reviews it and fixes come back here). Ledger slices built (customer-funded flow, spot rates + realized FX, revaluation, EMM-funded), vehicles, job orders, evidence documents, and job orders in the ledger with flags and sign-offs (0014). Allowed entry shapes with the posting endpoints, then costs/containers and the report basis, to build |
+| 2 Vehicles + FX | **In progress.** Gate approved by the owner (2026-11-15, provisional: the accountant still reviews it and fixes come back here). Ledger slices built (customer-funded flow, spot rates + realized FX, revaluation, EMM-funded), vehicles, job orders, evidence documents, job orders in the ledger with flags and sign-offs (0014), and allowed entry shapes with completions re-performed (0015). The posting endpoints, then costs/containers and the report basis, to build |
 | 3–6 | Not started |
 
 ## Phase 2: now and next
@@ -65,8 +73,8 @@ Research behind the next slices: `docs/research/2026-11-15-existing-platforms.md
 - Migration 0007 (month-end revaluation, ADR 0011): pool and foreign payables restated at the latest CBN rate (at most 7 days old) to 7100 through 1019/2009, reversed on day 1 in the same transaction, evidence in `fx_revaluations`, re-performed by the database. The whole-entry checks (0006, 0007) now run inside `post_journal_entry` (as separate deferred triggers they could be fired early and dodged), EXECUTE revoked from PUBLIC. Foreign lines on the balance sheet only on 1010 and 2000.
 - **Phase 4 gate item (ledger audit of 0007):** the period lock must refuse unless the period's latest revaluation equals a fresh re-computation, shipped before or with the first endpoint that locks a period (`finbook_app` can already UPDATE `periods.status`). Until then a posting backdated after a revaluation leaves it stale.
 - Migration 0008 (EMM-funded, ADR 0012): `funding` on the cost rules (emm_funded → 1200), `stockDeposit`, `refundStockDeposit`, `arriveInYard`, `sellStockCar` (gross 4000, full cost to 5000), `convertToStock` (cost to 1200, customer refunded in full). The database reads each car's mode (job or stock) from its live entries: never both, convert is the only crossing (open job, supplier-paid car, whole cost, whole refund in cash), balances never cross zero, inventory only from real costs, moves only whole.
-- **Job orders in the ledger: built** (0014, ADR 0016). Still open:
-  - **Completion endpoint blocker:** re-perform each car's cut from its own quote, and move the job to `completed`. A typed cut up to the funds held still posts.
+- **Job orders in the ledger: built** (0014, ADR 0016); **allowed shapes and completion re-performance: built** (0015, ADR 0017). Still open:
+  - **Not recordable yet** (each needs its own entry type, ADR 0016/0017): customer paying the supplier directly; RMB receipts and refunds; a supplier's RMB refund; a credit note after completion or on an EMM-funded car; paying a foreign payable straight in naira.
   - **`POST /costs` blocker:** every cash-paid car cost carries a cost type. A car bought for naira cash isn't seen as a supplier cost.
   - **Before the first correction:** cancelling a job and putting its car on a new one.
 - **Endpoints slice:** Postgres check messages carry the tenant's own balances; map them before showing them to roles without report access or sending them to Sentry.
@@ -75,15 +83,14 @@ Research behind the next slices: `docs/research/2026-11-15-existing-platforms.md
 - **Gate items from the vehicles-slice security review (2026-11-16):** a worker job deleting `idempotency_keys` older than 7 days (stored answers hold phones and TINs) before real client data; check whether Sentry events carry pg error `detail` or request bodies (VINs, TINs) before Sentry DSNs are set; confirm Railway's edge appends `X-Forwarded-For` (trust proxy 1).
 - Endpoints slice: VIN rule built in `packages/contracts` (`vinProblem`, `vinStatus`, `VinInput`; ISO 3779 check digit, 100% branch coverage), and in the database (`vin_status_of`, 0011): `vehicles.vin_status` is generated, so a client can't mark a bad VIN good; a test runs both checks on 2,000 VINs.
 - Endpoints slice: index `journal_lines (tenant_id, vehicle_id, account_id)` added (migration 0010, partial on `vehicle_id IS NOT NULL`).
-- Known gaps: no mixed v2/v3 hash-chain test across the upgrade; the 10k fuzz test doesn't include pool, payable or spot lines; `counterparty_id` isn't typed (customer vs supplier) until the counterparties table lands (slice 3). Evidence stays optional on purpose: the spec lets entries post as "evidence pending" and flags them on the exception report.
+- Known gaps: no mixed v2/v3 hash-chain test across the upgrade; the job fuzz test has no revaluation, reversal-heavy or multi-currency walks; `counterparty_id` isn't typed (customer vs supplier) until the counterparties table lands (slice 3). Evidence stays optional on purpose: the spec lets entries post as "evidence pending" and flags them on the exception report.
 
 **Next slices, in order (build from the top):**
-1. **Allowed entry shapes + posting endpoints** (owner, 2026-11-17; ADR 0016 → Consequences):
-   - every posting rule becomes a named entry type with one database-checked shape;
-   - manual journals can't touch the job accounts;
-   - the fuzz test covers job postings;
-   - this closes the open round-4 findings and the completion re-performance blocker;
-   - it adds the rules that can't be recorded yet (customer paying the supplier directly, RMB receipts and refunds).
+1. **Posting endpoints**, one per entry type in `packages/ledger` (`EntryType`). Each one:
+   - reads the car's history and the pool from the ledger;
+   - runs the rule and posts with `source_type` set by the rule, never from the request;
+   - takes an idempotency key and writes `audit_log`;
+   - maps Postgres check messages before they reach roles without report access or Sentry.
 2. **Shipments/containers, cost types, `cost_allocations` and `POST /costs`.** Split basis stored (borrowed from ERPNext's landed cost voucher). Owner defaults:
    - split by value at pool cost;
    - evidence may be pending unless the cost type requires a receipt;
@@ -104,12 +111,12 @@ Research behind the next slices: `docs/research/2026-11-15-existing-platforms.md
 ## What exists
 
 - **Apps:** `apps/api` (NestJS 12, `GET /health` public, `POST /webhooks/clerk` (Svix-signed), `GET /me`, `POST/GET /counterparties`, `POST/GET /vehicles`, `GET /vehicles/:id`, documents (presigned upload, confirm, download), job orders and their sign-offs behind the global Clerk guard and the Redis rate limiter, Sentry tagged with tenant and request id), `apps/worker` (NestJS + BullMQ, `system` queue with a `ping` job, Sentry), `apps/web` (Next.js 16 on Cloudflare Workers via vinext, placeholder page). No auth or business endpoints yet.
-- **Packages:** `money`, `ledger`, `db` (Drizzle schema; migrations 0000–0014; `withTenant()`, `resolveAccess()`; `migrate()`), `contracts` (Zod, VIN rule; `pnpm openapi` writes `packages/contracts/openapi.json`).
+- **Packages:** `money`, `ledger`, `db` (Drizzle schema; migrations 0000–0015; `withTenant()`, `resolveAccess()`; `migrate()`), `contracts` (Zod, VIN rule; `pnpm openapi` writes `packages/contracts/openapi.json`).
 - **Database guarantees** (ADR 0006): API logs in as `finbook_api` (non-superuser) and runs as `finbook_app` under forced RLS; owner URL only for migrations. Balance at commit, append-only ledger and audit log, period lock, reversals mirror exactly, accounts frozen once posted to, FX checks, DB-stamped actor and time, audit rows, per-tenant hash chain with `ledger_chain_breaks()`. Known limit: chain tampering by a DB superuser needs an off-site anchor (backup manifest, phase 5).
-- **Tests:** money 10 and ledger 17 (100% branch coverage), api 2 unit + 36 integration (job-order sign-offs, documents via S3Mock, job orders, vehicles, counterparties, idempotency per tenant and user, races, 429, viewer 403, auth, template tokens refused, cross-tenant 404, suspended tenant, MFA, default deny, signed webhook, ordering, firm staff never mirrored), worker 7 (1 needs Redis), db integration 87 (Testcontainers Postgres 18, needs Docker).
+- **Tests:** money 10 and ledger 18 (100% branch coverage), api 2 unit + 36 integration (job-order sign-offs, documents via S3Mock, job orders, vehicles, counterparties, idempotency per tenant and user, races, 429, viewer 403, auth, template tokens refused, cross-tenant 404, suspended tenant, MFA, default deny, signed webhook, ordering, firm staff never mirrored), worker 7 (1 needs Redis), db integration 93 (Testcontainers Postgres 18, needs Docker; the two fuzz tests take about 7 minutes together).
 - **Quality gate:** `.githooks/pre-push` runs install, lint, typecheck, unit, integration and build before every push (ADR 0007). Strict type-aware ESLint bans float money (`parseFloat`, `Number()`, `Math.round` and friends, `toFixed`).
 - **Staging (Railway project `finbook`, env `staging`):** Postgres 18, Redis, api (https://api-staging-c68d0388.up.railway.app/health), worker, and a one-off `migrate` service. Production environment exists, empty, owner-run only. Details: `docs/deploy.md`.
-- **Decisions:** ADRs 0001–0016 in `docs/decisions/`. Research notes in `docs/research/`.
+- **Decisions:** ADRs 0001–0017 in `docs/decisions/`. Research notes in `docs/research/`.
 
 ## Gotchas for the next session
 

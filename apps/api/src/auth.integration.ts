@@ -487,17 +487,18 @@ describe('documents and job orders', () => {
     const car = (await (await send('POST', '/vehicles', ownerA, { vin: 'SALGS2SE5LA000001', make: 'Land Rover', model: 'Range Rover', year: 2020 })).json()) as { id: string };
     const quote = await evidence(ownerA, PDF);
     assert.equal((await send('POST', `/job-orders/${job.id}/accept-quote`, ownerA, { documentId: quote.id })).status, 422); // no car yet
-    const added = await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: car.id });
-    assert.deepEqual([added.status, ((await added.json()) as { vehicles: unknown[] }).vehicles], [201, [{ vehicleId: car.id, carPriceMinor: null }]]);
+    assert.equal((await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: car.id })).status, 400); // every car carries its own landing charge
+    const added = await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: car.id, landingChargeNgn: '100000000' });
+    assert.deepEqual([added.status, ((await added.json()) as { vehicles: unknown[] }).vehicles], [201, [{ vehicleId: car.id, carPriceMinor: null, landingChargeNgn: '100000000' }]]);
     const accepted = await send('POST', `/job-orders/${job.id}/accept-quote`, ownerA, { documentId: quote.id });
     assert.deepEqual([accepted.status, ((await accepted.json()) as { status: string }).status], [200, 'quote_accepted']);
     const late = (await (await send('POST', '/vehicles', ownerA, { vin: 'SALGS2SE5LA000002', make: 'Land Rover', model: 'Range Rover', year: 2020 })).json()) as { id: string };
     const job2 = (await (await send('POST', '/job-orders', ownerA, { customerId: customerA, jobType: 'clearing_only', orderedOn: '2026-01-08', landingChargeNgn: '0' })).json()) as { id: string };
-    await send('POST', `/job-orders/${job2.id}/vehicles`, ownerA, { vehicleId: late.id });
+    await send('POST', `/job-orders/${job2.id}/vehicles`, ownerA, { vehicleId: late.id, landingChargeNgn: '0' });
     const reused = await send('POST', `/job-orders/${job2.id}/accept-quote`, ownerA, { documentId: quote.id });
     assert.equal(reused.status, 409); // one acceptance backs one job
     const late2 = (await (await send('POST', '/vehicles', ownerA, { vin: 'SALGS2SE5LA000005', make: 'Land Rover', model: 'Range Rover', year: 2020 })).json()) as { id: string };
-    const tooLate = await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: late2.id });
+    const tooLate = await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: late2.id, landingChargeNgn: '0' });
     assert.equal(tooLate.status, 422);
     assert.match(await tooLate.text(), /before its quote is accepted/);
   });
@@ -505,9 +506,9 @@ describe('documents and job orders', () => {
   test("another tenant's job, car, customer or document: the same 404 / 422 as one that doesn't exist; viewers can't see jobs", async () => {
     const job = (await (await send('POST', '/job-orders', ownerA, { customerId: customerA, jobType: 'clearing_only', orderedOn: '2026-01-08', landingChargeNgn: '0' })).json()) as { id: string };
     assert.equal((await get(`/job-orders/${job.id}`, bearer(ownerB))).status, 404);
-    assert.equal((await send('POST', `/job-orders/${job.id}/vehicles`, ownerB, { vehicleId: randomUUID() })).status, 404);
+    assert.equal((await send('POST', `/job-orders/${job.id}/vehicles`, ownerB, { vehicleId: randomUUID(), landingChargeNgn: '0' })).status, 404);
     const bCar = (await (await send('POST', '/vehicles', ownerB, { vin: 'SALGS2SE5LA000003', make: 'x', model: 'y', year: 2020 })).json()) as { id: string };
-    assert.equal((await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: bCar.id })).status, 422);
+    assert.equal((await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: bCar.id, landingChargeNgn: '0' })).status, 422);
     const bCustomer = ((await (await send('POST', '/counterparties', ownerB, { kind: 'customer', name: 'B buyer' })).json()) as { id: string }).id;
     const viaB = await send('POST', '/job-orders', ownerA, { customerId: bCustomer, jobType: 'clearing_only', orderedOn: '2026-01-08', landingChargeNgn: '0' });
     assert.equal(viaB.status, 422);
@@ -518,7 +519,7 @@ describe('documents and job orders', () => {
     assert.equal((await send('POST', `/job-orders/${job.id}/accept-quote`, ownerB, { documentId: quoteA.id })).status, 404); // B on A's job
     const quoteB = await evidence(ownerB, PDF);
     const carA = (await (await send('POST', '/vehicles', ownerA, { vin: 'SALGS2SE5LA000004', make: 'x', model: 'y', year: 2020 })).json()) as { id: string };
-    await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: carA.id });
+    await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: carA.id, landingChargeNgn: '0' });
     assert.equal((await send('POST', `/job-orders/${job.id}/accept-quote`, ownerA, { documentId: quoteB.id })).status, 422); // A with B's document
     assert.equal((await get('/job-orders', bearer(viewerA))).status, 403);
   });
@@ -533,10 +534,10 @@ describe('documents and job orders', () => {
       orderedOn: '2026-01-09', carPrice: { amountMinor: '9800000', currency: 'CNY' }, quoteRate: { rate: '108', source: 'cbn' }, landingChargeNgn: '0' })).json()) as { id: string };
     const path = `/job-orders/${job.id}/sign-offs`;
     const car = (await (await send('POST', '/vehicles', ownerA, { vin: 'SALGS2SE5LA000006', make: 'Land Rover', model: 'Range Rover', year: 2020 })).json()) as { id: string };
-    const unpriced = await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: car.id });
+    const unpriced = await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: car.id, landingChargeNgn: '0' });
     assert.equal(unpriced.status, 422);
     assert.match(await unpriced.text(), /each car on a car purchase needs its own quoted price/);
-    await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: car.id, carPriceMinor: '9800000' });
+    await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: car.id, carPriceMinor: '9800000', landingChargeNgn: '0' });
     assert.equal((await send('POST', `/job-orders/${job.id}/accept-quote`, ownerA, { documentId: (await evidence(ownerA, PDF)).id })).status, 200);
     const early = await review(tenantA, path, { flagId: randomUUID(), reason: 'nothing to sign yet' });
     assert.equal(early.status, 422); // nothing posted for the car yet: no flag on this job
@@ -551,7 +552,7 @@ describe('documents and job orders', () => {
       const period = (await owner.query<{ id: string }>("INSERT INTO periods (tenant_id, starts_on, ends_on) VALUES ($1, '2026-01-01', '2026-01-31') RETURNING id", [tenantA])).rows[0]?.id;
       const entry = (await owner.query<{ id: string }>(
         `INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, created_by)
-         VALUES ($1, $2, '2026-01-10', 'car bought for naira', 'test', uuidv7(), 'api-flag-1', 'user_owner_a') RETURNING id`, [tenantA, period])).rows[0]?.id;
+         VALUES ($1, $2, '2026-01-10', 'car bought for naira', 'car_cost', uuidv7(), 'api-flag-1', 'user_owner_a') RETURNING id`, [tenantA, period])).rows[0]?.id;
       await owner.query("INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, vehicle_id) VALUES ($1, $2, $3, 500000000, 0, 'NGN', 500000000, $4), ($1, $2, $5, 0, 500000000, 'NGN', 500000000, NULL)",
         [tenantA, entry, transit, car.id, cash]);
       await owner.query('COMMIT');

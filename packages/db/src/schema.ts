@@ -408,9 +408,12 @@ export const jobOrderVehicles = pgTable('job_order_vehicles', {
   vehicleId: uuid('vehicle_id').notNull(),
   /** The car's own quoted price, in the job's car currency (owner 2026-11-17: each car has its own provable cut). Car purchases only. */
   carPriceMinor: bigint('car_price_minor', { mode: 'bigint' }),
+  /** The car's own landing charge in kobo (owner 2026-11-17); the job's landing charge is their sum once the quote is accepted. */
+  landingChargeNgn: bigint('landing_charge_ngn', { mode: 'bigint' }).notNull(),
   createdAt: createdAt(),
 }, (t) => [
   check('job_order_vehicles_car_price', sql`${t.carPriceMinor} > 0`),
+  check('job_order_vehicles_landing_charge', sql`${t.landingChargeNgn} >= 0`),
   unique('job_order_vehicles_one_job_per_car').on(t.tenantId, t.vehicleId),
   unique('job_order_vehicles_job_car').on(t.tenantId, t.jobOrderId, t.vehicleId),
   foreignKey({ name: 'job_order_vehicles_job', columns: [t.tenantId, t.jobOrderId], foreignColumns: [jobOrders.tenantId, jobOrders.id] }),
@@ -436,7 +439,7 @@ export const jobOrderFlags = pgTable('job_order_flags', {
   index('job_order_flags_tenant_job').on(t.tenantId, t.jobOrderId),
   foreignKey({ name: 'job_order_flags_job_car', columns: [t.tenantId, t.jobOrderId, t.vehicleId], foreignColumns: [jobOrderVehicles.tenantId, jobOrderVehicles.jobOrderId, jobOrderVehicles.vehicleId] }),
   foreignKey({ name: 'job_order_flags_entry', columns: [t.tenantId, t.entryId], foreignColumns: [journalEntries.tenantId, journalEntries.id] }),
-  check('job_order_flags_kind', sql`${t.kind} in ('emm_funded', 'converted_to_stock', 'posted_before_quote', 'supplier_cost_not_covered', 'cost_after_completion', 'completion_unverified', 'cost_credited')`),
+  check('job_order_flags_kind', sql`${t.kind} in ('emm_funded', 'converted_to_stock', 'posted_before_quote', 'supplier_cost_not_covered', 'cost_after_completion', 'completion_unverified', 'cost_credited', 'negative_cut')`),
 ]);
 
 /**

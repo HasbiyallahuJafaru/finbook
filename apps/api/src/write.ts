@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { BadRequestException, ConflictException, HttpException, UnprocessableEntityException } from '@nestjs/common';
+import { BadRequestException, ConflictException, HttpException, ServiceUnavailableException, UnprocessableEntityException } from '@nestjs/common';
 import type pg from 'pg';
 import type { z } from 'zod';
 import { withTenant, type Tx } from '@app/db';
@@ -47,6 +47,10 @@ export async function idempotentWrite<T>(
     const row = await withTenant(pool, actor, async (t) => (await stored(t)).rows[0]);
     if (row) return answer(row);
     if (err instanceof Replay) throw new ConflictException();
+    // A lock wait or idle transaction past its limit (withTenant): nothing was written, and the same key retries safely.
+    if (err instanceof Error && 'code' in err && (err.code === '55P03' || err.code === '25P03')) {
+      throw new ServiceUnavailableException('the books are busy right now: retry with the same Idempotency-Key');
+    }
     throw err;
   }
 }

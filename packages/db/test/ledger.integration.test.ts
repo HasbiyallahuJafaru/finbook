@@ -8,8 +8,8 @@ import pg from 'pg';
 import { vinProblem } from '@app/contracts';
 import { convert, formatRate, parseRate, RATE_SCALE } from '@app/money';
 import {
-  arriveInYard, buyCurrency, completeAgentJob, completeClearingJob, convertToStock, customerReceipt, payFromPool, payPayableFromPool, refundStockDeposit, revalue, sellStockCar, sharedCost, stockDeposit,
-  supplierInvoice,
+  arriveInYard, buyCurrency, completeAgentJob, completeClearingJob, convertToStock, customerReceipt, customerRefund, payFromPool, payPayableFromPool, receivableReceipt, refundStockDeposit, revalue, sellStockCar, sharedCost, stockDeposit,
+  supplierCredit, supplierInvoice,
   type Line as LedgerLine, type RevaluationItem,
 } from '@app/ledger';
 import { applyMembershipEvent, migrate, resolveAccess, revokeOrganization, withTenant, type Actor, type Tx } from '../src/index.ts';
@@ -18,7 +18,42 @@ type Line = {
   account: string; debit?: bigint; credit?: bigint;
   currency?: string; amountMinor?: bigint; rate?: string; rateSource?: string; rateNote?: string;
 };
-type Entry = { periodId: string; date: string; lines: Line[]; key?: string; memo?: string; reverses?: string };
+type Entry = { periodId: string; date: string; lines: Line[]; key?: string; memo?: string; reverses?: string; sourceType?: string };
+
+/**
+ * The entry type a test entry posts as (migration 0015): what the API sets from the rule it ran. Tests name it when they
+ * forge an entry; otherwise it is read off the lines, the way the rules in packages/ledger build them. A reversal takes the
+ * type of the entry it reverses.
+ */
+type Shaped = { account: string; debit?: bigint; credit?: bigint; rateSource?: string };
+function entryTypeOf(lines: readonly Shaped[]): string {
+  const dr = (a: string) => lines.some((l) => l.account === a && (l.debit ?? 0n) > 0n);
+  const cr = (a: string) => lines.some((l) => l.account === a && (l.credit ?? 0n) > 0n);
+  const on = (a: string) => dr(a) || cr(a);
+  const rated = (a: string, r: string) => lines.some((l) => l.account === a && l.rateSource === r);
+  if (on('1019') || on('2009') || on('7100')) return 'fx_revaluation';
+  if (dr('1200') && cr('1150')) return 'stock_conversion';
+  if (on('4100') || on('4200') || (cr('1150') && (dr('2150') || dr('1100')))) return 'job_completion';
+  if (dr('1210') && cr('1200')) return 'yard_arrival';
+  if (on('4000') || on('5000')) return 'stock_sale';
+  if (cr('2100')) return 'stock_deposit';
+  if (dr('2100')) return 'stock_deposit_refund';
+  if (cr('2150')) return 'customer_receipt';
+  if (dr('2150')) return 'customer_refund';
+  if (cr('1100')) return 'receivable_receipt';
+  if (rated('2000', 'payable_average')) return 'supplier_settlement';
+  if (rated('2000', 'agent_invoice')) return 'supplier_invoice';
+  if (dr('1010')) return 'currency_purchase';
+  if (rated('1010', 'pool_average')) return 'pool_payment';
+  if (cr('1150')) return 'supplier_credit';
+  if (dr('1150') || dr('1200')) return 'car_cost';
+  return 'manual_journal';
+}
+
+/** Refused for not fitting its entry type (0015): the shapes now catch most forged entries before the older guards do. */
+const SHAPE = /has no place for that line|entry holds \d+ to|entry is for one car|names one counterparty|a manual journal names no car|is not an entry type/;
+/** An older guard's refusal, or the shape check's, whichever catches the forged entry first. */
+const orShape = (re: RegExp) => new RegExp(`${re.source}|${SHAPE.source}`);
 
 const API_PASSWORD = 'test-only-password'; // fixture: the throwaway container's finbook_api login
 const RATES_PASSWORD = 'test-only-rates'; // fixture: the throwaway container's finbook_rates login
@@ -42,7 +77,9 @@ const FIXTURE_RATE_HALF = '0.500000';
 const FIXTURE_RATE_SPOT = '108.000000'; // spot (CBN reference) rate stored for 2026-01-08 in the test database
 const FIXTURE_RATE_INVOICE = parseRate('105.000000');
 const SPOT_CBN = { rate: parseRate(FIXTURE_RATE_SPOT), source: 'cbn' as const };
-const SUPPLIER = '019a0000-0000-7000-8000-0000000000f1';
+const SUPPLIER = '019a0000-0000-7000-8000-0000000000f1'; // stands for the tenant's own test supplier (suppliers below)
+const suppliers: Record<string, string> = {}; // tenant -> its test supplier (a real counterparty of kind supplier, 0015)
+const counterpartyIn = (tenant: string, id: string) => (id === SUPPLIER ? (suppliers[tenant] ?? '') : id);
 const rateString = (scaled: bigint) => `${String(scaled / RATE_SCALE)}.${String(scaled % RATE_SCALE).padStart(6, '0')}`;
 
 const as = (tenantId: string, userId = USER): Actor => ({ tenantId, userId });
@@ -54,8 +91,8 @@ const one = async (c: pg.ClientBase, sql: string, params: unknown[] = []) => (aw
 async function insertEntry(c: pg.ClientBase, tenant: string, e: Entry): Promise<string> {
   const entryId = await one(c,
     `INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, reverses_entry_id)
-     VALUES ($1, $2, $3, $4, 'manual_journal', uuidv7(), $5, $6) RETURNING id`,
-    [tenant, e.periodId, e.date, e.memo ?? 'test entry', e.key ?? `k-${String(++keySeq)}`, e.reverses ?? null]);
+     VALUES ($1, $2, $3, $4, coalesce($7, (SELECT source_type FROM journal_entries WHERE id = $6)), uuidv7(), $5, $6) RETURNING id`,
+    [tenant, e.periodId, e.date, e.memo ?? 'test entry', e.key ?? `k-${String(++keySeq)}`, e.reverses ?? null, e.sourceType ?? (e.reverses ? null : entryTypeOf(e.lines))]);
   const ids = accounts[tenant] ?? {};
   for (const l of e.lines) {
     const debit = l.debit ?? 0n;
@@ -96,6 +133,7 @@ async function freshTenant(name: string): Promise<{ id: string; period: string }
       ids[code] = await one(t.client, 'INSERT INTO accounts (tenant_id, code, name, type, currency) VALUES ($1, $2, $3, $4, $5) RETURNING id',
         [id, code, `Account ${code}`, type, currency]);
     }
+    suppliers[id] = await one(t.client, "INSERT INTO counterparties (tenant_id, kind, name) VALUES ($1, 'supplier', 'Test supplier') RETURNING id", [id]);
     return one(t.client, "INSERT INTO periods (tenant_id, starts_on, ends_on) VALUES ($1, '2026-01-01', '2026-01-31') RETURNING id", [id]);
   });
   return { id, period };
@@ -396,7 +434,7 @@ describe('phase 2: posting rules through the database', () => {
   // Nothing posts for a car that isn't on a job order with an accepted quote (0014), so each test tenant gets real cars A, B
   // and C, each on its own accepted job. By default each is a customer-funded car purchase whose customer has already paid
   // FIXTURE_FUNDS_HELD, the normal business; a test can set its own.
-  type JobSetup = { jobType: 'car_purchase' | 'clearing_only'; funding: 'customer_funded' | 'emm_funded' };
+  type JobSetup = { jobType: 'car_purchase' | 'clearing_only'; funding: 'customer_funded' | 'emm_funded'; price?: bigint; landing?: bigint; rate?: string };
   const CUSTOMER_JOB: JobSetup = { jobType: 'car_purchase', funding: 'customer_funded' };
   const EMM: JobSetup = { jobType: 'car_purchase', funding: 'emm_funded' };
   const FIXTURE_FUNDS_HELD = 1_000_000_000n; // NGN 10,000,000.00 paid by each customer before EMM pays the supplier
@@ -436,10 +474,11 @@ describe('phase 2: posting rules through the database', () => {
         await t.client.query("UPDATE documents SET status = 'stored', evidence_key = 'evidence/' || tenant_id || '/2026/01/' || id || '.pdf', stored_at = now() WHERE id = $1", [quote]);
         const jobId = await one(t.client,
           `INSERT INTO job_orders (tenant_id, customer_id, job_type, funding, funding_reason, ordered_on, car_price_minor, car_price_currency, quote_rate, quote_rate_source, quote_rate_note, landing_charge_ngn)
-           VALUES ($1, $2, $3, $4, $5, '2026-01-05', $6, $7, $8, $9, $10, 0) RETURNING id`,
+           VALUES ($1, $2, $3, $4, $5, '2026-01-05', $6, $7, $8, $9, $10, $11) RETURNING id`,
           [tenant, customerId, s.jobType, s.funding, s.funding === 'emm_funded' ? 'fixture: bought ahead of a buyer' : null,
-            purchase ? 4_500_000n : null, purchase ? 'CNY' : null, purchase ? '110.000000' : null, purchase ? 'manual' : null, purchase ? 'FIXTURE_RATE_QUOTE' : null]);
-        await t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, car_price_minor) VALUES ($1, $2, $3, $4)', [tenant, jobId, carIds[v], purchase ? 4_500_000n : null]);
+            purchase ? (s.price ?? 4_500_000n) : null, purchase ? 'CNY' : null, purchase ? (s.rate ?? '110.000000') : null, purchase ? 'manual' : null, purchase ? 'FIXTURE_RATE_QUOTE' : null, s.landing ?? 0n]);
+        await t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, car_price_minor, landing_charge_ngn) VALUES ($1, $2, $3, $4, $5)',
+          [tenant, jobId, carIds[v], purchase ? (s.price ?? 4_500_000n) : null, s.landing ?? 0n]);
         await t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2 WHERE id = $1", [jobId, quote]);
         return jobId;
       });
@@ -458,14 +497,14 @@ describe('phase 2: posting rules through the database', () => {
   const insertPosting = async (c: pg.ClientBase, tenant: string, period: string, lines: LedgerLine[], opts: PostOpts = {}) => {
     const ids = accounts[tenant] ?? {};
     const entryId = await one(c,
-      'INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, reverses_entry_id) VALUES ($1, $2, $3, \'posting rule\', $4, uuidv7(), $5, $6) RETURNING id',
-      [tenant, period, opts.date ?? '2026-01-10', opts.sourceType ?? 'test', `pr-${String(++keySeq)}`, opts.reverses ?? null]);
+      'INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, reverses_entry_id) VALUES ($1, $2, $3, \'posting rule\', coalesce($4, (SELECT source_type FROM journal_entries WHERE id = $6)), uuidv7(), $5, $6) RETURNING id',
+      [tenant, period, opts.date ?? '2026-01-10', opts.sourceType ?? (opts.reverses ? null : entryTypeOf(lines)), `pr-${String(++keySeq)}`, opts.reverses ?? null]);
     for (const l of lines) {
       await c.query(
         `INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, spot_rate, spot_source, rate_note, vehicle_id, counterparty_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
         [tenant, entryId, ids[l.account], l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null, l.spotRate ?? null, l.spotSource ?? null, l.rateNote ?? null,
-          l.vehicleId ? carOf(tenant, l.vehicleId) : null, l.counterpartyId ? (l.counterpartyId.length === 36 ? l.counterpartyId : customer(tenant, l.counterpartyId)) : null]);
+          l.vehicleId ? carOf(tenant, l.vehicleId) : null, l.counterpartyId ? (l.counterpartyId.length === 36 ? counterpartyIn(tenant, l.counterpartyId) : customer(tenant, l.counterpartyId)) : null]);
     }
     return entryId;
   };
@@ -512,7 +551,7 @@ describe('phase 2: posting rules through the database', () => {
   };
 
   test('the worked example posts cleanly and the balances match the hand-worked figures', async () => {
-    const { id, period } = await funded('Worked example', { held: false });
+    const { id, period } = await funded('Worked example', { held: false, jobs: { A: { ...CUSTOMER_JOB, landing: 150_000_000n } } });
     for (const [v, amountNgn] of [['A', 600_000_000n], ['B', 500_000_000n], ['C', 650_000_000n]] as const) await postLines(id, period, customerReceipt({ ...job(v), amountNgn }));
     for (const [v, amountMinor] of [['A', 4_000_000n], ['B', 3_500_000n], ['C', 4_500_000n]] as const) {
       await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor, vehicleId: v, spot: SPOT_CBN }).lines);
@@ -565,7 +604,7 @@ describe('phase 2: posting rules through the database', () => {
     const original = await tx(id, async (t) => (await t.client.query<{ id: string }>('SELECT entry_id AS id FROM journal_lines WHERE vehicle_id = $1 LIMIT 1', [carOf(id, 'A')])).rows[0]?.id ?? '');
     const mirror = (vehicleId: string): LedgerLine[] => paid.map((l) => ({ ...l, debit: l.credit, credit: l.debit, vehicleId }));
     const reverse = (lines: LedgerLine[]) => tx(id, async (t) => {
-      const entryId = await one(t.client, "INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, reverses_entry_id) VALUES ($1, $2, '2026-01-11', 'reversal', 'test', uuidv7(), $3, $4) RETURNING id",
+      const entryId = await one(t.client, "INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, reverses_entry_id) VALUES ($1, $2, '2026-01-11', 'reversal', 'pool_payment', uuidv7(), $3, $4) RETURNING id",
         [id, period, `rev-${String(++keySeq)}`, original]);
       for (const l of lines) {
         await t.client.query('INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, spot_rate, spot_source, vehicle_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)',
@@ -588,7 +627,7 @@ describe('phase 2: posting rules through the database', () => {
   const payableOf = (tenant: string) => tx(tenant, async (t) => {
     const r = (await t.client.query<{ bal: string; cost: string }>(
       "SELECT coalesce(sum(CASE WHEN credit_ngn > 0 THEN amount_minor ELSE -amount_minor END), 0)::text AS bal, coalesce(sum(credit_ngn - debit_ngn), 0)::text AS cost FROM journal_lines WHERE account_id = $1 AND currency = 'CNY' AND counterparty_id = $2 AND vehicle_id = $3",
-      [accounts[tenant]?.['2000'], SUPPLIER, carOf(tenant, 'A')])).rows[0];
+      [accounts[tenant]?.['2000'], counterpartyIn(tenant, SUPPLIER), carOf(tenant, 'A')])).rows[0];
     return { balanceMinor: BigInt(r?.bal ?? 0), costNgn: BigInt(r?.cost ?? 0) };
   });
   const bill = { vehicleId: 'A', supplierId: SUPPLIER };
@@ -712,6 +751,32 @@ describe('phase 2: posting rules through the database', () => {
     await assert.rejects(owner("UPDATE fx_reference_rates SET rate = '1.000000'"), /append-only/);
   });
 
+  test('a posting waits at most 5 seconds for a lock, then fails cleanly; nothing holds a transaction idle for long (security review of 0015)', async () => {
+    const { id, period } = await funded('Lock timeout');
+    const settings = await tx(id, async (t) => (await t.client.query<{ lock: string; idle: string }>(
+      "SELECT current_setting('lock_timeout') AS lock, current_setting('idle_in_transaction_session_timeout') AS idle")).rows[0]);
+    assert.deepEqual(settings, { lock: '5s', idle: '30s' });
+    // Someone holds car A's job row (an accept-quote, a stuck request): a posting for A gives up after 5 s instead of
+    // freezing this tenant's postings behind it.
+    let held = (): void => undefined;
+    let release = (): void => undefined;
+    const holding = new Promise<void>((r) => { held = r; });
+    const until = new Promise<void>((r) => { release = r; });
+    const holder = tx(id, async (t) => {
+      await t.client.query('SELECT 1 FROM job_orders WHERE id = $1 FOR UPDATE', [jobIds[id]?.A]);
+      held();
+      await until;
+    });
+    await holding;
+    const started = Date.now();
+    await assert.rejects(postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 1_000n })), /lock timeout/);
+    const waited = Date.now() - started;
+    assert.ok(waited >= 4_500 && waited < 15_000, `waited ${String(waited)} ms`);
+    release();
+    await holder;
+    await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 1_000n })); // and posts once the row is free
+  });
+
   test('two payments at the same moment cannot both spend the same pool', async () => {
     const { id, period } = await funded('Pool race');
     const stale = await poolOf(id); // both payments are prepared from the same view: CNY 150,000.00
@@ -807,10 +872,10 @@ describe('phase 2: posting rules through the database', () => {
     await assert.rejects(postRevaluation(id, period, feb, good, { reversalDate: '2026-02-02' }), /posts with its reversal dated 2026-02-01/);
     await assert.rejects(postRevaluation(id, period, feb, good, { date: '2026-01-30' }), /dated its period's last day \(2026-01-31\)/);
     const r = revalue(good);
-    await assert.rejects(postRevaluation(id, period, feb, good, { lines: r.lines.map((l) => (l.account === '2009' ? { ...l, account: '6000' } : l)) }), /posts only to 1019, 2009 and 7100/);
+    await assert.rejects(postRevaluation(id, period, feb, good, { lines: r.lines.map((l) => (l.account === '2009' ? { ...l, account: '6000' } : l)) }), orShape(/posts only to 1019, 2009 and 7100/));
     // 1019 and 2009 hold revaluation only.
-    await assert.rejects(postLines(id, period, [{ account: '1019', debit: 100n, credit: 0n, currency: 'NGN', amountMinor: 100n }, { account: '7100', debit: 0n, credit: 100n, currency: 'NGN', amountMinor: 100n }]),
-      /1019 and 2009 hold month-end revaluation only/);
+    await assert.rejects(postLines(id, period, [{ account: '1019', debit: 100n, credit: 0n, currency: 'NGN', amountMinor: 100n }, { account: '7100', debit: 0n, credit: 100n, currency: 'NGN', amountMinor: 100n }], { sourceType: 'manual_journal' }),
+      orShape(/1019 and 2009 hold month-end revaluation only/));
     await postRevaluation(id, period, feb, good);
   });
 
@@ -826,7 +891,7 @@ describe('phase 2: posting rules through the database', () => {
   const swap = (lines: LedgerLine[]) => lines.map((l) => ({ ...l, debit: l.credit, credit: l.debit }));
 
   test('a car is a customer-funded job or EMM stock, never both (ledger audit of 0008)', async () => {
-    const { id, period } = await funded('Job or stock', { held: false });
+    const { id, period } = await funded('Job or stock', { held: false, jobs: { B: { ...CUSTOMER_JOB, price: 1_100_000n } } });
     // Job A: the customer pays, EMM pays the supplier; its completion is worked out now, before anything else happens.
     await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 600_000_000n }));
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
@@ -840,11 +905,11 @@ describe('phase 2: posting rules through the database', () => {
     await postLines(id, period, conversion);
     // Now stock: the agent completion worked out earlier is refused, and so is any agent cost.
     await assert.rejects(postLines(id, period, completion), /job costs \(1150\).*never cross zero/); // its 1150 moved to stock
-    await assert.rejects(postLines(id, period, sharedCost({ amountNgn: 1_000n, vehicleIds: ['A'] })), /EMM stock \(EMM-funded or converted\): it takes no customer-funded postings/);
+    await assert.rejects(postLines(id, period, sharedCost({ amountNgn: 1_000n, vehicleIds: ['A'] })), orShape(/EMM stock \(EMM-funded or converted\): it takes no customer-funded postings/));
     // One payment split across both sides for car B: refused.
     const split = payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'B', spot: SPOT_CBN }).lines
       .flatMap((l) => (l.account === '1150' ? [{ ...l, debit: l.debit / 2n, amountMinor: l.amountMinor / 2n }, { ...l, account: '1200', debit: l.debit - l.debit / 2n, amountMinor: l.amountMinor - l.amountMinor / 2n }] : [l]));
-    await assert.rejects(postLines(id, period, split), /never both in one entry/);
+    await assert.rejects(postLines(id, period, split), orShape(/never both in one entry/));
     // A completed job can't be converted afterwards, even with a late cost to move.
     await postLines(id, period, customerReceipt({ ...job('B'), amountNgn: 100_000_000n }));
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'B', spot: SPOT_CBN }).lines);
@@ -863,12 +928,12 @@ describe('phase 2: posting rules through the database', () => {
     await postLines(id, period, swap(conversion), { reverses: conversionId });
     // While open, A's funds can't be paid out beyond what is held, and A's costs can't pay for another car's inventory.
     await assert.rejects(postLines(id, period, [ngnOn('2150', 600_000_001n, 'A', 'A'), ngnOn('1000', -600_000_001n)]), /funds held \(2150\) never cross zero/);
-    await assert.rejects(postLines(id, period, [ngnOn('1150', 100n), ngnOn('1000', -100n)]), /every job-cost, funds-held and inventory line \(1150, 2150, 1200, 1210\) names its car/);
+    await assert.rejects(postLines(id, period, [ngnOn('1150', 100n), ngnOn('1000', -100n)]), orShape(/every job-cost, funds-held and inventory line \(1150, 2150, 1200, 1210\) names its car/));
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'C', spot: SPOT_CBN, funding: 'emm_funded' }).lines);
-    await assert.rejects(postLines(id, period, [ngnOn('1200', 100_000_000n, 'C'), ngnOn('1150', -100_000_000n, 'A')]), /the same car's job costs when converting/);
+    await assert.rejects(postLines(id, period, [ngnOn('1200', 100_000_000n, 'C'), ngnOn('1150', -100_000_000n, 'A')]), orShape(/the same car's job costs when converting/));
     await postLines(id, period, completeAgentJob({ ...job('A'), quote: { currency: 'CNY', sellingMinor: 4_500_000n, rate: parseRate('110.000000'), landingChargeNgn: 0n }, history: await historyOf(id, 'A') }).lines);
     // Car C is stock: agent income for it is refused even with nothing to cross zero.
-    await assert.rejects(postLines(id, period, [ngnOn('1100', 100n, 'C', 'C'), ngnOn('4100', -100n, 'C')]), /EMM stock \(EMM-funded or converted\): it takes no customer-funded postings/);
+    await assert.rejects(postLines(id, period, [ngnOn('1100', 100n, 'C', 'C'), ngnOn('4100', -100n, 'C')]), orShape(/EMM stock \(EMM-funded or converted\): it takes no customer-funded postings/));
     // Car B: a first cost posted as EMM-funded by mistake. The job says customer-funded, so it never posts (0014; before job
     // orders this slip posted and needed a reversal). B stays an ordinary customer job.
     await assert.rejects(postLines(id, period, sharedCost({ amountNgn: 50_000_000n, vehicleIds: ['B'], funding: 'emm_funded' })), /job order \d+ is customer-funded: its car is not stock unless converted/);
@@ -880,7 +945,7 @@ describe('phase 2: posting rules through the database', () => {
   });
 
   test('a job completed at a zero cut stays completed; a conversion is undone only after the stock steps after it (ledger audit of 0008, round 4)', async () => {
-    const { id, period } = await funded('Zero cut', { held: false });
+    const { id, period } = await funded('Zero cut', { held: false, jobs: { A: { ...CUSTOMER_JOB, price: 4_000_000n }, B: { ...CUSTOMER_JOB, price: 2_200_000n } } });
     // Job A sold to the customer at exactly the car's quote-rate cost with no landing charge: no 4100/4200 line at all.
     await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 600_000_000n }));
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
@@ -909,7 +974,7 @@ describe('phase 2: posting rules through the database', () => {
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
     const conversion = convertToStock({ ...job('A'), history: await historyOf(id, 'A') });
     const diverted = [...conversion.filter((l) => l.account !== '1000'), ngnOn('1000', -100_000_000n), ngnOn('2000', -500_000_000n, undefined, SUPPLIER)];
-    await assert.rejects(postLines(id, period, diverted), /repays the customer's whole funds held \(2150\), nothing else/);
+    await assert.rejects(postLines(id, period, diverted), orShape(/repays the customer's whole funds held \(2150\), nothing else/));
     await postLines(id, period, conversion);
   });
 
@@ -917,7 +982,7 @@ describe('phase 2: posting rules through the database', () => {
     const { id, period } = await funded('Stock corrections', { jobs: { C: EMM } });
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 3_000_000n, vehicleId: 'C', spot: SPOT_CBN, funding: 'emm_funded' }).lines);
     // A "cost" conjured from equity or income: refused.
-    await assert.rejects(postLines(id, period, [ngnOn('1200', 100_000_000n, 'C'), ngnOn('3000', -100_000_000n)]), /paid for only from the pool \(1010\), payables \(2000\), cash \(1000\)/);
+    await assert.rejects(postLines(id, period, [ngnOn('1200', 100_000_000n, 'C'), ngnOn('3000', -100_000_000n)]), orShape(/paid for only from the pool \(1010\), payables \(2000\), cash \(1000\)/));
     const formM = sharedCost({ amountNgn: 50_000_000n, vehicleIds: ['C'], funding: 'emm_funded' });
     const formMId = await postLines(id, period, formM);
     const arrival = arriveInYard({ vehicleId: 'C', history: await historyOf(id, 'C') });
@@ -928,7 +993,7 @@ describe('phase 2: posting rules through the database', () => {
     await postLines(id, period, swap(formM), { reverses: formMId });
     await postLines(id, period, arriveInYard({ vehicleId: 'C', history: await historyOf(id, 'C') }));
     // Customer A put down a deposit and walked away; customer B buys. A's deposit can't pay for B's car, and goes back to A.
-    await assert.rejects(postLines(id, period, [ngnOn('1000', 1_000n), ngnOn('2100', -1_000n, 'C')]), /every deposit line \(2100\) its car and buyer/);
+    await assert.rejects(postLines(id, period, [ngnOn('1000', 1_000n), ngnOn('2100', -1_000n, 'C')]), orShape(/every deposit line \(2100\) its car and buyer/));
     await postLines(id, period, stockDeposit({ ...job('A'), vehicleId: 'C', amountNgn: 200_000_000n }));
     const sale = sellStockCar({ ...job('B'), vehicleId: 'C', priceNgn: 450_000_000n, history: await historyOf(id, 'C') });
     assert.equal(sale.find((l) => l.account === '1100')?.debit, 450_000_000n, 'B owes the whole price');
@@ -968,6 +1033,11 @@ describe('phase 2: posting rules through the database', () => {
       `SELECT r.rolname || ': ' || p.proname AS who FROM pg_roles r CROSS JOIN pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
         WHERE NOT r.rolsuper AND n.nspname = 'public' AND p.prosecdef AND p.prorettype <> 'trigger'::regtype AND has_function_privilege(r.oid, p.oid, 'EXECUTE') ORDER BY 1`);
     assert.deepEqual(callable.rows.map((r) => r.who), []);
+    // The ledger's helpers aren't definers, but are revoked too (security review of 0015): a blanket grant would show here.
+    const helpers = await owner<{ who: string }>(
+      `SELECT r.rolname || ': ' || p.proname AS who FROM pg_roles r CROSS JOIN pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE NOT r.rolsuper AND n.nspname = 'public' AND p.proname IN ('entry_is_live', 'job_cars_completed', 'entry_line_slots') AND has_function_privilege(r.oid, p.oid, 'EXECUTE') ORDER BY 1`);
+    assert.deepEqual(helpers.rows.map((r) => r.who), []);
   });
 
   test('inventory moves only whole: arrival, sale with revenue, every line naming its car', async () => {
@@ -975,17 +1045,17 @@ describe('phase 2: posting rules through the database', () => {
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 3_000_000n, vehicleId: 'C', spot: SPOT_CBN, funding: 'emm_funded' }).lines);
     const ngnLine = (account: string, signed: bigint, vehicleId?: string): LedgerLine =>
       ({ account, debit: signed > 0n ? signed : 0n, credit: signed < 0n ? -signed : 0n, currency: 'NGN', amountMinor: signed < 0n ? -signed : signed, ...(vehicleId && { vehicleId }) });
-    await assert.rejects(postLines(id, period, [ngnLine('1200', 100n), ngnLine('1000', -100n)]), /1200, 1210\) names its car/);
+    await assert.rejects(postLines(id, period, [ngnLine('1200', 100n), ngnLine('1000', -100n)]), orShape(/1200, 1210\) names its car/));
     // Half the car to the yard: refused. All of it: fine.
-    await assert.rejects(postLines(id, period, [ngnLine('1210', 160_000_000n, 'C'), ngnLine('1200', -160_000_000n, 'C')]), /leaves transit \(1200\) only by moving its whole cost/);
+    await assert.rejects(postLines(id, period, [ngnLine('1210', 160_000_000n, 'C'), ngnLine('1200', -160_000_000n, 'C')]), orShape(/leaves transit \(1200\) only by moving its whole cost/));
     // Out of transit into an expense instead of the yard: refused.
-    await assert.rejects(postLines(id, period, [ngnLine('6000', 320_000_000n), ngnLine('1200', -320_000_000n, 'C')]), /leaves transit \(1200\) only by moving its whole cost/);
+    await assert.rejects(postLines(id, period, [ngnLine('6000', 320_000_000n), ngnLine('1200', -320_000_000n, 'C')]), orShape(/leaves transit \(1200\) only by moving its whole cost/));
     await postLines(id, period, arriveInYard({ vehicleId: 'C', history: await historyOf(id, 'C') }));
     // Written off to cost of sales without a sale, or sold at part of its cost: refused.
-    await assert.rejects(postLines(id, period, [ngnLine('5000', 320_000_000n, 'C'), ngnLine('1210', -320_000_000n, 'C')]), /leaves the yard \(1210\) only when sold/);
+    await assert.rejects(postLines(id, period, [ngnLine('5000', 320_000_000n, 'C'), ngnLine('1210', -320_000_000n, 'C')]), orShape(/leaves the yard \(1210\) only when sold/));
     const sale = sellStockCar({ ...job('C'), priceNgn: 450_000_000n, history: await historyOf(id, 'C') });
     await assert.rejects(postLines(id, period, sale.map((l) => (l.account === '5000' ? { ...l, debit: l.debit - 1n, amountMinor: l.amountMinor - 1n } : l.account === '1210' ? { ...l, credit: l.credit - 1n, amountMinor: l.amountMinor - 1n } : l))),
-      /leaves the yard \(1210\) only when sold/);
+      orShape(/leaves the yard \(1210\) only when sold/));
     // A late in-transit cost after arrival must reach the yard before the car can be sold.
     await postLines(id, period, sharedCost({ amountNgn: 1_000n, vehicleIds: ['C'], funding: 'emm_funded' }));
     await assert.rejects(postLines(id, period, sale), /nothing left in transit/);
@@ -1011,7 +1081,7 @@ describe('phase 2: posting rules through the database', () => {
   // firm reviewer signs it off.
   const UNSIGNED = {
     A: { jobType: 'car_purchase', funding: 'customer_funded' },
-    B: { jobType: 'clearing_only', funding: 'customer_funded' },
+    B: { jobType: 'clearing_only', funding: 'customer_funded', landing: 180_000_000n },
     C: { jobType: 'car_purchase', funding: 'emm_funded' },
   } as const;
   /** The tenant's open flags as [kind, car], cars by their test letter. */
@@ -1032,7 +1102,7 @@ describe('phase 2: posting rules through the database', () => {
         VALUES ($1, $2, $3, $4, $5, '2026-01-05', $6, $7, $8, $9, $10, 0) RETURNING id`,
         [tenant, people[v], emm ? 'car_purchase' : 'clearing_only', funding, emm ? 'fixture: bought ahead of a buyer' : null,
           emm ? 1_000_000n : null, emm ? 'CNY' : null, emm ? '110.000000' : null, emm ? 'manual' : null, emm ? 'FIXTURE_RATE_QUOTE' : null]);
-      await t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, car_price_minor) VALUES ($1, $2, $3, $4)', [tenant, jobs[v], mine[v], emm ? 1_000_000n : null]);
+      await t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, car_price_minor, landing_charge_ngn) VALUES ($1, $2, $3, $4, 0)', [tenant, jobs[v], mine[v], emm ? 1_000_000n : null]);
     });
   };
 
@@ -1077,39 +1147,45 @@ describe('phase 2: posting rules through the database', () => {
       [ngnOn('3000', 1_000n), ngnOn('2150', -1_000n, 'A', 'A')],
       [ngnOn('1100', 1_000n, 'A', 'A'), ngnOn('2150', -1_000n, 'A', 'A')],
       [ngnOn('1000', 2_000n), ngnOn('2150', -1_000n, 'A', 'A'), ngnOn('2150', -1_000n, 'B', 'B')],
-    ]) await assert.rejects(postLines(id, period, forged), /come in only by a receipt from one customer|leave only in the car's completion/); // per car, whichever is checked first
+    ]) await assert.rejects(postLines(id, period, forged), orShape(/come in only by a receipt from one customer|leave only in the car's completion/)); // per car, whichever is checked first
     await assert.rejects(postLines(id, period, customerReceipt({ vehicleId: 'A', counterpartyId: 'B', amountNgn: 1_000n })), /name that job's customer/);
     // ...and leave only as a completion, a refund in cash or a conversion: a forfeit to income is refused (owner 2026-11-15),
     // and so is a cut outside a completion, or revenue that names no car.
-    await assert.rejects(postLines(id, period, [ngnOn('2150', 1_000n, 'A', 'A'), ngnOn('4100', -1_000n, 'A')]), /leave only in the car's completion, a refund/);
-    await assert.rejects(postLines(id, period, [ngnOn('2150', 1_000n, 'A', 'A'), ngnOn('6100', 100n), ngnOn('1000', -1_100n)]), /leave only in the car's completion, a refund/);
-    await assert.rejects(postLines(id, period, [ngnOn('1100', 1_000n, 'A', 'A'), ngnOn('4100', -1_000n, 'A')]), /post only in the car's completion/);
-    await assert.rejects(postLines(id, period, [ngnOn('1000', 1_000n), ngnOn('4100', -1_000n)]), /always name their car/);
-    await postLines(id, period, [ngnOn('2150', 1_000n, 'A', 'A'), ngnOn('1000', -1_000n)]); // the NGN 10.00 overpaid goes back
+    await assert.rejects(postLines(id, period, [ngnOn('2150', 1_000n, 'A', 'A'), ngnOn('4100', -1_000n, 'A')]), orShape(/leave only in the car's completion, a refund/));
+    await assert.rejects(postLines(id, period, [ngnOn('2150', 1_000n, 'A', 'A'), ngnOn('6100', 100n), ngnOn('1000', -1_100n)]), orShape(/leave only in the car's completion, a refund/));
+    await assert.rejects(postLines(id, period, [ngnOn('1100', 1_000n, 'A', 'A'), ngnOn('4100', -1_000n, 'A')]), orShape(/post only in the car's completion/));
+    await assert.rejects(postLines(id, period, [ngnOn('1000', 1_000n), ngnOn('4100', -1_000n)]), orShape(/always name their car/));
+    await postLines(id, period, customerRefund({ ...job('A'), amountNgn: 1_000n, history: await historyOf(id, 'A') })); // the NGN 10.00 overpaid goes back
     // Converted to stock: it posts, flagged until signed off.
     await postLines(id, period, convertToStock({ ...job('A'), history: await historyOf(id, 'A') }));
     assert.deepEqual(await flags(id), [['converted_to_stock', 'A'], ['posted_before_quote', 'D']]);
     await approve(id, 'A', 'converted_to_stock');
     // A supplier's credit note or refund brings a car's job costs down (cash back); nothing else may.
-    await assert.rejects(postLines(id, period, [ngnOn('3000', 400n), ngnOn('1150', -400n, 'D')]), /job costs \(1150\) come down only in its completion, a conversion, or a supplier's credit/);
-    await postLines(id, period, [ngnOn('1000', 400n), ngnOn('1150', -400n, 'D')]); // flagged for a reviewer to check against the supplier's document
-    // Clearing-only B is the customer's own car: no supplier is paid for it. Its completion holds only its own lines, clears
-    // its whole job costs, and happens once; a cost after it is flagged.
+    await assert.rejects(postLines(id, period, [ngnOn('3000', 400n), ngnOn('1150', -400n, 'D')]), SHAPE);
+    await postLines(id, period, supplierCredit({ vehicleId: 'D', amountNgn: 400n, history: await historyOf(id, 'D') })); // flagged for a reviewer to check against the supplier's document
+    // Clearing-only B is the customer's own car: no supplier is paid for it. The database re-performs its completion from B's
+    // own landing charge (NGN 1,800,000.00) and ledger (0015), so a cut moved between lines, a typed charge, or another car's
+    // costs are refused; it completes once, which completes its job; a cost after it is flagged.
     await assert.rejects(postLines(id, period, await pay(id, 'B')), /clearing-only: the customer owns the car, so no supplier is paid for it/);
     await postLines(id, period, sharedCost({ amountNgn: 150_000_000n, vehicleIds: ['B'] }));
     const completion = completeClearingJob({ ...job('B'), landingChargeNgn: 180_000_000n, history: await historyOf(id, 'B') }).lines;
+    const reperformed = /the completion for job order \d+ must match the car's quote and ledger: job costs cleared 150000000, funds held applied 10000000, billed 170000000, car markup 0, clearing margin 30000000, FX 0/;
     const lessCut = (by: bigint) => completion.map((l) => (l.account === '4200' ? { ...l, credit: l.credit - by, amountMinor: l.amountMinor - by } : l));
-    await assert.rejects(postLines(id, period, [...lessCut(1_000n), ngnOn('4900', -1_000n)]), /a completion holds only its car's lines/); // part of the cut to car-less income
-    await assert.rejects(postLines(id, period, [...lessCut(400n), ngnOn('1150', -400n, 'D')]), /a completion holds only its car's lines|can't complete before its quote|come down only in its completion/); // another car's costs
-    await assert.rejects(postLines(id, period, [ngnOn('1150', 1n, 'B'), ...completion.map((l) => (l.account === '1150' ? { ...l, credit: l.credit + 1n, amountMinor: l.amountMinor + 1n } : l))]),
-      /a completion holds only its car's lines/); // a wash on its job costs
+    await assert.rejects(postLines(id, period, [...lessCut(1_000n), ngnOn('4900', -1_000n)]), SHAPE); // part of the cut to car-less income
+    await assert.rejects(postLines(id, period, [...lessCut(1_000n), ngnOn('7000', -1_000n, 'B')]), reperformed); // part of the cut shown as FX
+    await assert.rejects(postLines(id, period, [...lessCut(400n), ngnOn('1150', -400n, 'D')]), SHAPE); // another car's costs
+    await assert.rejects(postLines(id, period, completeClearingJob({ ...job('B'), landingChargeNgn: 190_000_000n, history: await historyOf(id, 'B') }).lines), reperformed); // a typed charge
     await assert.rejects(postLines(id, period, completion.map((l) => (l.account === '1150' ? { ...l, credit: 1n, amountMinor: 1n } : l.account === '4200' ? { ...l, credit: l.credit + 149_999_999n, amountMinor: l.amountMinor + 149_999_999n } : l))),
-      /clears the car's whole job costs \(1150\) to zero/);
+      reperformed);
+    const status = async (v: string) => (await tx(id, (t) => t.client.query<{ status: string }>('SELECT status FROM job_orders WHERE id = $1', [jobIds[id]?.[v]]))).rows[0]?.status;
+    assert.equal(await status('B'), 'quote_accepted');
+    await assert.rejects(tx(id, (t) => t.client.query("UPDATE job_orders SET status = 'completed' WHERE id = $1", [jobIds[id]?.B])), /only the ledger completes a job/);
     await postLines(id, period, completion);
+    assert.equal(await status('B'), 'completed');
     await postLines(id, period, sharedCost({ amountNgn: 1n, vehicleIds: ['B'] })); // a late kobo of cost
-    assert.deepEqual(await flags(id), [['completion_unverified', 'B'], ['cost_after_completion', 'B'], ['cost_credited', 'D'], ['posted_before_quote', 'D'], ['posted_before_quote', 'D']]);
+    assert.deepEqual(await flags(id), [['cost_after_completion', 'B'], ['cost_credited', 'D'], ['posted_before_quote', 'D'], ['posted_before_quote', 'D']]);
     await assert.rejects(postLines(id, period, completeClearingJob({ ...job('B'), landingChargeNgn: 1_000n, history: await historyOf(id, 'B') }).lines), /already completed: a car completes once/);
-    for (const [v, kind] of [['B', 'completion_unverified'], ['B', 'cost_after_completion'], ['D', 'cost_credited']] as const) await approve(id, v, kind);
+    for (const [v, kind] of [['B', 'cost_after_completion'], ['D', 'cost_credited']] as const) await approve(id, v, kind);
     // EMM-funded C: the client's own stock, never customer funds or job costs. Its first posting raises the flag, which stays
     // even if that posting is reversed (it was recorded); the next posting then raises it again, as the car's first live one.
     await assert.rejects(postLines(id, period, customerReceipt({ ...job('C'), amountNgn: 1_000n })), /EMM-funded: its car is stock \(1200, 1210, 2100\), never job costs/);
@@ -1136,10 +1212,335 @@ describe('phase 2: posting rules through the database', () => {
     assert.deepEqual(await flags(id), []);
     await postLines(other, otherPeriod, completeAgentJob({ ...job('A'), quote: { currency: 'CNY', sellingMinor: 4_500_000n, rate: parseRate('110.000000'), landingChargeNgn: 0n }, history: await historyOf(other, 'A') }).lines);
     await postLines(other, otherPeriod, await pay(other, 'A')); // a supplier paid after the completion: a late cost, not covered
-    assert.deepEqual(await flags(other), [['completion_unverified', 'A'], ['cost_after_completion', 'A'], ['supplier_cost_not_covered', 'A'], ['supplier_cost_not_covered', 'A'], ['supplier_cost_not_covered', 'A']]);
+    assert.deepEqual(await flags(other), [['cost_after_completion', 'A'], ['supplier_cost_not_covered', 'A'], ['supplier_cost_not_covered', 'A'], ['supplier_cost_not_covered', 'A']]);
     const tb = await trialBalance(id);
     assert.equal(tb.dr - tb.cr, 0n);
     assert.deepEqual(await chainBreaks(id), []);
+  });
+
+  test('every entry fits the shape of its type; a manual journal keeps off the job accounts (0015)', async () => {
+    const { id, period } = await funded('Entry shapes');
+    const receipt = customerReceipt({ ...job('A'), amountNgn: 1_000n });
+    // An unknown type is refused, and so are the right lines under the wrong type, or a reversal that changes its type.
+    await assert.rejects(postLines(id, period, receipt, { sourceType: 'deposit' }), /deposit is not an entry type/);
+    await assert.rejects(postLines(id, period, receipt, { sourceType: 'customer_refund' }), /a customer_refund entry has no place for that line on 1000/);
+    const receiptId = await postLines(id, period, receipt);
+    await assert.rejects(postLines(id, period, swap(receipt), { reverses: receiptId, sourceType: 'customer_refund' }), /a reversal keeps the entry type of the entry it reverses/);
+    await postLines(id, period, swap(receipt), { reverses: receiptId });
+    // Who a line names is checked against the counterparty itself: customer funds never name the supplier.
+    await assert.rejects(postLines(id, period, customerReceipt({ vehicleId: 'A', counterpartyId: SUPPLIER, amountNgn: 1_000n })), /a customer_receipt entry has no place for that line on 2150/);
+    // Each slot holds as many lines as its type allows; only a car cost splits over several cars.
+    await assert.rejects(postLines(id, period, [...receipt, ...receipt]), /a customer_receipt entry holds 1 to 1 "cash" line\(s\)/);
+    await postLines(id, period, sharedCost({ amountNgn: 3n, vehicleIds: ['A', 'B', 'C'] }));
+    const paid = payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines;
+    await assert.rejects(postLines(id, period, paid.map((l) => (l.account === '1010' ? { ...l, vehicleId: 'B' } : l))), /a pool_payment entry is for one car/);
+    // Manual journals: an NGN supplier bill for a general expense posts; a car, the job accounts or a foreign payable never.
+    await postLines(id, period, [ngnOn('6000', 5_000n), ngnOn('2000', -5_000n, undefined, SUPPLIER)], { sourceType: 'manual_journal' });
+    for (const forged of [
+      [ngnOn('6100', 1_000n, 'A'), ngnOn('1000', -1_000n)],
+      [ngnOn('1150', 1_000n), ngnOn('1000', -1_000n)],
+      [ngnOn('3000', 1_000n), ngnOn('4100', -1_000n)],
+      [ngnOn('2150', 1_000n), ngnOn('3000', -1_000n)],
+      [ngnOn('7100', 1_000n), ngnOn('3000', -1_000n)],
+      [ngnOn('6100', 1_000n), ngnOn('1100', -1_000n)],
+    ]) await assert.rejects(postLines(id, period, forged, { sourceType: 'manual_journal' }), /a manual journal names no car and keeps off the accounts the posting rules own/);
+    // The shapes are the owner's: the app can't read or change them.
+    await assert.rejects(tx(id, (t) => t.client.query('SELECT 1 FROM entry_shapes')), /permission denied/);
+    await assert.rejects(tx(id, (t) => t.client.query('DELETE FROM entry_shapes')), /permission denied/);
+    const tb = await trialBalance(id);
+    assert.equal(tb.dr - tb.cr, 0n);
+  });
+
+  test("worked example: each car's cut re-performed from its own price and landing charge; the job completes with its last car (0015)", async () => {
+    // One job order for two cars, X (CNY 45,000.00, landing NGN 1,500,000.00) and Y (CNY 25,000.00, landing NGN 1,000,000.00),
+    // quoted at FIXTURE_RATE_QUOTE (110). Pool: CNY 150,000.00 for NGN 16,000,000.00 (average 106.666666..).
+    //   X: paid CNY 40,000.00 = NGN 4,266,666.67; container NGN 1,000,000.01 split X 500,000.01, Y 500,000.00.
+    //      markup (45,000 - 40,000) x 110 = 550,000.00; FX 40,000 x 110 - 4,266,666.67 = 133,333.33;
+    //      margin 1,500,000.00 - 500,000.01 = 999,999.99; bill 4,950,000.00 + 1,500,000.00 = 6,450,000.00, from funds held 6,000,000.00, owed 450,000.00.
+    //   Y: paid CNY 20,000.00 from a pool now CNY 110,000.00 / NGN 11,733,333.33 = NGN 2,133,333.33.
+    //      markup (25,000 - 20,000) x 110 = 550,000.00; FX 20,000 x 110 - 2,133,333.33 = 66,666.67;
+    //      margin 1,000,000.00 - 500,000.00 = 500,000.00; bill 2,750,000.00 + 1,000,000.00 = 3,750,000.00, all from funds held 4,000,000.00.
+    const { id, period } = await funded('Two-car job', { held: false });
+    const mine = cars[id];
+    const people = customers[id];
+    const jobs = jobIds[id];
+    assert.ok(mine && people && jobs);
+    const jobId = await tx(id, async (t) => {
+      const quote = await one(t.client, "INSERT INTO documents (tenant_id, doc_type, mime, size_bytes, sha256, original_filename) VALUES ($1, 'accepted_quote', 'application/pdf', 100, $2, 'q.pdf') RETURNING id", [id, 'd'.repeat(64)]);
+      await t.client.query("UPDATE documents SET status = 'stored', evidence_key = 'evidence/' || tenant_id || '/2026/01/' || id || '.pdf', stored_at = now() WHERE id = $1", [quote]);
+      const j = await one(t.client, `INSERT INTO job_orders (tenant_id, customer_id, job_type, ordered_on, car_price_minor, car_price_currency, quote_rate, quote_rate_source, quote_rate_note, landing_charge_ngn)
+        VALUES ($1, $2, 'car_purchase', '2026-01-05', 7000000, 'CNY', '110.000000', 'manual', 'FIXTURE_RATE_QUOTE', 250000000) RETURNING id`, [id, people.A]);
+      for (const [v, price, landing] of [['X', 4_500_000n, 150_000_000n], ['Y', 2_500_000n, 100_000_000n]] as const) {
+        mine[v] = await one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, $2, 'Test', 'Car', 2024) RETURNING id", [id, `TESTCAR${v}000000000`]);
+        people[v] = people.A ?? '';
+        jobs[v] = j;
+        await t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, car_price_minor, landing_charge_ngn) VALUES ($1, $2, $3, $4, $5)', [id, j, mine[v], price, landing]);
+      }
+      await t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2 WHERE id = $1", [j, quote]);
+      return j;
+    });
+    const status = async () => (await tx(id, (t) => t.client.query<{ status: string }>('SELECT status FROM job_orders WHERE id = $1', [jobId]))).rows[0]?.status;
+    const quoteOf = (sellingMinor: bigint, landingChargeNgn: bigint) => ({ currency: 'CNY', sellingMinor, rate: parseRate('110.000000'), landingChargeNgn }); // FIXTURE_RATE_QUOTE
+    await postLines(id, period, customerReceipt({ ...job('X'), amountNgn: 600_000_000n }));
+    await postLines(id, period, customerReceipt({ ...job('Y'), amountNgn: 400_000_000n }));
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'X', spot: SPOT_CBN }).lines);
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 2_000_000n, vehicleId: 'Y', spot: SPOT_CBN }).lines);
+    await postLines(id, period, sharedCost({ amountNgn: 100_000_001n, vehicleIds: ['X', 'Y'] }));
+    const doneX = completeAgentJob({ ...job('X'), quote: quoteOf(4_500_000n, 150_000_000n), history: await historyOf(id, 'X') }).lines;
+    const net = (lines: LedgerLine[]) => Object.fromEntries(lines.map((l) => [l.account, l.debit - l.credit]));
+    assert.deepEqual(net(doneX), { 2150: 600_000_000n, 1100: 45_000_000n, 1150: -476_666_668n, 4100: -55_000_000n, 4200: -99_999_999n, 7000: -13_333_333n });
+    // An FX gain shown as markup, Y's price and landing charge on X, or a typed price: refused, though each balances.
+    const x = /the completion for job order \d+ must match the car's quote and ledger: job costs cleared 476666668, funds held applied 600000000, billed 45000000, car markup 55000000, clearing margin 99999999, FX 13333333/;
+    const swapped = doneX.map((l) => (l.account === '4100' ? { ...l, account: '7000' } : l.account === '7000' ? { ...l, account: '4100' } : l));
+    await assert.rejects(postLines(id, period, swapped), x);
+    await assert.rejects(postLines(id, period, completeAgentJob({ ...job('X'), quote: quoteOf(2_500_000n, 100_000_000n), history: await historyOf(id, 'X') }).lines), x);
+    await assert.rejects(postLines(id, period, completeAgentJob({ ...job('X'), quote: quoteOf(4_500_001n, 150_000_000n), history: await historyOf(id, 'X') }).lines), x);
+    await postLines(id, period, doneX);
+    assert.equal(await status(), 'quote_accepted'); // Y is still open
+    const doneY = completeAgentJob({ ...job('Y'), quote: quoteOf(2_500_000n, 100_000_000n), history: await historyOf(id, 'Y') }).lines;
+    assert.deepEqual(net(doneY), { 2150: 375_000_000n, 1150: -263_333_333n, 4100: -55_000_000n, 4200: -50_000_000n, 7000: -6_666_667n });
+    const doneYId = await postLines(id, period, doneY);
+    assert.equal(await status(), 'completed');
+    // Reversing Y's completion reopens the job; completing it again closes it. Y's leftover NGN 250,000.00 goes back to the customer.
+    await postLines(id, period, swap(doneY), { reverses: doneYId });
+    assert.equal(await status(), 'quote_accepted');
+    await postLines(id, period, doneY);
+    assert.equal(await status(), 'completed');
+    await postLines(id, period, customerRefund({ ...job('Y'), amountNgn: 25_000_000n, history: await historyOf(id, 'Y') }));
+    // X's customer settles the NGN 450,000.00 owed.
+    await postLines(id, period, receivableReceipt({ vehicleId: 'X', counterpartyId: 'A', amountNgn: 45_000_000n, history: await historyOf(id, 'X') })); // X's customer is A's (historyOf names a customer by its first letter)
+    const left = await tx(id, async (t) => (await t.client.query<{ code: string; net: string }>(
+      "SELECT a.code, sum(l.debit_ngn - l.credit_ngn)::text AS net FROM journal_lines l JOIN accounts a ON a.id = l.account_id WHERE l.vehicle_id = ANY ($1) AND a.code IN ('1100', '1150', '2150') GROUP BY a.code ORDER BY a.code",
+      [[mine.X, mine.Y]])).rows);
+    assert.deepEqual(left, [{ code: '1100', net: '0' }, { code: '1150', net: '0' }, { code: '2150', net: '0' }]);
+    assert.deepEqual(await flags(id), []);
+    const tb = await trialBalance(id);
+    assert.equal(tb.dr - tb.cr, 0n);
+    assert.deepEqual(await chainBreaks(id), []);
+  });
+
+  test('job fuzz: random postings through every rule keep each car exactly as the rules say; tampered and mistyped entries are refused (0015)', { timeout: 900_000 }, async () => {
+    let seed = 20261117n;
+    const rnd = (max: bigint) => ((seed = (seed * 6364136223846793005n + 1442695040888963407n) % 2n ** 64n), (seed >> 11n) % max);
+    const pickOf = <T,>(xs: readonly T[]): T => xs[Number(rnd(BigInt(xs.length)))] as T;
+    const { id, period } = await freshTenant('Job fuzz');
+    await jobsFor(id);
+    type Car = { v: string; kind: 'agent' | 'clearing' | 'stock'; price: bigint; landing: bigint; viaInvoice: boolean; stage: 'open' | 'completed' | 'transit' | 'yard' | 'sold' };
+    const fleet: Car[] = [];
+    const mine = cars[id];
+    const people = customers[id];
+    const jobs = jobIds[id];
+    assert.ok(mine && people && jobs);
+    await tx(id, async (t) => {
+      for (let i = 0; i < 200; i++) {
+        const v = `F${String(i)}`;
+        const kind = pickOf(['agent', 'agent', 'agent', 'clearing', 'stock'] as const);
+        const purchase = kind !== 'clearing';
+        const price = rnd(5_000_000n) + 1_000_000n; // CNY 10,000.00-60,000.00
+        const landing = rnd(200_000_000n); // NGN 0-2,000,000.00
+        people[v] = await one(t.client, "INSERT INTO counterparties (tenant_id, kind, name) VALUES ($1, 'customer', $2) RETURNING id", [id, `Customer ${v}`]);
+        mine[v] = await one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, $2, 'Test', 'Car', 2024) RETURNING id", [id, `FUZZCAR${String(i).padStart(10, '0')}`]);
+        const quote = await one(t.client, "INSERT INTO documents (tenant_id, doc_type, mime, size_bytes, sha256, original_filename) VALUES ($1, 'accepted_quote', 'application/pdf', 100, $2, 'q.pdf') RETURNING id",
+          [id, String(i).padStart(64, 'f')]);
+        await t.client.query("UPDATE documents SET status = 'stored', evidence_key = 'evidence/' || tenant_id || '/2026/01/' || id || '.pdf', stored_at = now() WHERE id = $1", [quote]);
+        jobs[v] = await one(t.client,
+          `INSERT INTO job_orders (tenant_id, customer_id, job_type, funding, funding_reason, ordered_on, car_price_minor, car_price_currency, quote_rate, quote_rate_source, quote_rate_note, landing_charge_ngn)
+           VALUES ($1, $2, $3, $4, $5, '2026-01-05', $6, $7, $8, $9, $10, $11) RETURNING id`,
+          [id, people[v], purchase ? 'car_purchase' : 'clearing_only', kind === 'stock' ? 'emm_funded' : 'customer_funded', kind === 'stock' ? 'fixture: bought ahead of a buyer' : null,
+            purchase ? price : null, purchase ? 'CNY' : null, purchase ? '110.000000' : null, purchase ? 'manual' : null, purchase ? 'FIXTURE_RATE_QUOTE' : null, landing]);
+        await t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, car_price_minor, landing_charge_ngn) VALUES ($1, $2, $3, $4, $5)',
+          [id, jobs[v], mine[v], purchase ? price : null, landing]);
+        await t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2 WHERE id = $1", [jobs[v], quote]);
+        fleet.push({ v, kind, price, landing, viaInvoice: kind === 'agent' && rnd(3n) === 0n, stage: kind === 'stock' ? 'transit' : 'open' });
+      }
+    });
+
+    // Everything posted, as the rules built it; balances are read back from here, the way the API reads the ledger.
+    const all: LedgerLine[] = [];
+    const sum = (f: (l: LedgerLine) => boolean, by: (l: LedgerLine) => bigint) => all.filter(f).reduce((s, l) => s + by(l), 0n);
+    const pool = () => ({
+      balanceMinor: sum((l) => l.account === '1010' && l.currency === 'CNY', (l) => (l.debit > 0n ? l.amountMinor : -l.amountMinor)),
+      costNgn: sum((l) => l.account === '1010' && l.currency === 'CNY', (l) => l.debit - l.credit),
+    });
+    const payable = (v: string) => ({
+      balanceMinor: sum((l) => l.account === '2000' && l.vehicleId === v && l.currency === 'CNY', (l) => (l.credit > 0n ? l.amountMinor : -l.amountMinor)),
+      costNgn: sum((l) => l.account === '2000' && l.vehicleId === v && l.currency === 'CNY', (l) => l.credit - l.debit),
+    });
+    const bal = (v: string, account: string) => sum((l) => l.vehicleId === v && l.account === account, (l) => l.debit - l.credit);
+    const TYPES = ['customer_receipt', 'customer_refund', 'receivable_receipt', 'currency_purchase', 'pool_payment', 'supplier_invoice', 'supplier_settlement', 'car_cost',
+      'supplier_credit', 'job_completion', 'stock_deposit', 'stock_deposit_refund', 'yard_arrival', 'stock_sale', 'stock_conversion', 'fx_revaluation', 'manual_journal'];
+    let posted = 0;
+    let refused = 0;
+    let reversed = 0;
+    /** Post one rule's lines; one in thirty is reversed straight away (a mistake corrected). Resolves to whether it stands. */
+    const post = async (sourceType: string, lines: LedgerLine[]) => {
+      if (rnd(25n) === 0n) { // the same lines under another type never fit
+        await assert.rejects(postLines(id, period, lines, { sourceType: pickOf(TYPES.filter((x) => x !== sourceType)) }), SHAPE);
+        refused++;
+      }
+      const entryId = await postLines(id, period, lines, { sourceType });
+      all.push(...lines);
+      posted++;
+      if (sourceType === 'supplier_invoice' || rnd(30n) !== 0n) return true;
+      await postLines(id, period, swap(lines), { reverses: entryId });
+      all.push(...swap(lines));
+      reversed++;
+      return false;
+    };
+    const cash = () => rnd(300_000_000n) + 1n;
+
+    const N = 8_000;
+    for (let step = 0; step < N; step++) {
+      if (pool().balanceMinor < 2_000_000n || rnd(15n) === 0n) {
+        const rateScaled = rnd(150n * RATE_SCALE) + 50n * RATE_SCALE; // fixture range (50-200) for property testing, not real rates
+        await post('currency_purchase', buyCurrency({ currency: 'CNY', amountMinor: rnd(10_000_000n) + 1_000_000n, rate: rateScaled, rateSource: 'bdc_receipt' }));
+        continue;
+      }
+      const c = pickOf(fleet);
+      const held = -bal(c.v, '2150');
+      const choice = rnd(10n);
+      if (c.kind !== 'stock' && c.stage === 'open') {
+        const carMinor = sum((l) => l.vehicleId === c.v && l.currency === 'CNY' && (l.account === '1010' || (l.account === '2000' && l.rateSource === 'agent_invoice')), (l) => (l.credit > 0n ? l.amountMinor : -l.amountMinor));
+        if (choice < 3n) await post('customer_receipt', customerReceipt({ ...job(c.v), amountNgn: cash() }));
+        else if (choice < 5n && c.kind === 'agent' && !c.viaInvoice) {
+          const amountMinor = rnd(pool().balanceMinor / 2n) + 10_000n;
+          await post('pool_payment', payFromPool({ pool: pool(), currency: 'CNY', amountMinor, vehicleId: c.v, spot: SPOT_CBN }).lines);
+        } else if (choice < 5n && c.kind === 'agent') {
+          const owed = payable(c.v);
+          if (owed.balanceMinor === 0n || rnd(2n) === 0n) {
+            const rate = rnd(150n * RATE_SCALE) + 50n * RATE_SCALE; // fixture range, as above
+            await post('supplier_invoice', supplierInvoice({ vehicleId: c.v, supplierId: SUPPLIER, currency: 'CNY', amountMinor: rnd(3_000_000n) + 10_000n, rate, spot: SPOT_CBN }));
+          } else {
+            const cap = owed.balanceMinor < pool().balanceMinor ? owed.balanceMinor : pool().balanceMinor;
+            await post('supplier_settlement', payPayableFromPool({ vehicleId: c.v, supplierId: SUPPLIER, pool: pool(), payable: owed, currency: 'CNY', amountMinor: rnd(cap) + 1n, spot: SPOT_CBN }).lines);
+          }
+        } else if (choice < 7n) {
+          const open = fleet.filter((o) => o.kind !== 'stock' && o.stage === 'open' && o.v !== c.v);
+          const others = open.length > 0 && rnd(2n) === 0n ? [pickOf(open).v] : [];
+          await post('car_cost', sharedCost({ amountNgn: rnd(50_000_000n) + 3n, vehicleIds: [c.v, ...others] }));
+        } else if (choice < 8n && rnd(4n) === 0n && bal(c.v, '1150') > 1n) {
+          await post('supplier_credit', supplierCredit({ vehicleId: c.v, amountNgn: rnd(bal(c.v, '1150') / 2n) + 1n, history: all }));
+        } else if (choice < 8n && held > 0n) {
+          await post('customer_refund', customerRefund({ ...job(c.v), amountNgn: rnd(held) + 1n, history: all }));
+        } else if (choice === 9n && rnd(3n) === 0n && bal(c.v, '1150') > 0n && (c.kind === 'clearing' || carMinor > 0n)) {
+          const done = c.kind === 'agent'
+            ? completeAgentJob({ ...job(c.v), quote: { currency: 'CNY', sellingMinor: c.price, rate: parseRate('110.000000'), landingChargeNgn: c.landing }, history: all }).lines // FIXTURE_RATE_QUOTE
+            : completeClearingJob({ ...job(c.v), landingChargeNgn: c.landing, history: all }).lines;
+          // A kobo moved between two lines the completion already has (cut to FX, markup to margin, bill to funds held):
+          // it still fits the shape and balances, so only the re-performance can refuse it.
+          const bump = (ls: LedgerLine[], account: string, by: bigint) => ls.map((l) => (l.account !== account ? l
+            : l.credit > 0n ? { ...l, credit: l.credit + by, amountMinor: l.amountMinor + by } : { ...l, debit: l.debit - by, amountMinor: l.amountMinor - by }));
+          const sound = (ls: LedgerLine[]) => ls.every((l) => (l.debit > 0n) !== (l.credit > 0n));
+          const pair = pickOf([['4100', '7000'], ['4200', '7000'], ['4100', '4200'], ['1100', '2150']] as const);
+          if (rnd(4n) === 0n && pair.every((acc) => done.some((l) => l.account === acc))) {
+            const tampered = bump(bump(done, pair[0], -1n), pair[1], 1n);
+            if (sound(tampered)) {
+              await assert.rejects(postLines(id, period, tampered, { sourceType: 'job_completion' }), /must match the car's quote and ledger/);
+              refused++;
+            }
+          }
+          if (await post('job_completion', done)) c.stage = 'completed';
+        }
+      } else if (c.stage === 'completed') {
+        const owed = bal(c.v, '1100');
+        if (choice < 5n && owed > 0n) await post('receivable_receipt', receivableReceipt({ ...job(c.v), amountNgn: rnd(owed) + 1n, history: all }));
+        else if (held > 0n) await post('customer_refund', customerRefund({ ...job(c.v), amountNgn: held, history: all }));
+      } else if (c.stage === 'transit') {
+        const paidFor = sum((l) => l.vehicleId === c.v && l.account === '1010', (l) => l.credit - l.debit) > 0n;
+        if (choice < 4n) {
+          await post('pool_payment', payFromPool({ pool: pool(), currency: 'CNY', amountMinor: rnd(pool().balanceMinor / 2n) + 10_000n, vehicleId: c.v, spot: SPOT_CBN, funding: 'emm_funded' }).lines);
+        } else if (choice < 7n) {
+          await post('car_cost', sharedCost({ amountNgn: rnd(50_000_000n) + 1n, vehicleIds: [c.v], funding: 'emm_funded' }));
+        } else if (paidFor) {
+          if (await post('yard_arrival', arriveInYard({ vehicleId: c.v, history: all }))) c.stage = 'yard';
+        }
+      } else if (c.stage === 'yard') {
+        const deposits = -bal(c.v, '2100');
+        if (choice < 4n) await post('stock_deposit', stockDeposit({ ...job(c.v), amountNgn: cash() }));
+        else if (choice < 6n && deposits > 0n) await post('stock_deposit_refund', refundStockDeposit({ ...job(c.v), amountNgn: rnd(deposits) + 1n, history: all }));
+        else if (choice === 9n && rnd(3n) === 0n) {
+          if (await post('stock_sale', sellStockCar({ ...job(c.v), priceNgn: deposits + rnd(500_000_000n) + 1n, history: all }))) c.stage = 'sold';
+        }
+      }
+    }
+
+    // The database holds exactly what the rules built, car by car and account by account.
+    const rows = (await tx(id, (t) => t.client.query<{ vehicle_id: string; code: string; net: string }>(
+      'SELECT l.vehicle_id, a.code, sum(l.debit_ngn - l.credit_ngn)::text AS net FROM journal_lines l JOIN accounts a ON a.id = l.account_id WHERE l.vehicle_id IS NOT NULL GROUP BY 1, 2'))).rows;
+    const letter = new Map(Object.entries(mine).map(([v, uuid]) => [uuid, v]));
+    const fromDb = Object.fromEntries(rows.filter((r) => r.net !== '0').map((r) => [`${letter.get(r.vehicle_id) ?? '?'} ${r.code}`, BigInt(r.net)]));
+    const nets = new Map<string, bigint>();
+    for (const l of all) if (l.vehicleId) nets.set(`${l.vehicleId} ${l.account}`, (nets.get(`${l.vehicleId} ${l.account}`) ?? 0n) + l.debit - l.credit);
+    assert.deepEqual(fromDb, Object.fromEntries([...nets].filter(([, n]) => n !== 0n)));
+    // Every completed car's job is completed with its job costs cleared; customer funds and the pool never went below zero.
+    const statuses = (await tx(id, (t) => t.client.query<{ id: string; status: string }>('SELECT id, status FROM job_orders'))).rows;
+    for (const c of fleet) {
+      assert.equal(statuses.find((s) => s.id === jobs[c.v])?.status, c.stage === 'completed' ? 'completed' : 'quote_accepted', c.v);
+      if (c.stage === 'completed') assert.equal(bal(c.v, '1150'), 0n, c.v);
+      assert.ok(bal(c.v, '2150') <= 0n, c.v);
+    }
+    assert.ok(pool().balanceMinor >= 0n);
+    assert.ok(fleet.filter((c) => c.stage === 'completed').length > 10 && fleet.some((c) => c.stage === 'sold'), 'the walk reached completions and sales');
+    assert.ok(posted > 3_000 && refused > 120 && reversed > 50, `posted ${String(posted)}, refused ${String(refused)}, reversed ${String(reversed)}`);
+    const tb = await trialBalance(id);
+    assert.equal(tb.dr - tb.cr, 0n, 'trial balance nets to zero');
+    assert.deepEqual(await chainBreaks(id), []);
+  });
+
+  test('worked example: half-kobo ties round up; receivables never go below zero or name another customer; a negative cut is flagged (ledger audit of 0015)', async () => {
+    // Car A: CNY 45,000.01 quoted at FIXTURE_RATE_QUOTE_TIE (108.5), landing NGN 0.00. A USD 1,000.00 payment made by mistake
+    // and reversed, then CNY 40,000.01 from the pool (CNY 150,000.00 for NGN 16,000,000.00):
+    //   4,000,001 x 1,600,000,000 / 15,000,000 = 426,666,773.33 -> NGN 4,266,667.73 paid
+    //   price 4,500,001 x 108.5 = 488,250,108.5 -> 488,250,109 (a tie, half-up); cost at quote 4,000,001 x 108.5 = 434,000,108.5 -> 434,000,109
+    //   markup 488,250,109 - 434,000,109 = NGN 542,500.00; FX 434,000,109 - 426,666,773 = NGN 73,333.36; all from funds held.
+    // Car B (clearing-only, landing NGN 1,000,000.00) costs NGN 1,500,000.00: its margin is -NGN 500,000.00, flagged.
+    const { id, period } = await funded('Audit of 0015', { held: false, jobs: {
+      A: { ...CUSTOMER_JOB, price: 4_500_001n, rate: '108.500000' }, // FIXTURE_RATE_QUOTE_TIE
+      B: { jobType: 'clearing_only', funding: 'customer_funded', landing: 100_000_000n },
+    } });
+    await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 600_000_000n }));
+    await postLines(id, period, buyCurrency({ currency: 'USD', amountMinor: 100_000n, rate: parseRate('1500.000000'), rateSource: 'manual', rateNote: 'FIXTURE_RATE_USD' }));
+    const usd = payFromPool({ pool: { balanceMinor: 100_000n, costNgn: 150_000_000n }, currency: 'USD', amountMinor: 100_000n, vehicleId: 'A',
+      spot: { rate: parseRate('1500.000000'), source: 'manual' }, rateNote: 'FIXTURE_RATE_USD: wrong currency, reversed' }).lines;
+    const usdId = await postLines(id, period, usd);
+    await postLines(id, period, swap(usd), { reverses: usdId });
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_001n, vehicleId: 'A', spot: SPOT_CBN }).lines);
+    const doneA = completeAgentJob({ ...job('A'), quote: { currency: 'CNY', sellingMinor: 4_500_001n, rate: parseRate('108.500000'), landingChargeNgn: 0n }, history: await historyOf(id, 'A') }).lines;
+    assert.deepEqual(Object.fromEntries(doneA.map((l) => [l.account, l.debit - l.credit])), { 2150: 488_250_109n, 1150: -426_666_773n, 4100: -54_250_000n, 7000: -7_333_336n });
+    await postLines(id, period, doneA);
+    // B: nothing is owed before its completion, so no receivable receipt yet; after it, only B's own customer pays, up to what they owe.
+    await postLines(id, period, customerReceipt({ ...job('B'), amountNgn: 10_000_000n }));
+    await postLines(id, period, sharedCost({ amountNgn: 150_000_000n, vehicleIds: ['B'] }));
+    const owes = /what a customer owes for a car \(1100\) is paid only up to what they owe/;
+    await assert.rejects(postLines(id, period, [ngnOn('1000', 1_000n), ngnOn('1100', -1_000n, 'B', 'B')]), owes); // a deposit booked as a receivable
+    const doneB = completeClearingJob({ ...job('B'), landingChargeNgn: 100_000_000n, history: await historyOf(id, 'B') }).lines;
+    const doneBId = await postLines(id, period, doneB);
+    await assert.rejects(postLines(id, period, [ngnOn('1000', 90_000_000n), ngnOn('1100', -90_000_000n, 'B', 'A')]), owes); // A owes nothing for B
+    await assert.rejects(postLines(id, period, [ngnOn('1000', 90_000_001n), ngnOn('1100', -90_000_001n, 'B', 'B')]), owes);
+    await postLines(id, period, receivableReceipt({ ...job('B'), amountNgn: 90_000_000n, history: await historyOf(id, 'B') }));
+    // Undoing B's completion now would leave the customer's payment with no bill: reverse the payment first.
+    await assert.rejects(postLines(id, period, swap(doneB), { reverses: doneBId }), owes);
+    // C: the supplier credits NGN 20,000.00, then the customer walks away: the car still converts to stock (it never completed).
+    await postLines(id, period, customerReceipt({ ...job('C'), amountNgn: 200_000_000n }));
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'C', spot: SPOT_CBN }).lines);
+    await postLines(id, period, sharedCost({ amountNgn: 5_000_000n, vehicleIds: ['C'] }));
+    await postLines(id, period, supplierCredit({ vehicleId: 'C', amountNgn: 2_000_000n, history: await historyOf(id, 'C') }));
+    await postLines(id, period, convertToStock({ ...job('C'), history: await historyOf(id, 'C') }));
+    assert.deepEqual(await flags(id), [['converted_to_stock', 'C'], ['cost_credited', 'C'], ['negative_cut', 'B']]);
+    const tb = await trialBalance(id);
+    assert.equal(tb.dr - tb.cr, 0n);
+    assert.deepEqual(await chainBreaks(id), []);
+  });
+
+  test('a car sold to its customer below its cost at the quote rate posts a negative markup, flagged (ledger audit of 0015)', async () => {
+    // Car A quoted CNY 30,000.00 at FIXTURE_RATE_QUOTE (110) but paid CNY 40,000.00: markup (30,000 - 40,000) x 110 = -NGN 1,100,000.00.
+    const { id, period } = await funded('Negative markup', { held: false, jobs: { A: { ...CUSTOMER_JOB, price: 3_000_000n } } });
+    await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 600_000_000n }));
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
+    const done = completeAgentJob({ ...job('A'), quote: { currency: 'CNY', sellingMinor: 3_000_000n, rate: parseRate('110.000000'), landingChargeNgn: 0n }, history: await historyOf(id, 'A') }).lines;
+    assert.equal(done.find((l) => l.account === '4100')?.debit, 110_000_000n);
+    await postLines(id, period, done);
+    assert.deepEqual(await flags(id), [['negative_cut', 'A']]);
   });
 
   test('a sign-off answers one flag, by a firm reviewer or admin who touched nothing the flag is about (0014)', async () => {
@@ -1209,7 +1610,7 @@ describe('phase 2: posting rules through the database', () => {
         }
       };
       const add = (job: string, vehicle: string, price: bigint | null) => savepoint(() =>
-        t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, car_price_minor) VALUES ($1, $2, $3, $4)', [id, job, vehicle, price]));
+        t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, car_price_minor, landing_charge_ngn) VALUES ($1, $2, $3, $4, 0)', [id, job, vehicle, price]));
       const [x, y] = [await car('TESTCARX000000000'), await car('TESTCARY000000000')];
       await assert.rejects(add(purchase, x, null), /each car on a car purchase needs its own quoted price/);
       await add(purchase, x, 4_000_000n);
@@ -1326,34 +1727,34 @@ describe('phase 2: posting rules through the database', () => {
     await assert.rejects(postLines(id, period, [ngn('1150', 100_000_000n, 0n, { vehicleId: 'A' }), ngn('1010', 0n, 100_000_000n)]), /holds foreign currency only/);
     // "Pay" the CNY invoice in NGN, leaving its CNY balance open to be paid again: named, unnamed, or in the invoice's own entry.
     const payNgn = ngn('2000', 210_000_000n, 0n, { vehicleId: 'A', counterpartyId: SUPPLIER });
-    await assert.rejects(postLines(id, period, [payNgn, ngn('1000', 0n, 210_000_000n)]), /more NGN than is owed/);
+    await assert.rejects(postLines(id, period, [payNgn, ngn('1000', 0n, 210_000_000n)]), orShape(/more NGN than is owed/));
     await assert.rejects(postLines(id, period, [ngn('2000', 210_000_000n, 0n), ngn('1000', 0n, 210_000_000n)]), /must name the supplier/);
     await assert.rejects(postLines(id, period, [ngn('6000', 1_000n, 0n), ngn('2000', 0n, 1_000n)]), /must name the supplier/); // an unnamed bill could never be paid
     const invoiceB = supplierInvoice({ vehicleId: 'B', supplierId: SUPPLIER, currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN });
-    await assert.rejects(postLines(id, period, [{ ...payNgn, vehicleId: 'B' }, ...invoiceB, ngn('1000', 0n, 210_000_000n)]), /more NGN than is owed/);
+    await assert.rejects(postLines(id, period, [{ ...payNgn, vehicleId: 'B' }, ...invoiceB, ngn('1000', 0n, 210_000_000n)]), orShape(/more NGN than is owed/));
     await postLines(id, period, payPayableFromPool({ ...bill, pool: await poolOf(id), payable: await payableOf(id), currency: 'CNY', amountMinor: 2_000_000n, spot: SPOT_CBN }).lines);
     // An NGN bill and its payment post; paying a kobo more than the bill does not.
     await postLines(id, period, [ngn('6000', 5_000_000n, 0n), ngn('2000', 0n, 5_000_000n, { counterpartyId: SUPPLIER })]);
-    await assert.rejects(postLines(id, period, [ngn('2000', 5_000_001n, 0n, { counterpartyId: SUPPLIER }), ngn('1000', 0n, 5_000_001n)]), /more NGN than is owed/);
+    await assert.rejects(postLines(id, period, [ngn('2000', 5_000_001n, 0n, { counterpartyId: SUPPLIER }), ngn('1000', 0n, 5_000_001n)]), orShape(/more NGN than is owed/));
     await postLines(id, period, [ngn('2000', 5_000_000n, 0n, { counterpartyId: SUPPLIER }), ngn('1000', 0n, 5_000_000n)]);
   });
 
   test('a car\'s supplier cost goes to that car\'s job costs, and a settlement cannot pay a car from the pool as well', async () => {
     const { id, period } = await funded('Entry shape');
     const pay = payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines;
-    const cost = /must go to that car's job costs \(1150\)/;
+    const cost = orShape(/must go to that car's job costs \(1150\)/);
     await assert.rejects(postLines(id, period, pay.map((l) => (l.account === '1010' ? { ...l, vehicleId: 'B' } : l))), cost); // pool names B, 1150 names A
     const inv = supplierInvoice({ ...bill, currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN });
     await assert.rejects(postLines(id, period, inv.map((l) => (l.account === '1150' ? { ...l, account: '6000', vehicleId: undefined } : l))), cost); // invoice expensed, car never costed
     await postLines(id, period, inv);
     const settle = payPayableFromPool({ ...bill, pool: await poolOf(id), payable: await payableOf(id), currency: 'CNY', amountMinor: 2_000_000n, spot: SPOT_CBN }).lines;
-    const shape = /a supplier settlement holds only the payable \(2000\), the pool \(1010, no car\) and realized FX \(7000\)/;
-    await assert.rejects(postLines(id, period, settle.map((l) => (l.account === '1010' ? { ...l, vehicleId: 'A' } : l))), /settle a supplier invoice in the same entry/); // pool line names the car
+    const shape = orShape(/a supplier settlement holds only the payable \(2000\), the pool \(1010, no car\) and realized FX \(7000\)/);
+    await assert.rejects(postLines(id, period, settle.map((l) => (l.account === '1010' ? { ...l, vehicleId: 'A' } : l))), orShape(/settle a supplier invoice in the same entry/)); // pool line names the car
     await assert.rejects(postLines(id, period, settle.map((l) => (l.account === '7000' ? { ...l, account: '1150', vehicleId: 'B' } : l))), shape); // FX gap into car B's cost
     // Clear the payable with no currency leaving the pool, as "income": refused.
     const [payableLine] = settle;
     if (!payableLine) throw new Error('settlement has a payable line');
-    await assert.rejects(postLines(id, period, [payableLine, { account: '7000', debit: 0n, credit: payableLine.debit, currency: 'NGN', amountMinor: payableLine.debit }]), /an invoice is settled only from the pool/);
+    await assert.rejects(postLines(id, period, [payableLine, { account: '7000', debit: 0n, credit: payableLine.debit, currency: 'NGN', amountMinor: payableLine.debit }]), orShape(/an invoice is settled only from the pool/));
     await postLines(id, period, settle);
   });
 
@@ -1362,7 +1763,7 @@ describe('phase 2: posting rules through the database', () => {
     await owner("UPDATE accounts SET code = '7999' WHERE tenant_id = $1 AND code = '7000'", [id]); // the app can't recode accounts; the owner sets up the odd chart
     await postLines(id, period, supplierInvoice({ ...bill, currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN }));
     const settle = payPayableFromPool({ ...bill, pool: await poolOf(id), payable: await payableOf(id), currency: 'CNY', amountMinor: 2_000_000n, spot: SPOT_CBN }).lines;
-    await assert.rejects(postLines(id, period, settle.map((l) => (l.account === '7000' ? { ...l, account: '1150', vehicleId: 'B' } : l))), /a supplier settlement holds only/);
+    await assert.rejects(postLines(id, period, settle.map((l) => (l.account === '7000' ? { ...l, account: '1150', vehicleId: 'B' } : l))), orShape(/a supplier settlement holds only/));
   });
 
   test('a car paid straight from the pool cannot be invoiced too, and a reversal cannot be reversed', async () => {
@@ -1382,16 +1783,16 @@ describe('phase 2: posting rules through the database', () => {
     const { id, period } = await funded('Car-less pool payment');
     const lines = payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines;
     const carless = lines.map((l) => (l.account === '1010' ? { ...l, vehicleId: undefined } : l));
-    await assert.rejects(postLines(id, period, carless), /must name the car, or settle a supplier invoice/);
+    await assert.rejects(postLines(id, period, carless), orShape(/must name the car, or settle a supplier invoice/));
     // Clearing the tenant setting before COMMIT must not blind the commit-time check (security review).
-    await assert.rejects(postLines(id, period, carless, { beforeCommit: (c) => c.query("SELECT set_config('app.tenant_id', '', true)") }), /must name the car, or settle a supplier invoice/);
+    await assert.rejects(postLines(id, period, carless, { beforeCommit: (c) => c.query("SELECT set_config('app.tenant_id', '', true)") }), orShape(/must name the car, or settle a supplier invoice/));
     await postLines(id, period, supplierInvoice({ ...bill, currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN }));
     // Pays CNY 20,000.00 from the pool but settles only CNY 10,000.00 of the invoice: refused.
     const settled = payPayableFromPool({ ...bill, pool: await poolOf(id), payable: await payableOf(id), currency: 'CNY', amountMinor: 1_000_000n, spot: SPOT_CBN });
     const settle = settled.lines;
     const extra = payFromPool({ pool: settled.pool, currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines
       .map((l) => (l.account === '1010' ? { ...l, vehicleId: undefined, counterpartyId: SUPPLIER } : { ...l, account: '6000', vehicleId: undefined }));
-    await assert.rejects(postLines(id, period, [...settle, ...extra]), /must name the car, or settle a supplier invoice/);
+    await assert.rejects(postLines(id, period, [...settle, ...extra]), orShape(/must name the car, or settle a supplier invoice/));
     await postLines(id, period, settle);
   });
 
@@ -1430,19 +1831,20 @@ describe('phase 1 gate', () => {
     const ngnCodes = ['1000', '3000', '4900', '6100', '6000', '7000']; // vehicle revenue always names a car (0014)
     const pick = () => ngnCodes[Number(rnd(BigInt(ngnCodes.length)))] ?? '1000';
 
-    // Random balanced entry: 1-3 lines on one side (NGN, or CNY into the pool 1010), the same total
-    // split over 1-3 NGN lines on the other side. Half the time the sides are swapped.
+    // Random balanced entry. One in eight is a currency purchase (CNY into the pool 1010, paid from cash: its own entry type,
+    // 0015); the rest are manual journals: 1-3 NGN lines on one side, the same total split over 1-3 NGN lines on the other,
+    // half the time with the sides swapped.
     const randomEntry = (): Entry => {
-      const side: Line[] = [];
-      for (let i = 0, n = Number(rnd(3n)) + 1; i < n; i++) {
-        if (rnd(4n) === 0n) {
-          const amountMinor = rnd(10n ** 9n) + 10_000n;
-          const rateScaled = rnd(2_000n * RATE_SCALE) + RATE_SCALE / 100n; // fixture range (0.01-2000) for property testing, not real rates
-          side.push({ account: '1010', debit: convert(amountMinor, rateScaled), currency: 'CNY', amountMinor, rate: rateString(rateScaled), rateSource: 'bank_receipt' });
-        } else {
-          side.push({ account: pick(), debit: rnd(10n ** 11n) + 100n });
-        }
+      const date = `2026-01-${String(Number(rnd(31n)) + 1).padStart(2, '0')}`;
+      if (rnd(8n) === 0n) {
+        const amountMinor = rnd(10n ** 9n) + 10_000n;
+        const rateScaled = rnd(2_000n * RATE_SCALE) + RATE_SCALE / 100n; // fixture range (0.01-2000) for property testing, not real rates
+        const cost = convert(amountMinor, rateScaled);
+        return { periodId: periodA, date, sourceType: 'currency_purchase', lines: [
+          { account: '1010', debit: cost, currency: 'CNY', amountMinor, rate: rateString(rateScaled), rateSource: 'bank_receipt' }, { account: '1000', credit: cost }] };
       }
+      const side: Line[] = [];
+      for (let i = 0, n = Number(rnd(3n)) + 1; i < n; i++) side.push({ account: pick(), debit: rnd(10n ** 11n) + 100n });
       const total = side.reduce((s, l) => s + (l.debit ?? 0n), 0n);
       const parts = Number(rnd(3n)) + 1;
       const other: Line[] = [];
@@ -1453,10 +1855,9 @@ describe('phase 1 gate', () => {
         left -= share;
       }
       other.push({ account: pick(), credit: left });
-      // Currency only leaves the pool (1010) at its average cost, so a flipped foreign line goes to an account without a pool.
-      const flip = (l: Line): Line => ({ ...l, account: l.account === '1010' ? '4900' : l.account, debit: l.credit ?? 0n, credit: l.debit ?? 0n });
+      const flip = (l: Line): Line => ({ ...l, debit: l.credit ?? 0n, credit: l.debit ?? 0n });
       const lines = rnd(2n) === 0n ? [...side, ...other] : [...side.map(flip), ...other.map(flip)];
-      return { periodId: periodA, date: `2026-01-${String(Number(rnd(31n)) + 1).padStart(2, '0')}`, lines };
+      return { periodId: periodA, date, sourceType: 'manual_journal', lines };
     };
 
     const entriesBefore = await count(tenantA, 'journal_entries');
@@ -1694,18 +2095,23 @@ describe('job orders and documents (migration 0013)', () => {
     await store(tenantA, pending);
     await assert.rejects(accept(pending), /add its cars/);
     const car = await tx(tenantA, (t) => one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, 'JM1BK32F781234567', 'Mazda', '3', 2019) RETURNING id", [tenantA]));
-    await tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id) VALUES ($1, $2, $3)', [tenantA, j, car]));
+    // Each car carries its own landing charge (owner 2026-11-17): together they make the job's NGN 1,500,000.00.
+    const carB = await tx(tenantA, (t) => one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, 'JM1BK32F781234570', 'Mazda', '3', 2019) RETURNING id", [tenantA]));
+    await tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, landing_charge_ngn) VALUES ($1, $2, $3, 100000000)', [tenantA, j, car]));
+    await assert.rejects(accept(pending), /the cars' own landing charges must add up to the job's landing charge/);
+    await assert.rejects(tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, landing_charge_ngn) VALUES ($1, $2, $3, -1)', [tenantA, j, carB])), /job_order_vehicles_landing_charge/);
+    await tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, landing_charge_ngn) VALUES ($1, $2, $3, 50000000)', [tenantA, j, carB]));
     await accept(pending);
     await assert.rejects(accept(pending), /not an allowed change/);
     const j3 = await tx(tenantA, (t) => job(t, tenantA, c));
     const car3 = await tx(tenantA, (t) => one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, 'JM1BK32F781234569', 'Mazda', '3', 2019) RETURNING id", [tenantA]));
-    await tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id) VALUES ($1, $2, $3)', [tenantA, j3, car3]));
+    await tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, landing_charge_ngn) VALUES ($1, $2, $3, 150000000)', [tenantA, j3, car3]));
     await assert.rejects(tx(tenantA, (t) => t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2 WHERE id = $1", [j3, pending])), /job_orders_one_job_per_quote/);
     await assert.rejects(tx(tenantA, (t) => t.client.query("UPDATE job_orders SET landing_charge_ngn = 1 WHERE id = $1", [j])), /permission denied/);
     const car2 = await tx(tenantA, (t) => one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, 'JM1BK32F781234568', 'Mazda', '3', 2019) RETURNING id", [tenantA]));
-    await assert.rejects(tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id) VALUES ($1, $2, $3)', [tenantA, j, car2])), /only before its quote is accepted/);
+    await assert.rejects(tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, landing_charge_ngn) VALUES ($1, $2, $3, 0)', [tenantA, j, car2])), /only before its quote is accepted/);
     const j2 = await tx(tenantA, (t) => job(t, tenantA, c));
-    await assert.rejects(tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id) VALUES ($1, $2, $3)', [tenantA, j2, car])), /one_job_per_car/);
+    await assert.rejects(tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, landing_charge_ngn) VALUES ($1, $2, $3, 0)', [tenantA, j2, car])), /one_job_per_car/);
     const audit = await owner<{ action: string }>("SELECT action FROM audit_log WHERE entity = 'job_orders' AND entity_id = $1 ORDER BY at", [j]);
     assert.deepEqual(audit.rows.map((r) => r.action), ['insert', 'update']);
   });
