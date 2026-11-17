@@ -8,7 +8,7 @@ _Last updated: 2026-11-17 (session: job orders in the ledger, record-then-flag, 
 
 ## Start here (next session)
 
-1. **Where the code is:** branch `phase2-revaluation` (**not merged to `main`**; ask the owner before merging or pushing). New since `69860c7`: the ledger side of job orders (migration 0014, ADR 0016).
+1. **Where the code is:** `main` and `phase2-revaluation` are both at `f5e6405` (fast-forwarded and pushed 2026-11-17, owner's instruction); ask the owner before pushing or merging again. New since `69860c7`: the ledger side of job orders (migration 0014, ADR 0016).
    - Every car an entry names must be on a job order, and funding decides the side (1150 vs 1200).
    - Customer funds held (2150) come in only as a cash receipt from the job's customer, and leave only in a completion, a refund or a conversion.
    - The cut posts only in a completion that clears 1150 and needs the accepted quote. Revenue always names its car.
