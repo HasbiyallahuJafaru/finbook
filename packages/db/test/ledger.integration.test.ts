@@ -8,7 +8,7 @@ import pg from 'pg';
 import { vinProblem } from '@app/contracts';
 import { convert, formatRate, parseRate, RATE_SCALE } from '@app/money';
 import {
-  arriveInYard, buyCurrency, completeAgentJob, convertToStock, customerReceipt, payFromPool, payPayableFromPool, refundStockDeposit, revalue, sellStockCar, sharedCost, stockDeposit,
+  arriveInYard, buyCurrency, completeAgentJob, completeClearingJob, convertToStock, customerReceipt, payFromPool, payPayableFromPool, refundStockDeposit, revalue, sellStockCar, sharedCost, stockDeposit,
   supplierInvoice,
   type Line as LedgerLine, type RevaluationItem,
 } from '@app/ledger';
@@ -89,7 +89,7 @@ async function freshTenant(name: string): Promise<{ id: string; period: string }
   accounts[id] = ids;
   const period = await tx(id, async (t) => {
     for (const [code, type, currency] of [['1000', 'asset', null], ['1010', 'asset', null], ['1020', 'asset', 'CNY'], ['2000', 'liability', null], ['3000', 'equity', null],
-      ['4000', 'income', null], ['5000', 'expense', null], ['6000', 'expense', null], ['7000', 'income', null],
+      ['4000', 'income', null], ['5000', 'expense', null], ['6000', 'expense', null], ['7000', 'income', null], ['4900', 'income', null], ['6100', 'expense', null],
       ['1100', 'asset', null], ['1150', 'asset', null], ['2150', 'liability', null], ['4100', 'income', null], ['4200', 'income', null],
       ['1019', 'asset', null], ['2009', 'liability', null], ['7100', 'income', null],
       ['1200', 'asset', null], ['1210', 'asset', null], ['2100', 'liability', null]] as const) {
@@ -393,8 +393,64 @@ describe('tenant isolation', () => {
 });
 
 describe('phase 2: posting rules through the database', () => {
-  const car: Record<string, string> = { A: '019a0000-0000-7000-8000-00000000000a', B: '019a0000-0000-7000-8000-00000000000b', C: '019a0000-0000-7000-8000-00000000000c' };
-  const customer = (v: string) => `019a0000-0000-7000-8000-0000000000c${v.toLowerCase()}`;
+  // Nothing posts for a car that isn't on a job order with an accepted quote (0014), so each test tenant gets real cars A, B
+  // and C, each on its own accepted job. By default each is a customer-funded car purchase whose customer has already paid
+  // FIXTURE_FUNDS_HELD, the normal business; a test can set its own.
+  type JobSetup = { jobType: 'car_purchase' | 'clearing_only'; funding: 'customer_funded' | 'emm_funded' };
+  const CUSTOMER_JOB: JobSetup = { jobType: 'car_purchase', funding: 'customer_funded' };
+  const EMM: JobSetup = { jobType: 'car_purchase', funding: 'emm_funded' };
+  const FIXTURE_FUNDS_HELD = 1_000_000_000n; // NGN 10,000,000.00 paid by each customer before EMM pays the supplier
+  const REVIEWER = 'user_reviewer';
+  const cars: Record<string, Record<string, string>> = {}; // tenant -> A/B/C -> vehicle id
+  const jobIds: Record<string, Record<string, string>> = {}; // tenant -> A/B/C -> job order id
+  const carOf = (tenant: string, v: string) => {
+    const id = cars[tenant]?.[v];
+    if (!id) throw new Error(`no test car ${v} in this tenant`);
+    return id;
+  };
+  /** A firm sign-off of every open flag of one kind on one car (0014). */
+  const approve = async (tenant: string, v: string, kind: string, userId = REVIEWER) => {
+    const open = (await tx(tenant, (t) => t.client.query<{ flag_id: string }>('SELECT flag_id FROM job_order_exceptions WHERE vehicle_id = $1 AND kind = $2', [cars[tenant]?.[v], kind]))).rows;
+    if (open.length === 0) throw new Error(`no open ${kind} flag for car ${v}`);
+    for (const f of open) {
+      await withTenant(apiPool, as(tenant, userId), (t) => t.client.query("INSERT INTO job_order_sign_offs (tenant_id, flag_id, reason) VALUES ($1, $2, 'fixture sign-off')", [tenant, f.flag_id]));
+    }
+  };
+  const jobsFor = async (tenant: string, setup: Partial<Record<string, JobSetup>> = {}) => {
+    await owner('INSERT INTO firm_staff (clerk_user_id) VALUES ($1) ON CONFLICT DO NOTHING', [REVIEWER]);
+    await owner("INSERT INTO firm_access (tenant_id, clerk_user_id, role, granted_by) VALUES ($1, $2, 'firm_reviewer', 'test')", [tenant, REVIEWER]);
+    const carIds: Record<string, string> = {};
+    const jobs: Record<string, string> = {};
+    const people: Record<string, string> = {};
+    cars[tenant] = carIds;
+    customers[tenant] = people;
+    jobIds[tenant] = jobs;
+    for (const v of ['A', 'B', 'C']) {
+      const s = setup[v] ?? CUSTOMER_JOB;
+      const purchase = s.jobType === 'car_purchase';
+      jobs[v] = await tx(tenant, async (t) => {
+        const customerId = await one(t.client, "INSERT INTO counterparties (tenant_id, kind, name) VALUES ($1, 'customer', $2) RETURNING id", [tenant, `Customer ${v}`]);
+        people[v] = customerId;
+        carIds[v] = await one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, $2, 'Test', 'Car', 2024) RETURNING id", [tenant, `TESTCAR${v}000000000`]);
+        const quote = await one(t.client, "INSERT INTO documents (tenant_id, doc_type, mime, size_bytes, sha256, original_filename) VALUES ($1, 'accepted_quote', 'application/pdf', 100, $2, 'q.pdf') RETURNING id", [tenant, 'a'.repeat(64)]);
+        await t.client.query("UPDATE documents SET status = 'stored', evidence_key = 'evidence/' || tenant_id || '/2026/01/' || id || '.pdf', stored_at = now() WHERE id = $1", [quote]);
+        const jobId = await one(t.client,
+          `INSERT INTO job_orders (tenant_id, customer_id, job_type, funding, funding_reason, ordered_on, car_price_minor, car_price_currency, quote_rate, quote_rate_source, quote_rate_note, landing_charge_ngn)
+           VALUES ($1, $2, $3, $4, $5, '2026-01-05', $6, $7, $8, $9, $10, 0) RETURNING id`,
+          [tenant, customerId, s.jobType, s.funding, s.funding === 'emm_funded' ? 'fixture: bought ahead of a buyer' : null,
+            purchase ? 4_500_000n : null, purchase ? 'CNY' : null, purchase ? '110.000000' : null, purchase ? 'manual' : null, purchase ? 'FIXTURE_RATE_QUOTE' : null]);
+        await t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, car_price_minor) VALUES ($1, $2, $3, $4)', [tenant, jobId, carIds[v], purchase ? 4_500_000n : null]);
+        await t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2 WHERE id = $1", [jobId, quote]);
+        return jobId;
+      });
+    }
+  };
+  const customers: Record<string, Record<string, string>> = {}; // tenant -> A/B/C -> the job's customer
+  const customer = (tenant: string, v: string) => {
+    const id = customers[tenant]?.[v];
+    if (!id) throw new Error(`no test customer ${v} in this tenant`);
+    return id;
+  };
   const job = (v: string) => ({ vehicleId: v, counterpartyId: v });
 
   type PostOpts = { date?: string; reverses?: string | null; sourceType?: string };
@@ -409,7 +465,7 @@ describe('phase 2: posting rules through the database', () => {
         `INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, spot_rate, spot_source, rate_note, vehicle_id, counterparty_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
         [tenant, entryId, ids[l.account], l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null, l.spotRate ?? null, l.spotSource ?? null, l.rateNote ?? null,
-          l.vehicleId ? car[l.vehicleId] : null, l.counterpartyId ? (l.counterpartyId.length === 36 ? l.counterpartyId : customer(l.counterpartyId)) : null]);
+          l.vehicleId ? carOf(tenant, l.vehicleId) : null, l.counterpartyId ? (l.counterpartyId.length === 36 ? l.counterpartyId : customer(tenant, l.counterpartyId)) : null]);
     }
     return entryId;
   };
@@ -441,15 +497,22 @@ describe('phase 2: posting rules through the database', () => {
       [accounts[tenant]?.['1010']])).rows[0];
     return { balanceMinor: BigInt(r?.bal ?? 0), costNgn: BigInt(r?.cost ?? 0) };
   });
-  const funded = async (name: string) => {
+  /** A tenant with jobs A, B and C, CNY 150,000.00 in the pool, and (unless held is false) each customer's funds held. */
+  const funded = async (name: string, opts: { jobs?: Partial<Record<string, JobSetup>>; held?: boolean } = {}) => {
     const t = await freshTenant(name);
+    await jobsFor(t.id, opts.jobs);
+    if (opts.held !== false) {
+      for (const v of ['A', 'B', 'C']) {
+        if ((opts.jobs?.[v] ?? CUSTOMER_JOB).funding === 'customer_funded') await postLines(t.id, t.period, customerReceipt({ ...job(v), amountNgn: FIXTURE_FUNDS_HELD }));
+      }
+    }
     await postLines(t.id, t.period, buyCurrency({ currency: 'CNY', amountMinor: 10_000_000n, rate: parseRate('100.000000'), rateSource: 'bdc_receipt' })); // FIXTURE_RATE_BUY_1
     await postLines(t.id, t.period, buyCurrency({ currency: 'CNY', amountMinor: 5_000_000n, rate: parseRate('120.000000'), rateSource: 'bdc_receipt' })); // FIXTURE_RATE_BUY_2
     return t;
   };
 
   test('the worked example posts cleanly and the balances match the hand-worked figures', async () => {
-    const { id, period } = await funded('Worked example');
+    const { id, period } = await funded('Worked example', { held: false });
     for (const [v, amountNgn] of [['A', 600_000_000n], ['B', 500_000_000n], ['C', 650_000_000n]] as const) await postLines(id, period, customerReceipt({ ...job(v), amountNgn }));
     for (const [v, amountMinor] of [['A', 4_000_000n], ['B', 3_500_000n], ['C', 4_500_000n]] as const) {
       await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor, vehicleId: v, spot: SPOT_CBN }).lines);
@@ -459,7 +522,7 @@ describe('phase 2: posting rules through the database', () => {
     await postLines(id, period, sharedCost({ amountNgn: 15_000_000n, vehicleIds: ['A'] }));
     // Completion reads car A's history back from the database, nothing is typed in.
     const history = await tx(id, async (t) => (await t.client.query<{ code: string; debit_ngn: string; credit_ngn: string; currency: string; amount_minor: string; vehicle_id: string | null }>(
-      'SELECT a.code, l.debit_ngn, l.credit_ngn, l.currency, l.amount_minor, l.vehicle_id FROM journal_lines l JOIN accounts a ON a.id = l.account_id WHERE l.vehicle_id = $1', [car.A])).rows
+      'SELECT a.code, l.debit_ngn, l.credit_ngn, l.currency, l.amount_minor, l.vehicle_id FROM journal_lines l JOIN accounts a ON a.id = l.account_id WHERE l.vehicle_id = $1', [carOf(id, 'A')])).rows
       .map((r): LedgerLine => ({ account: r.code, debit: BigInt(r.debit_ngn), credit: BigInt(r.credit_ngn), currency: r.currency.trim(), amountMinor: BigInt(r.amount_minor), vehicleId: 'A' })));
     await postLines(id, period, completeAgentJob({ ...job('A'), quote: { currency: 'CNY', sellingMinor: 4_500_000n, rate: parseRate('110.000000'), landingChargeNgn: 150_000_000n }, history }).lines); // FIXTURE_RATE_QUOTE
 
@@ -499,14 +562,14 @@ describe('phase 2: posting rules through the database', () => {
     const { id, period } = await funded('Pool reversal');
     const paid = payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines;
     await postLines(id, period, paid);
-    const original = await tx(id, async (t) => (await t.client.query<{ id: string }>('SELECT entry_id AS id FROM journal_lines WHERE vehicle_id = $1 LIMIT 1', [car.A])).rows[0]?.id ?? '');
+    const original = await tx(id, async (t) => (await t.client.query<{ id: string }>('SELECT entry_id AS id FROM journal_lines WHERE vehicle_id = $1 LIMIT 1', [carOf(id, 'A')])).rows[0]?.id ?? '');
     const mirror = (vehicleId: string): LedgerLine[] => paid.map((l) => ({ ...l, debit: l.credit, credit: l.debit, vehicleId }));
     const reverse = (lines: LedgerLine[]) => tx(id, async (t) => {
       const entryId = await one(t.client, "INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, reverses_entry_id) VALUES ($1, $2, '2026-01-11', 'reversal', 'test', uuidv7(), $3, $4) RETURNING id",
         [id, period, `rev-${String(++keySeq)}`, original]);
       for (const l of lines) {
         await t.client.query('INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, spot_rate, spot_source, vehicle_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)',
-          [id, entryId, accounts[id]?.[l.account], l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null, l.spotRate ?? null, l.spotSource ?? null, l.vehicleId ? car[l.vehicleId] : null]);
+          [id, entryId, accounts[id]?.[l.account], l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null, l.spotRate ?? null, l.spotSource ?? null, l.vehicleId ? carOf(id, l.vehicleId) : null]);
       }
     });
     await assert.rejects(reverse(mirror('B')), /does not mirror/);
@@ -525,7 +588,7 @@ describe('phase 2: posting rules through the database', () => {
   const payableOf = (tenant: string) => tx(tenant, async (t) => {
     const r = (await t.client.query<{ bal: string; cost: string }>(
       "SELECT coalesce(sum(CASE WHEN credit_ngn > 0 THEN amount_minor ELSE -amount_minor END), 0)::text AS bal, coalesce(sum(credit_ngn - debit_ngn), 0)::text AS cost FROM journal_lines WHERE account_id = $1 AND currency = 'CNY' AND counterparty_id = $2 AND vehicle_id = $3",
-      [accounts[tenant]?.['2000'], SUPPLIER, car.A])).rows[0];
+      [accounts[tenant]?.['2000'], SUPPLIER, carOf(tenant, 'A')])).rows[0];
     return { balanceMinor: BigInt(r?.bal ?? 0), costNgn: BigInt(r?.cost ?? 0) };
   });
   const bill = { vehicleId: 'A', supplierId: SUPPLIER };
@@ -752,11 +815,10 @@ describe('phase 2: posting rules through the database', () => {
   });
 
   /** One car's ledger history, read back from the database (what the API will hand the posting rules). */
-  const customerKey = Object.fromEntries(['A', 'B', 'C'].map((k) => [customer(k), k]));
   const historyOf = (tenant: string, v: string) => tx(tenant, async (t) => (await t.client.query<{ code: string; debit_ngn: string; credit_ngn: string; currency: string; amount_minor: string; counterparty_id: string | null }>(
-    'SELECT a.code, l.debit_ngn, l.credit_ngn, l.currency, l.amount_minor, l.counterparty_id FROM journal_lines l JOIN accounts a ON a.id = l.account_id WHERE l.vehicle_id = $1', [car[v]])).rows
+    'SELECT a.code, l.debit_ngn, l.credit_ngn, l.currency, l.amount_minor, l.counterparty_id FROM journal_lines l JOIN accounts a ON a.id = l.account_id WHERE l.vehicle_id = $1', [carOf(tenant, v)])).rows
     .map((r): LedgerLine => ({ account: r.code, debit: BigInt(r.debit_ngn), credit: BigInt(r.credit_ngn), currency: r.currency.trim(), amountMinor: BigInt(r.amount_minor), vehicleId: v,
-      ...(r.counterparty_id && { counterpartyId: customerKey[r.counterparty_id] ?? r.counterparty_id }) })));
+      ...(r.counterparty_id && { counterpartyId: Object.entries(customers[tenant] ?? {}).find(([, cid]) => cid === r.counterparty_id)?.[0] ?? r.counterparty_id }) })));
   const ngnOn = (account: string, signed: bigint, vehicleId?: string, counterpartyId?: string): LedgerLine => ({
     account, debit: signed > 0n ? signed : 0n, credit: signed < 0n ? -signed : 0n, currency: 'NGN', amountMinor: signed < 0n ? -signed : signed,
     ...(vehicleId && { vehicleId }), ...(counterpartyId && { counterpartyId }),
@@ -764,7 +826,7 @@ describe('phase 2: posting rules through the database', () => {
   const swap = (lines: LedgerLine[]) => lines.map((l) => ({ ...l, debit: l.credit, credit: l.debit }));
 
   test('a car is a customer-funded job or EMM stock, never both (ledger audit of 0008)', async () => {
-    const { id, period } = await funded('Job or stock');
+    const { id, period } = await funded('Job or stock', { held: false });
     // Job A: the customer pays, EMM pays the supplier; its completion is worked out now, before anything else happens.
     await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 600_000_000n }));
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
@@ -792,7 +854,7 @@ describe('phase 2: posting rules through the database', () => {
   });
 
   test('a reversed mistake leaves the car as it was; no car pays for another; a clearing job never becomes stock (ledger audit of 0008, round 3)', async () => {
-    const { id, period } = await funded('Reversed mistakes');
+    const { id, period } = await funded('Reversed mistakes', { held: false, jobs: { B: { jobType: 'clearing_only', funding: 'customer_funded' }, C: EMM } });
     // Job A, converted in error, then the convert reversed: A is an open job again and completes normally.
     await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 600_000_000n }));
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
@@ -807,10 +869,9 @@ describe('phase 2: posting rules through the database', () => {
     await postLines(id, period, completeAgentJob({ ...job('A'), quote: { currency: 'CNY', sellingMinor: 4_500_000n, rate: parseRate('110.000000'), landingChargeNgn: 0n }, history: await historyOf(id, 'A') }).lines);
     // Car C is stock: agent income for it is refused even with nothing to cross zero.
     await assert.rejects(postLines(id, period, [ngnOn('1100', 100n, 'C', 'C'), ngnOn('4100', -100n, 'C')]), /EMM stock \(EMM-funded or converted\): it takes no customer-funded postings/);
-    // Car B: its first cost posted as EMM-funded by mistake and reversed; B is then an ordinary customer job.
-    const slip = sharedCost({ amountNgn: 50_000_000n, vehicleIds: ['B'], funding: 'emm_funded' });
-    const slipId = await postLines(id, period, slip);
-    await postLines(id, period, swap(slip), { reverses: slipId });
+    // Car B: a first cost posted as EMM-funded by mistake. The job says customer-funded, so it never posts (0014; before job
+    // orders this slip posted and needed a reversal). B stays an ordinary customer job.
+    await assert.rejects(postLines(id, period, sharedCost({ amountNgn: 50_000_000n, vehicleIds: ['B'], funding: 'emm_funded' })), /job order \d+ is customer-funded: its car is not stock unless converted/);
     await postLines(id, period, customerReceipt({ ...job('B'), amountNgn: 300_000_000n }));
     await postLines(id, period, sharedCost({ amountNgn: 150_000_000n, vehicleIds: ['B'] })); // clearing-only: no supplier payment for B
     // A clearing-only job is the customer's own car: no conversion to stock. (The ledger rule refuses it too.)
@@ -819,7 +880,7 @@ describe('phase 2: posting rules through the database', () => {
   });
 
   test('a job completed at a zero cut stays completed; a conversion is undone only after the stock steps after it (ledger audit of 0008, round 4)', async () => {
-    const { id, period } = await funded('Zero cut');
+    const { id, period } = await funded('Zero cut', { held: false });
     // Job A sold to the customer at exactly the car's quote-rate cost with no landing charge: no 4100/4200 line at all.
     await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 600_000_000n }));
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
@@ -843,7 +904,7 @@ describe('phase 2: posting rules through the database', () => {
   });
 
   test('a conversion repays the customer in cash, exactly: none of it diverted (ledger audit of 0008, round 3)', async () => {
-    const { id, period } = await funded('Convert diversion');
+    const { id, period } = await funded('Convert diversion', { held: false });
     await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 600_000_000n }));
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
     const conversion = convertToStock({ ...job('A'), history: await historyOf(id, 'A') });
@@ -853,7 +914,7 @@ describe('phase 2: posting rules through the database', () => {
   });
 
   test('inventory only from real costs; corrections undo later steps first; deposits stay with their buyer (ledger audit of 0008)', async () => {
-    const { id, period } = await funded('Stock corrections');
+    const { id, period } = await funded('Stock corrections', { jobs: { C: EMM } });
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 3_000_000n, vehicleId: 'C', spot: SPOT_CBN, funding: 'emm_funded' }).lines);
     // A "cost" conjured from equity or income: refused.
     await assert.rejects(postLines(id, period, [ngnOn('1200', 100_000_000n, 'C'), ngnOn('3000', -100_000_000n)]), /paid for only from the pool \(1010\), payables \(2000\), cash \(1000\)/);
@@ -885,7 +946,7 @@ describe('phase 2: posting rules through the database', () => {
   // pool at 16,000,000.00 / 150,000.00 = NGN 3,200,000.00, Form M NGN 500,000.00, to the yard at 3,700,000.00, deposit
   // 2,000,000.00, sold for 4,500,000.00 -> gross profit NGN 800,000.00, inventory cleared.
   test('worked example: an EMM-funded stock car through the database, to the kobo', async () => {
-    const { id, period } = await funded('Stock car');
+    const { id, period } = await funded('Stock car', { jobs: { C: EMM } });
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 3_000_000n, vehicleId: 'C', spot: SPOT_CBN, funding: 'emm_funded' }).lines);
     await postLines(id, period, sharedCost({ amountNgn: 50_000_000n, vehicleIds: ['C'], funding: 'emm_funded' }));
     await postLines(id, period, arriveInYard({ vehicleId: 'C', history: await historyOf(id, 'C') }));
@@ -910,7 +971,7 @@ describe('phase 2: posting rules through the database', () => {
   });
 
   test('inventory moves only whole: arrival, sale with revenue, every line naming its car', async () => {
-    const { id, period } = await funded('Stock guards');
+    const { id, period } = await funded('Stock guards', { jobs: { C: EMM } });
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 3_000_000n, vehicleId: 'C', spot: SPOT_CBN, funding: 'emm_funded' }).lines);
     const ngnLine = (account: string, signed: bigint, vehicleId?: string): LedgerLine =>
       ({ account, debit: signed > 0n ? signed : 0n, credit: signed < 0n ? -signed : 0n, currency: 'NGN', amountMinor: signed < 0n ? -signed : signed, ...(vehicleId && { vehicleId }) });
@@ -931,7 +992,7 @@ describe('phase 2: posting rules through the database', () => {
   });
 
   test('convert to stock through the database: the job\'s cost becomes inventory and the customer is repaid in full', async () => {
-    const { id, period } = await funded('Convert to stock');
+    const { id, period } = await funded('Convert to stock', { held: false });
     await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 600_000_000n }));
     await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 4_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
     await postLines(id, period, sharedCost({ amountNgn: 131_666_667n, vehicleIds: ['A'] }));
@@ -945,6 +1006,220 @@ describe('phase 2: posting rules through the database', () => {
     assert.deepEqual([after['1200'], after['1210'], after['4000'], after['5000']], [0n, 0n, -600_000_000n, 558_333_334n]);
   });
 
+  // Job orders and the books (migration 0014, ADR 0016). The client transacts; we keep its books: the database refuses only
+  // what would make them wrong or untraceable, and raises a flag as each entry commits for the rest, which stays until a
+  // firm reviewer signs it off.
+  const UNSIGNED = {
+    A: { jobType: 'car_purchase', funding: 'customer_funded' },
+    B: { jobType: 'clearing_only', funding: 'customer_funded' },
+    C: { jobType: 'car_purchase', funding: 'emm_funded' },
+  } as const;
+  /** The tenant's open flags as [kind, car], cars by their test letter. */
+  const flags = (tenant: string) => tx(tenant, async (t) => (await t.client.query<{ kind: string; vehicle_id: string }>(
+    'SELECT kind, vehicle_id FROM job_order_exceptions ORDER BY kind, vehicle_id, flag_id')).rows
+    .map((r) => [r.kind, Object.entries(cars[tenant] ?? {}).find(([, c]) => c === r.vehicle_id)?.[0]]));
+  /** One more car on its own draft job in this tenant (clearing-only, or an EMM-funded car purchase), known to the helpers by its letter. */
+  const draftJob = async (tenant: string, v: string, userId = USER, funding: 'customer_funded' | 'emm_funded' = 'customer_funded') => {
+    const mine = cars[tenant];
+    const people = customers[tenant];
+    const jobs = jobIds[tenant];
+    assert.ok(mine && people && jobs);
+    people[v] = people.B ?? '';
+    await withTenant(apiPool, as(tenant, userId), async (t) => {
+      mine[v] = await one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, $2, 'Test', 'Car', 2024) RETURNING id", [tenant, `TESTCAR${v}000000000`]);
+      const emm = funding === 'emm_funded'; // an EMM-funded job is always a car purchase (0014)
+      jobs[v] = await one(t.client, `INSERT INTO job_orders (tenant_id, customer_id, job_type, funding, funding_reason, ordered_on, car_price_minor, car_price_currency, quote_rate, quote_rate_source, quote_rate_note, landing_charge_ngn)
+        VALUES ($1, $2, $3, $4, $5, '2026-01-05', $6, $7, $8, $9, $10, 0) RETURNING id`,
+        [tenant, people[v], emm ? 'car_purchase' : 'clearing_only', funding, emm ? 'fixture: bought ahead of a buyer' : null,
+          emm ? 1_000_000n : null, emm ? 'CNY' : null, emm ? '110.000000' : null, emm ? 'manual' : null, emm ? 'FIXTURE_RATE_QUOTE' : null]);
+      await t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, car_price_minor) VALUES ($1, $2, $3, $4)', [tenant, jobs[v], mine[v], emm ? 1_000_000n : null]);
+    });
+  };
+
+  test('the books record what the client did; only entries that would make them wrong are refused, the rest is flagged as it posts (0014)', async () => {
+    const { id, period } = await funded('Job rules', { held: false, jobs: UNSIGNED });
+    const { id: other, period: otherPeriod } = await funded('Job rules elsewhere', { held: false, jobs: UNSIGNED });
+    const pay = async (tenant: string, v: string, funding?: 'emm_funded') =>
+      payFromPool({ pool: await poolOf(tenant), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: v, spot: SPOT_CBN, ...(funding && { funding }) }).lines;
+    // A car on no job order takes nothing. On a draft job its costs post (flagged), but it can't complete: the cut comes from the accepted quote.
+    const mine = cars[id];
+    assert.ok(mine);
+    mine.Z = await tx(id, (t) => one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, 'TESTCARZ000000000', 'Test', 'Car', 2024) RETURNING id", [id]));
+    await assert.rejects(postLines(id, period, sharedCost({ amountNgn: 1_000n, vehicleIds: ['Z'] })), /must be on a job order \(not cancelled\) before anything posts/);
+    await draftJob(id, 'D');
+    await postLines(id, period, sharedCost({ amountNgn: 1_000n, vehicleIds: ['D'] }));
+    await assert.rejects(postLines(id, period, completeClearingJob({ ...job('D'), landingChargeNgn: 5_000n, history: await historyOf(id, 'D') }).lines),
+      /can't complete before its quote is accepted/);
+    // Customer-funded A: the client paid the supplier before its customer paid. It posts, flagged; the flag stays after the
+    // customer pays (it happened) until a firm reviewer signs it off. Each tenant sees only its own flags.
+    await postLines(id, period, await pay(id, 'A'));
+    await postLines(other, otherPeriod, await pay(other, 'A'));
+    assert.deepEqual(await flags(id), [['posted_before_quote', 'D'], ['supplier_cost_not_covered', 'A']]);
+    assert.deepEqual(await flags(other), [['supplier_cost_not_covered', 'A']]);
+    await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 106_667_667n })); // NGN 1,066,676.67: NGN 10.00 more than paid out
+    assert.deepEqual(await flags(id), [['posted_before_quote', 'D'], ['supplier_cost_not_covered', 'A']]);
+    await approve(id, 'A', 'supplier_cost_not_covered');
+    assert.deepEqual(await flags(id), [['posted_before_quote', 'D']]);
+    // Reversing the customer's receipt after the supplier was paid opens the gap again: the reversal raises its own flag.
+    const otherReceipt = await postLines(other, otherPeriod, customerReceipt({ ...job('A'), amountNgn: 300_000_000n }));
+    await postLines(other, otherPeriod, await pay(other, 'A')); // covered: no new flag
+    assert.deepEqual(await flags(other), [['supplier_cost_not_covered', 'A']]);
+    await postLines(other, otherPeriod, swap(customerReceipt({ ...job('A'), amountNgn: 300_000_000n })), { reverses: otherReceipt });
+    assert.deepEqual(await flags(other), [['supplier_cost_not_covered', 'A'], ['supplier_cost_not_covered', 'A']]);
+    // Customer funds come in only as cash from the job's own customer, nothing else in the entry (a bank charge is its own
+    // entry): never conjured from a charge, equity or a receivable, moved from another car, or split between customers.
+    await postLines(id, period, customerReceipt({ ...job('B'), amountNgn: 10_000_000n }));
+    await postLines(id, period, [ngnOn('6100', 5_375n), ngnOn('1000', -5_375n)]); // the bank's NGN 53.75 charge on it
+    for (const forged of [
+      [ngnOn('1000', 9_994_625n), ngnOn('6100', 5_375n), ngnOn('2150', -10_000_000n, 'A', 'A')],
+      [ngnOn('6100', 500_000_000n), ngnOn('2150', -500_000_000n, 'A', 'A')],
+      [ngnOn('2150', 1_000n, 'B', 'B'), ngnOn('2150', -1_000n, 'A', 'A')],
+      [ngnOn('3000', 1_000n), ngnOn('2150', -1_000n, 'A', 'A')],
+      [ngnOn('1100', 1_000n, 'A', 'A'), ngnOn('2150', -1_000n, 'A', 'A')],
+      [ngnOn('1000', 2_000n), ngnOn('2150', -1_000n, 'A', 'A'), ngnOn('2150', -1_000n, 'B', 'B')],
+    ]) await assert.rejects(postLines(id, period, forged), /come in only by a receipt from one customer|leave only in the car's completion/); // per car, whichever is checked first
+    await assert.rejects(postLines(id, period, customerReceipt({ vehicleId: 'A', counterpartyId: 'B', amountNgn: 1_000n })), /name that job's customer/);
+    // ...and leave only as a completion, a refund in cash or a conversion: a forfeit to income is refused (owner 2026-11-15),
+    // and so is a cut outside a completion, or revenue that names no car.
+    await assert.rejects(postLines(id, period, [ngnOn('2150', 1_000n, 'A', 'A'), ngnOn('4100', -1_000n, 'A')]), /leave only in the car's completion, a refund/);
+    await assert.rejects(postLines(id, period, [ngnOn('2150', 1_000n, 'A', 'A'), ngnOn('6100', 100n), ngnOn('1000', -1_100n)]), /leave only in the car's completion, a refund/);
+    await assert.rejects(postLines(id, period, [ngnOn('1100', 1_000n, 'A', 'A'), ngnOn('4100', -1_000n, 'A')]), /post only in the car's completion/);
+    await assert.rejects(postLines(id, period, [ngnOn('1000', 1_000n), ngnOn('4100', -1_000n)]), /always name their car/);
+    await postLines(id, period, [ngnOn('2150', 1_000n, 'A', 'A'), ngnOn('1000', -1_000n)]); // the NGN 10.00 overpaid goes back
+    // Converted to stock: it posts, flagged until signed off.
+    await postLines(id, period, convertToStock({ ...job('A'), history: await historyOf(id, 'A') }));
+    assert.deepEqual(await flags(id), [['converted_to_stock', 'A'], ['posted_before_quote', 'D']]);
+    await approve(id, 'A', 'converted_to_stock');
+    // A supplier's credit note or refund brings a car's job costs down (cash back); nothing else may.
+    await assert.rejects(postLines(id, period, [ngnOn('3000', 400n), ngnOn('1150', -400n, 'D')]), /job costs \(1150\) come down only in its completion, a conversion, or a supplier's credit/);
+    await postLines(id, period, [ngnOn('1000', 400n), ngnOn('1150', -400n, 'D')]); // flagged for a reviewer to check against the supplier's document
+    // Clearing-only B is the customer's own car: no supplier is paid for it. Its completion holds only its own lines, clears
+    // its whole job costs, and happens once; a cost after it is flagged.
+    await assert.rejects(postLines(id, period, await pay(id, 'B')), /clearing-only: the customer owns the car, so no supplier is paid for it/);
+    await postLines(id, period, sharedCost({ amountNgn: 150_000_000n, vehicleIds: ['B'] }));
+    const completion = completeClearingJob({ ...job('B'), landingChargeNgn: 180_000_000n, history: await historyOf(id, 'B') }).lines;
+    const lessCut = (by: bigint) => completion.map((l) => (l.account === '4200' ? { ...l, credit: l.credit - by, amountMinor: l.amountMinor - by } : l));
+    await assert.rejects(postLines(id, period, [...lessCut(1_000n), ngnOn('4900', -1_000n)]), /a completion holds only its car's lines/); // part of the cut to car-less income
+    await assert.rejects(postLines(id, period, [...lessCut(400n), ngnOn('1150', -400n, 'D')]), /a completion holds only its car's lines|can't complete before its quote|come down only in its completion/); // another car's costs
+    await assert.rejects(postLines(id, period, [ngnOn('1150', 1n, 'B'), ...completion.map((l) => (l.account === '1150' ? { ...l, credit: l.credit + 1n, amountMinor: l.amountMinor + 1n } : l))]),
+      /a completion holds only its car's lines/); // a wash on its job costs
+    await assert.rejects(postLines(id, period, completion.map((l) => (l.account === '1150' ? { ...l, credit: 1n, amountMinor: 1n } : l.account === '4200' ? { ...l, credit: l.credit + 149_999_999n, amountMinor: l.amountMinor + 149_999_999n } : l))),
+      /clears the car's whole job costs \(1150\) to zero/);
+    await postLines(id, period, completion);
+    await postLines(id, period, sharedCost({ amountNgn: 1n, vehicleIds: ['B'] })); // a late kobo of cost
+    assert.deepEqual(await flags(id), [['completion_unverified', 'B'], ['cost_after_completion', 'B'], ['cost_credited', 'D'], ['posted_before_quote', 'D'], ['posted_before_quote', 'D']]);
+    await assert.rejects(postLines(id, period, completeClearingJob({ ...job('B'), landingChargeNgn: 1_000n, history: await historyOf(id, 'B') }).lines), /already completed: a car completes once/);
+    for (const [v, kind] of [['B', 'completion_unverified'], ['B', 'cost_after_completion'], ['D', 'cost_credited']] as const) await approve(id, v, kind);
+    // EMM-funded C: the client's own stock, never customer funds or job costs. Its first posting raises the flag, which stays
+    // even if that posting is reversed (it was recorded); the next posting then raises it again, as the car's first live one.
+    await assert.rejects(postLines(id, period, customerReceipt({ ...job('C'), amountNgn: 1_000n })), /EMM-funded: its car is stock \(1200, 1210, 2100\), never job costs/);
+    await assert.rejects(postLines(id, period, sharedCost({ amountNgn: 1_000n, vehicleIds: ['C'] })), /EMM-funded: its car is stock/);
+    const cPaid = await pay(id, 'C', 'emm_funded');
+    const cPaidId = await postLines(id, period, cPaid);
+    await postLines(id, period, swap(cPaid), { reverses: cPaidId });
+    await postLines(id, period, await pay(id, 'C', 'emm_funded'));
+    assert.deepEqual(await flags(id), [['emm_funded', 'C'], ['emm_funded', 'C'], ['posted_before_quote', 'D'], ['posted_before_quote', 'D']]);
+    await approve(id, 'C', 'emm_funded');
+    // D's quote accepted later: the app can't backdate it (the database stamps the time), and D's earlier postings stay flagged.
+    await tx(id, async (t) => {
+      const quote = await one(t.client, "INSERT INTO documents (tenant_id, doc_type, mime, size_bytes, sha256, original_filename) VALUES ($1, 'accepted_quote', 'application/pdf', 100, $2, 'q.pdf') RETURNING id", [id, 'c'.repeat(64)]);
+      await t.client.query("UPDATE documents SET status = 'stored', evidence_key = 'evidence/' || tenant_id || '/2026/01/' || id || '.pdf', stored_at = now() WHERE id = $1", [quote]);
+      await t.client.query('SAVEPOINT backdate');
+      await assert.rejects(t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2, accepted_at = '2025-01-01' WHERE id = $1", [jobIds[id]?.D, quote]), /permission denied/);
+      await t.client.query('ROLLBACK TO SAVEPOINT backdate');
+      await t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2 WHERE id = $1", [jobIds[id]?.D, quote]);
+    });
+    const accepted = (await tx(id, (t) => t.client.query<{ fresh: boolean }>("SELECT accepted_at > now() - interval '1 minute' AS fresh FROM job_orders WHERE id = $1", [jobIds[id]?.D]))).rows[0];
+    assert.deepEqual(accepted, { fresh: true });
+    assert.deepEqual(await flags(id), [['posted_before_quote', 'D'], ['posted_before_quote', 'D']]);
+    await approve(id, 'D', 'posted_before_quote');
+    assert.deepEqual(await flags(id), []);
+    await postLines(other, otherPeriod, completeAgentJob({ ...job('A'), quote: { currency: 'CNY', sellingMinor: 4_500_000n, rate: parseRate('110.000000'), landingChargeNgn: 0n }, history: await historyOf(other, 'A') }).lines);
+    await postLines(other, otherPeriod, await pay(other, 'A')); // a supplier paid after the completion: a late cost, not covered
+    assert.deepEqual(await flags(other), [['completion_unverified', 'A'], ['cost_after_completion', 'A'], ['supplier_cost_not_covered', 'A'], ['supplier_cost_not_covered', 'A'], ['supplier_cost_not_covered', 'A']]);
+    const tb = await trialBalance(id);
+    assert.equal(tb.dr - tb.cr, 0n);
+    assert.deepEqual(await chainBreaks(id), []);
+  });
+
+  test('a sign-off answers one flag, by a firm reviewer or admin who touched nothing the flag is about (0014)', async () => {
+    const { id, period } = await funded('Sign-offs', { held: false, jobs: UNSIGNED });
+    const { id: elsewhere } = await freshTenant('Sign-offs elsewhere');
+    const flagOf = async (v: string, kind: string) => (await tx(id, (t) => t.client.query<{ flag_id: string }>(
+      'SELECT flag_id FROM job_order_exceptions WHERE vehicle_id = $1 AND kind = $2', [cars[id]?.[v], kind]))).rows[0]?.flag_id;
+    const insert = (userId: string, tenant: string, flagId: string | undefined, extra = '', reason = 'fixture sign-off') =>
+      withTenant(apiPool, as(tenant, userId), (t) => t.client.query(
+        `INSERT INTO job_order_sign_offs (tenant_id, flag_id, reason${extra ? ', signed_by' : ''}) VALUES ($1, $2, $3${extra ? ', $4' : ''})`,
+        [tenant, flagId, reason, ...(extra ? [extra] : [])]));
+    const postAs = (userId: string, lines: LedgerLine[]) => withTenant(apiPool, as(id, userId), (t) => insertPosting(t.client, id, period, lines));
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'C', spot: SPOT_CBN, funding: 'emm_funded' }).lines);
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 1_000_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
+    // Not a signer here: a client user, a firm accountant of this business, a firm reviewer of another business.
+    await owner("INSERT INTO firm_staff (clerk_user_id) VALUES ('user_accountant'), ('user_elsewhere'), ('user_firm_admin') ON CONFLICT DO NOTHING");
+    await owner(`INSERT INTO firm_access (tenant_id, clerk_user_id, role, granted_by) VALUES ($1, 'user_accountant', 'firm_accountant', 'test'),
+      ($2, 'user_elsewhere', 'firm_reviewer', 'test'), ($1, 'user_firm_admin', 'firm_admin', 'test')`, [id, elsewhere]);
+    for (const who of [USER, 'user_accountant', 'user_elsewhere']) await assert.rejects(approve(id, 'C', 'emm_funded', who), /only a firm reviewer or firm admin for this business can sign off/);
+    // A firm admin signs off too (owner, 2026-11-17), but never what they touched: a job they created, a car they recorded for.
+    await draftJob(id, 'E', 'user_firm_admin', 'emm_funded');
+    await postLines(id, period, sharedCost({ amountNgn: 1_000n, vehicleIds: ['E'], funding: 'emm_funded' }));
+    await assert.rejects(approve(id, 'E', 'emm_funded', 'user_firm_admin'), /touched nothing it is about/);
+    await postAs('user_firm_admin', customerReceipt({ ...job('A'), amountNgn: 1_000n }));
+    await assert.rejects(approve(id, 'A', 'supplier_cost_not_covered', 'user_firm_admin'), /touched nothing it is about/);
+    await approve(id, 'C', 'emm_funded', 'user_firm_admin');
+    // One sign-off per flag; another tenant's flag looks like no flag at all.
+    const cFlag = (await tx(id, (t) => t.client.query<{ id: string }>("SELECT id FROM job_order_flags WHERE vehicle_id = $1 AND kind = 'emm_funded'", [cars[id]?.C]))).rows[0]?.id;
+    await assert.rejects(insert(REVIEWER, id, cFlag), /job_order_sign_offs_one_per_flag/);
+    await assert.rejects(insert('user_elsewhere', elsewhere, await flagOf('A', 'supplier_cost_not_covered')), /job_order_sign_offs_flag/);
+    // A reason, never a supplied signer, and never changed or deleted, even by the owner; flags can't be written or changed by the app.
+    const aFlag = await flagOf('A', 'supplier_cost_not_covered');
+    await assert.rejects(insert(REVIEWER, id, aFlag, '', '  '), /job_order_sign_offs_reason/);
+    await assert.rejects(insert(REVIEWER, id, aFlag, 'user_someone_else'), /permission denied/);
+    await assert.rejects(tx(id, (t) => t.client.query("INSERT INTO job_order_flags (tenant_id, job_order_id, vehicle_id, entry_id, kind) SELECT tenant_id, job_order_id, vehicle_id, entry_id, 'emm_funded' FROM job_order_flags LIMIT 1")), /permission denied/);
+    await assert.rejects(owner('DELETE FROM job_order_flags'), /append-only/);
+    await insert(REVIEWER, id, aFlag);
+    await approve(id, 'E', 'emm_funded');
+    const row = (await tx(id, (t) => t.client.query<{ signed_by: string; fresh: boolean }>(
+      "SELECT signed_by, signed_at > now() - interval '1 minute' AS fresh FROM job_order_sign_offs WHERE flag_id = $1", [aFlag]))).rows[0];
+    assert.deepEqual(row, { signed_by: REVIEWER, fresh: true });
+    await assert.rejects(tx(id, (t) => t.client.query("UPDATE job_order_sign_offs SET reason = 'changed'")), /permission denied/);
+    await assert.rejects(owner('UPDATE job_order_sign_offs SET reason = $1', ['changed']), /append-only/);
+    await assert.rejects(owner('DELETE FROM job_order_sign_offs'), /append-only/);
+    assert.equal(await tx(id, async (t) => (await t.client.query("SELECT 1 FROM audit_log WHERE entity = 'job_order_sign_offs' AND actor = $1", [REVIEWER])).rowCount), 2);
+    assert.deepEqual(await flags(id), [['posted_before_quote', 'E']]);
+    assert.equal(await count(elsewhere, 'job_order_sign_offs'), 0);
+  });
+
+  test('each car on a car purchase carries its own quoted price, adding up to the job\'s; clearing-only cars carry none (0014)', async () => {
+    const { id } = await funded('Per-car prices', { held: false });
+    await tx(id, async (t) => {
+      const customerId = customers[id]?.A;
+      const quote = await one(t.client, "INSERT INTO documents (tenant_id, doc_type, mime, size_bytes, sha256, original_filename) VALUES ($1, 'accepted_quote', 'application/pdf', 100, $2, 'q.pdf') RETURNING id", [id, 'b'.repeat(64)]);
+      await t.client.query("UPDATE documents SET status = 'stored', evidence_key = 'evidence/' || tenant_id || '/2026/01/' || id || '.pdf', stored_at = now() WHERE id = $1", [quote]);
+      const purchase = await one(t.client, `INSERT INTO job_orders (tenant_id, customer_id, job_type, ordered_on, car_price_minor, car_price_currency, quote_rate, quote_rate_source, quote_rate_note, landing_charge_ngn)
+        VALUES ($1, $2, 'car_purchase', '2026-01-05', 9000000, 'CNY', '110.000000', 'manual', 'FIXTURE_RATE_QUOTE', 0) RETURNING id`, [id, customerId]);
+      const car = async (vin: string) => one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, $2, 'Test', 'Car', 2024) RETURNING id", [id, vin]);
+      const savepoint = async (run: () => Promise<unknown>) => {
+        await t.client.query('SAVEPOINT s');
+        try {
+          await run();
+          await t.client.query('RELEASE SAVEPOINT s');
+        } catch (err) {
+          await t.client.query('ROLLBACK TO SAVEPOINT s');
+          throw err;
+        }
+      };
+      const add = (job: string, vehicle: string, price: bigint | null) => savepoint(() =>
+        t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id, car_price_minor) VALUES ($1, $2, $3, $4)', [id, job, vehicle, price]));
+      const [x, y] = [await car('TESTCARX000000000'), await car('TESTCARY000000000')];
+      await assert.rejects(add(purchase, x, null), /each car on a car purchase needs its own quoted price/);
+      await add(purchase, x, 4_000_000n);
+      await add(purchase, y, 4_000_000n);
+      await assert.rejects(savepoint(() => t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2 WHERE id = $1", [purchase, quote])),
+        /the cars' own prices must add up to the quoted car price/); // CNY 80,000.00 of 90,000.00
+      const clearing = await one(t.client, "INSERT INTO job_orders (tenant_id, customer_id, job_type, ordered_on, landing_charge_ngn) VALUES ($1, $2, 'clearing_only', '2026-01-05', 0) RETURNING id", [id, customerId]);
+      await assert.rejects(add(clearing, await car('TESTCARW000000000'), 1n), /a clearing-only job's cars carry no car price/);
+    });
+  });
   const periodFor = (tenant: string, starts: string, ends: string) =>
     tx(tenant, (t) => one(t.client, 'INSERT INTO periods (tenant_id, starts_on, ends_on) VALUES ($1, $2, $3) RETURNING id', [tenant, starts, ends]));
 
@@ -1152,7 +1427,7 @@ describe('phase 1 gate', () => {
     let seed = 20260115n;
     const rnd = (max: bigint) => ((seed = (seed * 6364136223846793005n + 1442695040888963407n) % 2n ** 64n), (seed >> 11n) % max);
     // No 2000 or 2150: an unnamed NGN line on payables, or on customer funds held, is refused (they name a supplier or a car).
-    const ngnCodes = ['1000', '3000', '4000', '5000', '6000', '7000'];
+    const ngnCodes = ['1000', '3000', '4900', '6100', '6000', '7000']; // vehicle revenue always names a car (0014)
     const pick = () => ngnCodes[Number(rnd(BigInt(ngnCodes.length)))] ?? '1000';
 
     // Random balanced entry: 1-3 lines on one side (NGN, or CNY into the pool 1010), the same total
@@ -1179,7 +1454,7 @@ describe('phase 1 gate', () => {
       }
       other.push({ account: pick(), credit: left });
       // Currency only leaves the pool (1010) at its average cost, so a flipped foreign line goes to an account without a pool.
-      const flip = (l: Line): Line => ({ ...l, account: l.account === '1010' ? '4000' : l.account, debit: l.credit ?? 0n, credit: l.debit ?? 0n });
+      const flip = (l: Line): Line => ({ ...l, account: l.account === '1010' ? '4900' : l.account, debit: l.credit ?? 0n, credit: l.debit ?? 0n });
       const lines = rnd(2n) === 0n ? [...side, ...other] : [...side.map(flip), ...other.map(flip)];
       return { periodId: periodA, date: `2026-01-${String(Number(rnd(31n)) + 1).padStart(2, '0')}`, lines };
     };
@@ -1402,13 +1677,15 @@ describe('job orders and documents (migration 0013)', () => {
     assert.ok(await purchase('230.000000', 'manual', 'BDC rate quoted on WhatsApp'));
     await assert.rejects(tx(tenantA, (t) => t.client.query(
       "INSERT INTO job_orders (tenant_id, customer_id, job_type, ordered_on, car_price_minor, car_price_currency, landing_charge_ngn) VALUES ($1, $2, 'car_purchase', '2026-01-09', 1, 'CNY', 0)", [tenantA, c])), /job_orders_quote_shape/);
-    await assert.rejects(tx(tenantA, (t) => job(t, tenantA, c, 'emm_funded')), /job_orders_funding_reason/);
+    await assert.rejects(tx(tenantA, (t) => t.client.query("INSERT INTO job_orders (tenant_id, customer_id, job_type, funding, ordered_on, car_price_minor, car_price_currency, quote_rate, quote_rate_source, quote_rate_note, landing_charge_ngn) VALUES ($1, $2, 'car_purchase', 'emm_funded', '2026-01-09', 1, 'CNY', '230.000000', 'manual', 'fixture', 0)", [tenantA, c])), /job_orders_funding_reason/);
+    // EMM-funded means the client bought the car as its own stock: never a clearing-only job, the customer's own car (0014)
+    await assert.rejects(tx(tenantA, (t) => t.client.query("INSERT INTO job_orders (tenant_id, customer_id, job_type, funding, funding_reason, ordered_on, landing_charge_ngn) VALUES ($1, $2, 'clearing_only', 'emm_funded', 'x', '2026-01-09', 0)", [tenantA, c])), /job_orders_emm_funded_is_purchase/);
   });
 
   test('a quote is accepted once, with a stored accepted_quote document and at least one car; then the job is fixed', async () => {
     const c = await customer(tenantA);
     const j = await tx(tenantA, (t) => job(t, tenantA, c));
-    const accept = (d: string) => tx(tenantA, (t) => t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2, accepted_at = now() WHERE id = $1", [j, d]));
+    const accept = (d: string) => tx(tenantA, (t) => t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2 WHERE id = $1", [j, d]));
     const pending = await doc(tenantA);
     await assert.rejects(accept(pending), /stored accepted_quote document/);
     const receipt = await doc(tenantA, 'receipt');
@@ -1423,7 +1700,7 @@ describe('job orders and documents (migration 0013)', () => {
     const j3 = await tx(tenantA, (t) => job(t, tenantA, c));
     const car3 = await tx(tenantA, (t) => one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, 'JM1BK32F781234569', 'Mazda', '3', 2019) RETURNING id", [tenantA]));
     await tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id) VALUES ($1, $2, $3)', [tenantA, j3, car3]));
-    await assert.rejects(tx(tenantA, (t) => t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2, accepted_at = now() WHERE id = $1", [j3, pending])), /job_orders_one_job_per_quote/);
+    await assert.rejects(tx(tenantA, (t) => t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2 WHERE id = $1", [j3, pending])), /job_orders_one_job_per_quote/);
     await assert.rejects(tx(tenantA, (t) => t.client.query("UPDATE job_orders SET landing_charge_ngn = 1 WHERE id = $1", [j])), /permission denied/);
     const car2 = await tx(tenantA, (t) => one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, 'JM1BK32F781234568', 'Mazda', '3', 2019) RETURNING id", [tenantA]));
     await assert.rejects(tx(tenantA, (t) => t.client.query('INSERT INTO job_order_vehicles (tenant_id, job_order_id, vehicle_id) VALUES ($1, $2, $3)', [tenantA, j, car2])), /only before its quote is accepted/);
@@ -1446,7 +1723,7 @@ describe('job orders and documents (migration 0013)', () => {
     assert.equal(uploader, USER);
     const c = await customer(tenantB);
     const jb = await tx(tenantB, (t) => job(t, tenantB, c));
-    await assert.rejects(tx(tenantB, (t) => t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2, accepted_at = now() WHERE id = $1", [jb, d])), /job_orders_quote_document|stored accepted_quote/);
+    await assert.rejects(tx(tenantB, (t) => t.client.query("UPDATE job_orders SET status = 'quote_accepted', accepted_quote_document_id = $2 WHERE id = $1", [jb, d])), /job_orders_quote_document|stored accepted_quote/);
     for (const table of ['documents', 'job_orders', 'job_order_vehicles', 'tenant_counters']) {
       assert.equal(await tx(tenantB, async (t) => (await t.client.query(`SELECT 1 FROM ${table} WHERE tenant_id = $1`, [tenantA])).rowCount), 0, table);
     }

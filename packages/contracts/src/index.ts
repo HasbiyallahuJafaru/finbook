@@ -97,6 +97,8 @@ export const JobType = z.enum(['car_purchase', 'clearing_only']);
 export const Funding = z.enum(['customer_funded', 'emm_funded']);
 export const JobStatus = z.enum(['draft', 'quote_accepted', 'completed', 'abandoned', 'cancelled']);
 export const QuoteRateSource = z.enum(['cbn', 'market', 'manual']);
+/** A question about how we book something the client recorded, raised by the database as the entry commits; a firm sign-off answers it, and never unlocks a posting (ADR 0016). */
+export const FlagKind = z.enum(['emm_funded', 'converted_to_stock', 'posted_before_quote', 'supplier_cost_not_covered', 'cost_after_completion']);
 
 export const CreateJobOrder = z.strictObject({
   customerId: z.uuid(),
@@ -120,9 +122,18 @@ export const JobOrder = z.object({
   status: JobStatus, orderedOn: isoDate,
   carPrice: z.object({ amountMinor: MinorUnits, currency: z.string() }).nullable(),
   quoteRate: z.object({ rate: z.string(), source: QuoteRateSource, note: z.string().nullable() }).nullable(),
-  landingChargeNgn: MinorUnits, acceptedQuoteDocumentId: z.uuid().nullable(), vehicleIds: z.array(z.uuid()),
+  landingChargeNgn: MinorUnits, acceptedQuoteDocumentId: z.uuid().nullable(),
+  /** Each car with its own quoted price (car purchases; null on clearing-only), in the job's car currency. */
+  vehicles: z.array(z.object({ vehicleId: z.uuid(), carPriceMinor: MinorUnits.nullable() })),
+  /** Flags the database raised as entries committed, each with its firm sign-off once given (ADR 0016). */
+  flags: z.array(z.object({
+    id: z.uuid(), kind: FlagKind, vehicleId: z.uuid(), entryId: z.uuid(), raisedAt: z.string(),
+    signOff: z.object({ reason: z.string(), signedBy: z.string(), signedAt: z.string() }).nullable(),
+  })),
 });
 export type JobOrder = z.infer<typeof JobOrder>;
 export const ListJobOrdersQuery = z.strictObject({ status: JobStatus.optional() });
-export const AddJobVehicle = z.strictObject({ vehicleId: z.uuid() });
+/** A car on a car purchase needs its own quoted price; a clearing-only car has none (the database checks both). */
+export const AddJobVehicle = z.strictObject({ vehicleId: z.uuid(), carPriceMinor: MinorUnits.optional() });
 export const AcceptQuote = z.strictObject({ documentId: z.uuid() });
+export const SignOffFlag = z.strictObject({ flagId: z.uuid(), reason: z.string().trim().min(1).max(500) });

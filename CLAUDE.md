@@ -2,6 +2,15 @@
 
 Multi-tenant bookkeeping for vehicle importers (first client: EMM's Shop — cars bought in China in RMB, cleared at Apapa in shared containers, sold in NGN). Our consultancy runs it for 20–100 client businesses. Auditors must be able to trace and re-perform every number.
 
+## Who we are: bookkeepers, not the business
+
+**We keep our clients' books. We never take part in their business.** Each client (a tenant) buys, imports, exports, sells, pays and reviews its own deals. It sends us its financial records. We record them in its ledger, keep its balances, audit them, and tell it where it stands: profit per car, costs, FX, miscellaneous spending and tax.
+- **"EMM" in rules, code and the spec means the client EMM's Shop, never us.** "EMM pays the supplier" is the client paying its own supplier. Our firm is never a buyer, seller, payer, payee or counterparty in any client's ledger.
+- **Firm roles** (`firm_admin`, `firm_accountant`, `firm_reviewer`) are our staff: they record, review and report on a client's books. **Client roles** (`client_owner`, `client_staff`, `client_viewer`) are the client's own people.
+- **The books record what happened.** A real transaction is never refused because of business policy. The database refuses only what would make the books wrong or untraceable: unbalanced, unevidenced foreign lines, money with no source, revenue with no car, an edited posted row, a closed period. Anything unusual but real (paid before the customer paid, EMM funding not yet confirmed, a conversion to stock, costs before the quote, a negative cut) **posts and is flagged** on the exception report (`job_order_exceptions`) for a firm reviewer. A wrong classification is corrected by reversal (owner, 2026-11-17; ADR 0016).
+- **A firm sign-off confirms our accounting treatment; it never approves the client's deal.** It clears a flag and never unlocks a posting.
+- When a spec line or an old ADR reads as if we approve or block a client's transactions, apply this section and raise the line with the owner.
+
 **Spec (source of truth):** `docs/spec/build-spec.md` · **Client findings:** `docs/spec/emms-ledger-review.md` · **Decisions:** `docs/decisions/` (ADRs, one per non-obvious choice).
 If code and spec disagree, stop and ask. Never "fix" the spec silently.
 
@@ -32,10 +41,11 @@ Break any of these and the work is wrong, however good it looks.
 - Posted entries are immutable. Corrections are reversals plus new entries (`reverses_entry_id`). No UPDATE/DELETE on posted rows, ever.
 - Locked periods refuse inserts. Every entry has `source_type`, `source_id`, `created_by` and an idempotency key. Each entry stores a hash chained to the previous entry for its tenant.
 
-**EMM's Shop business model** (see spec → Vehicle module)
-- Job types: `car_purchase` and `clearing_only`. Funding is set per job: `customer_funded` (default, agent accounting: revenue = EMM's cut) or `emm_funded` (rare exception, principal accounting: the car is inventory, needs a reason plus reviewer approval).
-- A supplier payment on a job with no customer receipt is blocked until the job is approved as `emm_funded`.
-- The cut is never typed in: it is the accepted quote minus actual cost, split into car markup (4100) and clearing margin (4200). No posting to a job without an accepted quote document.
+**How we book EMM's Shop** (the client's business model; see spec → Vehicle module, ADR 0016)
+- Job types: `car_purchase` and `clearing_only`. Funding is set per job and never changes: `customer_funded` (default, agent accounting: the client's revenue = its cut) or `emm_funded` (rare exception, principal accounting: the car is the client's inventory, needs a reason, flagged until a firm reviewer or admin signs off the treatment).
+- A supplier payment on a customer-funded job that the customer's funds held don't cover posts, and is flagged (`supplier_cost_not_covered`): the client may be financing the car itself, which would make it EMM-funded.
+- Customer funds held (2150) come in only as a cash receipt from the job's own customer, and leave only in a completion, a cash refund or a conversion to stock. A deposit is never booked as income (owner, 2026-11-15).
+- The cut is never typed in: it is each car's accepted quote minus its actual cost, split into car markup (4100) and clearing margin (4200), with vehicle revenue always naming its car. Each car on a car purchase has its own quoted price. Costs may post before the quote is accepted (flagged); a job can't complete without an accepted quote document.
 - The RMB selling price is converted at the quote-day rate locked on the job order. The gap against the rate actually paid posts to FX (7000), never into margin.
 
 **FX**

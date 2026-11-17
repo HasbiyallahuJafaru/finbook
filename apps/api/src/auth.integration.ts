@@ -488,7 +488,7 @@ describe('documents and job orders', () => {
     const quote = await evidence(ownerA, PDF);
     assert.equal((await send('POST', `/job-orders/${job.id}/accept-quote`, ownerA, { documentId: quote.id })).status, 422); // no car yet
     const added = await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: car.id });
-    assert.deepEqual([added.status, ((await added.json()) as { vehicleIds: string[] }).vehicleIds], [201, [car.id]]);
+    assert.deepEqual([added.status, ((await added.json()) as { vehicles: unknown[] }).vehicles], [201, [{ vehicleId: car.id, carPriceMinor: null }]]);
     const accepted = await send('POST', `/job-orders/${job.id}/accept-quote`, ownerA, { documentId: quote.id });
     assert.deepEqual([accepted.status, ((await accepted.json()) as { status: string }).status], [200, 'quote_accepted']);
     const late = (await (await send('POST', '/vehicles', ownerA, { vin: 'SALGS2SE5LA000002', make: 'Land Rover', model: 'Range Rover', year: 2020 })).json()) as { id: string };
@@ -521,5 +521,60 @@ describe('documents and job orders', () => {
     await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: carA.id });
     assert.equal((await send('POST', `/job-orders/${job.id}/accept-quote`, ownerA, { documentId: quoteB.id })).status, 422); // A with B's document
     assert.equal((await get('/job-orders', bearer(viewerA))).status, 403);
+  });
+
+  test('a firm reviewer signs off a flag the database raised; recorders cannot; another tenant gets 404 (0014)', async () => {
+    await ownerPool.query("INSERT INTO firm_staff (clerk_user_id) VALUES ('user_reviewer') ON CONFLICT DO NOTHING");
+    await ownerPool.query("INSERT INTO firm_access (tenant_id, clerk_user_id, role, granted_by) VALUES ($1, 'user_reviewer', 'firm_reviewer', 'user_admin'), ($2, 'user_reviewer', 'firm_reviewer', 'user_admin')", [tenantA, tenantB]);
+    const review = (tenant: string, path: string, body: unknown, key = randomUUID()) => fetch(`${url}${path}`, {
+      method: 'POST', body: JSON.stringify(body),
+      headers: { ...bearer({ sub: 'user_reviewer', fva: [1, 1] }, { 'x-tenant-id': tenant }), 'content-type': 'application/json', 'idempotency-key': key } });
+    const job = (await (await send('POST', '/job-orders', ownerA, { customerId: customerA, jobType: 'car_purchase', funding: 'emm_funded', fundingReason: 'bought ahead of a buyer',
+      orderedOn: '2026-01-09', carPrice: { amountMinor: '9800000', currency: 'CNY' }, quoteRate: { rate: '108', source: 'cbn' }, landingChargeNgn: '0' })).json()) as { id: string };
+    const path = `/job-orders/${job.id}/sign-offs`;
+    const car = (await (await send('POST', '/vehicles', ownerA, { vin: 'SALGS2SE5LA000006', make: 'Land Rover', model: 'Range Rover', year: 2020 })).json()) as { id: string };
+    const unpriced = await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: car.id });
+    assert.equal(unpriced.status, 422);
+    assert.match(await unpriced.text(), /each car on a car purchase needs its own quoted price/);
+    await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: car.id, carPriceMinor: '9800000' });
+    assert.equal((await send('POST', `/job-orders/${job.id}/accept-quote`, ownerA, { documentId: (await evidence(ownerA, PDF)).id })).status, 200);
+    const early = await review(tenantA, path, { flagId: randomUUID(), reason: 'nothing to sign yet' });
+    assert.equal(early.status, 422); // nothing posted for the car yet: no flag on this job
+    assert.match(await early.text(), /that flag is not on this job order/);
+    // The client buys the car for naira (Dr 1200 / Cr 1000). There is no posting endpoint yet, so the owner posts it here.
+    const owner = await ownerPool.connect();
+    try {
+      await owner.query('BEGIN');
+      const account = async (code: string, type: string) => (await owner.query<{ id: string }>(
+        'INSERT INTO accounts (tenant_id, code, name, type) VALUES ($1, $2, $3, $4) RETURNING id', [tenantA, code, `Account ${code}`, type])).rows[0]?.id;
+      const [cash, transit] = [await account('1000', 'asset'), await account('1200', 'asset')];
+      const period = (await owner.query<{ id: string }>("INSERT INTO periods (tenant_id, starts_on, ends_on) VALUES ($1, '2026-01-01', '2026-01-31') RETURNING id", [tenantA])).rows[0]?.id;
+      const entry = (await owner.query<{ id: string }>(
+        `INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, created_by)
+         VALUES ($1, $2, '2026-01-10', 'car bought for naira', 'test', uuidv7(), 'api-flag-1', 'user_owner_a') RETURNING id`, [tenantA, period])).rows[0]?.id;
+      await owner.query("INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, vehicle_id) VALUES ($1, $2, $3, 500000000, 0, 'NGN', 500000000, $4), ($1, $2, $5, 0, 500000000, 'NGN', 500000000, NULL)",
+        [tenantA, entry, transit, car.id, cash]);
+      await owner.query('COMMIT');
+    } finally {
+      owner.release();
+    }
+    // The database raised the flag as the entry committed; the job order lists it, not yet signed off.
+    const raised = ((await (await get(`/job-orders/${job.id}`, bearer(ownerA))).json()) as { flags: { id: string; kind: string; vehicleId: string; signOff: unknown }[] }).flags;
+    assert.deepEqual(raised.map(({ kind, vehicleId, signOff }) => ({ kind, vehicleId, signOff })), [{ kind: 'emm_funded', vehicleId: car.id, signOff: null }]);
+    const approval = { flagId: raised[0]?.id, reason: 'buyer lined up; this model sells within a month' };
+    assert.equal((await send('POST', path, ownerA, approval)).status, 403); // a recorder never signs off
+    assert.equal((await review(tenantA, path, { ...approval, reason: '  ' })).status, 400);
+    assert.equal((await review(tenantB, path, approval)).status, 404); // B's reviewer on A's job: same as no job
+    const key = randomUUID();
+    const first = await review(tenantA, path, approval, key);
+    const approved = (await first.json()) as { flags: { kind: string; signOff: { reason: string; signedBy: string } | null }[] };
+    assert.equal(first.status, 201);
+    assert.deepEqual(approved.flags.map(({ kind, signOff }) => ({ kind, reason: signOff?.reason, signedBy: signOff?.signedBy })), [{ kind: 'emm_funded', reason: approval.reason, signedBy: 'user_reviewer' }]);
+    const retry = await review(tenantA, path, approval, key);
+    assert.deepEqual([retry.status, await retry.json()], [201, approved]); // same key: the stored answer, no second effect
+    assert.equal((await review(tenantA, path, approval)).status, 409); // a new key: that flag is already signed off
+    const audit = await ownerPool.query("SELECT l.actor FROM audit_log l JOIN job_order_sign_offs s ON s.id = l.entity_id WHERE l.entity = 'job_order_sign_offs' AND s.flag_id = $1", [approval.flagId]);
+    assert.deepEqual(audit.rows, [{ actor: 'user_reviewer' }]);
+    assert.equal((await get(`/job-orders/${job.id}`, bearer(ownerB))).status, 404);
   });
 });

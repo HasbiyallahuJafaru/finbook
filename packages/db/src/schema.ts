@@ -154,7 +154,11 @@ export const auditLog = pgTable('audit_log', {
   after: jsonb('after'),
   ip: inet('ip'),
   at: timestamp('at', { withTimezone: true }).notNull().defaultNow(),
-}, (t) => [index('audit_log_tenant_at').on(t.tenantId, t.at)]);
+}, (t) => [
+  index('audit_log_tenant_at').on(t.tenantId, t.at),
+  // four eyes on sign-offs reads what one person touched (0014)
+  index('audit_log_tenant_actor').on(t.tenantId, t.actor),
+]);
 
 /**
  * Daily reference (spot) rates, global, not per tenant (spec → Currency and FX, rule 7). They pre-fill forms and
@@ -381,6 +385,8 @@ export const jobOrders = pgTable('job_orders', {
   check('job_orders_customer_kind', sql`${t.customerKind} = 'customer'`),
   check('job_orders_job_type', sql`${t.jobType} in ('car_purchase', 'clearing_only')`),
   check('job_orders_funding', sql`${t.funding} in ('customer_funded', 'emm_funded')`),
+  // EMM-funded means the client bought the car as its own stock: a clearing-only job is the customer's own car (ledger audit of 0014)
+  check('job_orders_emm_funded_is_purchase', sql`${t.funding} = 'customer_funded' OR ${t.jobType} = 'car_purchase'`),
   check('job_orders_funding_reason', sql`${t.funding} = 'customer_funded' OR btrim(coalesce(${t.fundingReason}, '')) <> ''`),
   check('job_orders_status', sql`${t.status} in ('draft', 'quote_accepted', 'completed', 'abandoned', 'cancelled')`),
   check('job_orders_number', sql`${t.number} > 0`),
@@ -394,15 +400,59 @@ export const jobOrders = pgTable('job_orders', {
   check('job_orders_accepted', sql`(${t.acceptedQuoteDocumentId} IS NULL) = (${t.acceptedAt} IS NULL) AND (${t.status} = 'draft') = (${t.acceptedAt} IS NULL)`),
 ]);
 
-/** The cars on a job order (one order can cover five cars); a car belongs to one job order at most. */
+/** The cars on a job order (one order can cover five cars), each with its own quoted price on a car purchase; a car belongs to one job order at most. */
 export const jobOrderVehicles = pgTable('job_order_vehicles', {
   id: id(),
   tenantId: tenantId(),
   jobOrderId: uuid('job_order_id').notNull(),
   vehicleId: uuid('vehicle_id').notNull(),
+  /** The car's own quoted price, in the job's car currency (owner 2026-11-17: each car has its own provable cut). Car purchases only. */
+  carPriceMinor: bigint('car_price_minor', { mode: 'bigint' }),
   createdAt: createdAt(),
 }, (t) => [
+  check('job_order_vehicles_car_price', sql`${t.carPriceMinor} > 0`),
   unique('job_order_vehicles_one_job_per_car').on(t.tenantId, t.vehicleId),
+  unique('job_order_vehicles_job_car').on(t.tenantId, t.jobOrderId, t.vehicleId),
   foreignKey({ name: 'job_order_vehicles_job', columns: [t.tenantId, t.jobOrderId], foreignColumns: [jobOrders.tenantId, jobOrders.id] }),
   foreignKey({ name: 'job_order_vehicles_vehicle', columns: [t.tenantId, t.vehicleId], foreignColumns: [vehicles.tenantId, vehicles.id] }),
+]);
+
+/**
+ * A flag a firm reviewer works through (ADR 0016; owner 2026-11-17: the client's transactions are booked as they happened,
+ * policy questions are flagged, never refused). The database raises each one when the entry that caused it commits, under
+ * the tenant's posting lock, and nobody can change or delete it: a flag is evidence that something happened.
+ */
+export const jobOrderFlags = pgTable('job_order_flags', {
+  id: id(),
+  tenantId: tenantId(),
+  jobOrderId: uuid('job_order_id').notNull(),
+  vehicleId: uuid('vehicle_id').notNull(),
+  entryId: uuid('entry_id').notNull(),
+  kind: text('kind').notNull(),
+  raisedAt: timestamp('raised_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  unique('job_order_flags_tenant_id_id').on(t.tenantId, t.id),
+  unique('job_order_flags_one_per_entry').on(t.tenantId, t.entryId, t.vehicleId, t.kind),
+  index('job_order_flags_tenant_job').on(t.tenantId, t.jobOrderId),
+  foreignKey({ name: 'job_order_flags_job_car', columns: [t.tenantId, t.jobOrderId, t.vehicleId], foreignColumns: [jobOrderVehicles.tenantId, jobOrderVehicles.jobOrderId, jobOrderVehicles.vehicleId] }),
+  foreignKey({ name: 'job_order_flags_entry', columns: [t.tenantId, t.entryId], foreignColumns: [journalEntries.tenantId, journalEntries.id] }),
+  check('job_order_flags_kind', sql`${t.kind} in ('emm_funded', 'converted_to_stock', 'posted_before_quote', 'supplier_cost_not_covered', 'cost_after_completion', 'completion_unverified', 'cost_credited')`),
+]);
+
+/**
+ * A firm reviewer's or admin's sign-off on one flag: it confirms our accounting treatment of what the client recorded and
+ * clears that flag; it never unlocks a posting. Who and when are stamped by the database, which also refuses anyone who
+ * touched the job, its cars, its quote or any entry for the car (four eyes). One per flag, never changed.
+ */
+export const jobOrderSignOffs = pgTable('job_order_sign_offs', {
+  id: id(),
+  tenantId: tenantId(),
+  flagId: uuid('flag_id').notNull(),
+  reason: text('reason').notNull(),
+  signedBy: text('signed_by').notNull().default(sql`app_user_id()`),
+  signedAt: timestamp('signed_at', { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  unique('job_order_sign_offs_one_per_flag').on(t.tenantId, t.flagId),
+  foreignKey({ name: 'job_order_sign_offs_flag', columns: [t.tenantId, t.flagId], foreignColumns: [jobOrderFlags.tenantId, jobOrderFlags.id] }),
+  check('job_order_sign_offs_reason', sql`btrim(${t.reason}) <> ''`),
 ]);

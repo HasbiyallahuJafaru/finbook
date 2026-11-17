@@ -2,7 +2,7 @@
 import { writeFileSync } from 'node:fs';
 import { z } from 'zod';
 import {
-  AcceptQuote, AddJobVehicle, Counterparty, CreateCounterparty, CreateJobOrder, CreateUpload, CreateVehicle, Document, DownloadTicket, IdempotencyKeyHeader, JobOrder,
+  AcceptQuote, AddJobVehicle, SignOffFlag, Counterparty, CreateCounterparty, CreateJobOrder, CreateUpload, CreateVehicle, Document, DownloadTicket, IdempotencyKeyHeader, JobOrder,
   ListCounterpartiesQuery, ListJobOrdersQuery, ListVehiclesQuery, MeResponse, TenantIdHeader, UploadTicket, Vehicle,
 } from './index.ts';
 
@@ -52,6 +52,8 @@ const doc = {
     '/job-orders/{id}/vehicles': { post: { parameters: [tenantHeader, idempotencyHeader, idPath], requestBody: body(AddJobVehicle), responses: { 201: ok('Car added (draft only)', JobOrder), ...writeErrors } } },
     '/job-orders/{id}/accept-quote': { post: { parameters: [tenantHeader, idempotencyHeader, idPath], requestBody: body(AcceptQuote),
       responses: { 200: ok('Quote accepted; the quote and cars are now fixed', JobOrder), ...writeErrors } } },
+    '/job-orders/{id}/sign-offs': { post: { parameters: [tenantHeader, idempotencyHeader, idPath], requestBody: body(SignOffFlag),
+      responses: { 201: ok('One flag signed off by a firm reviewer or admin; who and when are stamped by the database', JobOrder), ...writeErrors } } },
     '/me': { get: { parameters: [tenantHeader], responses: { 200: { description: 'The caller in this tenant', content: { 'application/json': { schema: json(MeResponse) } } }, ...errors } } },
   },
 };

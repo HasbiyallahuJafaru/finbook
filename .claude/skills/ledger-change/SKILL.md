@@ -19,7 +19,8 @@ Money bugs are silent. This procedure makes them loud.
 - Assert all four: lines balance, each line's amount, the account balances afterwards, and the trial balance still nets to zero.
 - For allocation: assert that the allocated shares add up exactly to the amount paid, with the remainder on the first car.
 - For agent jobs (`customer_funded`): no inventory account is touched. The cut posts to 4100 (car markup at the quote-day rate) and 4200 (landing charge minus actual landed cost). The rate gap posts to 7000.
-- For `emm_funded` jobs: inventory 1200/1210 is used, the sale posts gross, and approval must exist before the supplier payment.
+- For `emm_funded` jobs: inventory 1200/1210 is used and the sale posts gross. Postings go through before any sign-off; until a firm reviewer signs off the treatment, the job shows on `job_order_exceptions`.
+- We are the client's bookkeepers (CLAUDE.md → Who we are): a rule refuses an entry only when the entry would make the books wrong or untraceable. A business-policy concern (paid before the customer paid, unconfirmed funding, costs before the quote) becomes an exception flag with a test proving it appears and clears, never a refusal.
 
 ## Implement
 
