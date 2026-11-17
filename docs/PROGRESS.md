@@ -39,7 +39,7 @@ _Last updated: 2026-11-17 (session: job orders in the ledger, record-then-flag, 
 | --- | --- |
 | 0 Foundations | Done, except owner-blocked items (below). Clerk auth built (guard, permission map, `GET /me`); needs the Clerk app's keys on staging and the membership webhook |
 | 1 Ledger core | **Done.** Gate evidence: local pre-push run (ADR 0007): 10k random entries net to zero, cross-tenant reads return zero rows |
-| 2 Vehicles + FX | **In progress.** Gate approved by the owner (2026-11-15, provisional: the accountant still reviews it and fixes come back here). Ledger slices built (customer-funded flow, spot rates + realized FX, revaluation, EMM-funded); tables + endpoints and report basis to build |
+| 2 Vehicles + FX | **In progress.** Gate approved by the owner (2026-11-15, provisional: the accountant still reviews it and fixes come back here). Ledger slices built (customer-funded flow, spot rates + realized FX, revaluation, EMM-funded), vehicles, job orders, evidence documents, and job orders in the ledger with flags and sign-offs (0014). Allowed entry shapes with the posting endpoints, then costs/containers and the report basis, to build |
 | 3–6 | Not started |
 
 ## Phase 2: now and next
@@ -78,8 +78,19 @@ Research behind the next slices: `docs/research/2026-11-15-existing-platforms.md
 - Known gaps: no mixed v2/v3 hash-chain test across the upgrade; the 10k fuzz test doesn't include pool, payable or spot lines; `counterparty_id` isn't typed (customer vs supplier) until the counterparties table lands (slice 3). Evidence stays optional on purpose: the spec lets entries post as "evidence pending" and flags them on the exception report.
 
 **Next slices, in order (build from the top):**
-1. **`emm_funded` (principal) path: built** (migration 0008, ADR 0012); the job-order parts are listed under the endpoints-slice blockers above.
-2. **Tables + endpoints.** Vehicles (VIN check digit, unique per tenant, `vin_needs_correction`), job orders (gapless numbers, accepted-quote evidence, funding field), shipments/containers, cost types, `cost_allocations` storing the split basis (borrowed from ERPNext's landed cost voucher), refuse costs on a completed job. Needs Clerk auth first (phase 0 item).
+1. **Allowed entry shapes + posting endpoints** (owner, 2026-11-17; ADR 0016 → Consequences):
+   - every posting rule becomes a named entry type with one database-checked shape;
+   - manual journals can't touch the job accounts;
+   - the fuzz test covers job postings;
+   - this closes the open round-4 findings and the completion re-performance blocker;
+   - it adds the rules that can't be recorded yet (customer paying the supplier directly, RMB receipts and refunds).
+2. **Shipments/containers, cost types, `cost_allocations` and `POST /costs`.** Split basis stored (borrowed from ERPNext's landed cost voucher). Owner defaults:
+   - split by value at pool cost;
+   - evidence may be pending unless the cost type requires a receipt;
+   - containers close for good;
+   - every cash-paid car cost carries a cost type, and the car price is never one.
+
+   Vehicles, job orders and their ledger rules are built (0011–0014).
 3. **Reports take a basis** (`spot` | `pool`); client-facing ones default to and only accept `spot` (ADR 0009).
 
 ## Waiting on the owner
