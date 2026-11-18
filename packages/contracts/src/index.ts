@@ -147,6 +147,14 @@ export const SignOffFlag = z.strictObject({ flagId: z.uuid(), reason: z.string()
  * and the entry type comes from the rule. More types join this union batch by batch.
  */
 const postingFacts = { entryDate: isoDate, memo: z.string().trim().min(1).max(500).optional(), evidenceDocumentId: z.uuid().optional() };
+/**
+ * The day's spot (reference) rate, confirmed by the user: the stored CBN rate pre-fills it (cbn, checked by the database), or
+ * they type another with a note saying why (manual). Clients see the spot basis (ADR 0009, 0010).
+ */
+const Spot = z.strictObject({ rate: RateString, source: z.enum(['cbn', 'manual']), note: z.string().trim().min(1).max(500).optional() });
+// A foreign-currency posting needs its document: the rate is provable only from it (CLAUDE.md; owner 2026-11-17).
+const foreign = { currency: ForeignCurrency, amountMinor: MinorUnits };
+const foreignFacts = { ...postingFacts, evidenceDocumentId: z.uuid() };
 export const CreatePosting = z.discriminatedUnion('type', [
   /** The job's customer pays towards a car: held in 2150 until the job completes. */
   z.strictObject({ type: z.literal('customer_receipt'), vehicleId: z.uuid(), amountNgn: MinorUnits, ...postingFacts }),
@@ -154,6 +162,15 @@ export const CreatePosting = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('customer_refund'), vehicleId: z.uuid(), amountNgn: MinorUnits, ...postingFacts }),
   /** The customer pays what they owe (1100) after the car's completion or sale. */
   z.strictObject({ type: z.literal('receivable_receipt'), vehicleId: z.uuid(), amountNgn: MinorUnits, ...postingFacts }),
+  /** Foreign currency bought for naira at the rate on the bank's or BDC's receipt: it joins the weighted-average pool (1010). */
+  z.strictObject({ type: z.literal('currency_purchase'), ...foreign,
+    rate: z.strictObject({ rate: RateString, source: z.enum(['bank_receipt', 'bdc_receipt', 'manual']), note: z.string().trim().min(1).max(500).optional() }), ...foreignFacts }),
+  /** The China supplier paid from the pool for one car: the car carries the pool's average cost. */
+  z.strictObject({ type: z.literal('pool_payment'), vehicleId: z.uuid(), ...foreign, spot: Spot, ...foreignFacts }),
+  /** A supplier's invoice for one car at the invoice rate: the car's cost goes up and a foreign payable is owed. */
+  z.strictObject({ type: z.literal('supplier_invoice'), vehicleId: z.uuid(), supplierId: z.uuid(), ...foreign, invoiceRate: RateString, spot: Spot, ...foreignFacts }),
+  /** (Part of) a supplier's invoice for one car paid from the pool: the gap against the booked cost is realized FX (7000). */
+  z.strictObject({ type: z.literal('supplier_settlement'), vehicleId: z.uuid(), supplierId: z.uuid(), ...foreign, spot: Spot, ...foreignFacts }),
 ]);
 export type CreatePosting = z.infer<typeof CreatePosting>;
 export const Posting = z.object({
@@ -166,3 +183,7 @@ export const Posting = z.object({
   flags: z.array(z.object({ id: z.uuid(), kind: FlagKind, vehicleId: z.uuid() })),
 });
 export type Posting = z.infer<typeof Posting>;
+/** Evidence for an entry that posted without it (owner 2026-11-17: evidence pending until attached; a document backing several entries is listed for review). */
+export const AttachEvidence = z.strictObject({ documentId: z.uuid() });
+export const EntryEvidence = z.object({ entryId: z.uuid(), documentId: z.uuid(), attachedBy: z.string(), attachedAt: z.string() });
+export type EntryEvidence = z.infer<typeof EntryEvidence>;

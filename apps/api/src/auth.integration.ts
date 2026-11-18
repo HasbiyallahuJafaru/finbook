@@ -640,6 +640,26 @@ describe('documents and job orders', () => {
       assert.deepEqual([owed.status, ((await owed.json()) as { message: string }).message], [422, 'receipt exceeds what this customer owes for this car']); // nothing billed yet
     });
 
+    test("evidence attached later clears an entry from evidence pending; a shared slip is listed for review; another tenant's entry is no entry", async () => {
+      const bare = (await (await post(ownerA, receipt('2000'))).json()) as { entryId: string };
+      const pendingNow = async () => (await ownerPool.query('SELECT entry_id FROM entries_missing_evidence WHERE entry_id = $1', [bare.entryId])).rowCount;
+      assert.equal(await pendingNow(), 1);
+      const attach = (claims: Record<string, unknown>, entryId: string, documentId: string) => fetch(`${url}/postings/${entryId}/evidence`, {
+        method: 'POST', body: JSON.stringify({ documentId }), headers: { ...bearer(claims), 'content-type': 'application/json', 'idempotency-key': randomUUID() } });
+      const slip = (await evidence(ownerA, Buffer.from('%PDF-1.7\n% fixture bank slip for the bare receipt\n%%EOF\n'), { docType: 'receipt' })).id;
+      assert.equal((await attach(ownerB, bare.entryId, slip)).status, 404); // B can't reach A's entry
+      const attached = await attach(ownerA, bare.entryId, slip);
+      assert.equal(attached.status, 201);
+      assert.deepEqual(((await attached.json()) as { attachedBy: string }).attachedBy, 'user_owner_a');
+      assert.equal(await pendingNow(), 0);
+      const again = await attach(ownerA, bare.entryId, (await evidence(ownerA, Buffer.from('%PDF-1.7\n% a second slip\n%%EOF\n'), { docType: 'receipt' })).id);
+      assert.deepEqual([again.status, ((await again.json()) as { message: string }).message], [422, 'that entry already has its evidence, or takes none']);
+      // The same slip backing a second entry posts (one transfer can pay for two things), and is listed for a firm reviewer.
+      const reused = (await (await post(ownerA, receipt('3000', { evidenceDocumentId: slip }))).json()) as { entryId: string };
+      const listed = await ownerPool.query<{ entry_ids: string[] }>('SELECT entry_ids FROM evidence_shared WHERE tenant_id = $1', [tenantA]);
+      assert.deepEqual(listed.rows.map((r) => [...r.entry_ids].sort()), [[bare.entryId, reused.entryId].sort()]);
+    });
+
     test('evidence is a stored document of yours; a locked month refuses; viewers can\'t post; another tenant\'s car is no car', async () => {
       // A pending upload, a document that doesn't exist and another tenant's stored document: one answer, nothing revealed.
       const pending = ((await (await send('POST', '/documents/uploads', ownerA, { docType: 'receipt', mime: 'application/pdf', sizeBytes: PDF.length, sha256: sha(PDF), filename: 'r.pdf' })).json()) as Ticket).document.id;
@@ -675,6 +695,99 @@ describe('documents and job orders', () => {
       assert.equal((await post(ownerB, receipt('100', { vehicleId: randomUUID() }))).status, 422); // the same answer as a car that doesn't exist
       const entries = await ownerPool.query('SELECT count(*)::int AS n FROM journal_entries WHERE tenant_id = $1', [tenantB]);
       assert.deepEqual(entries.rows, [{ n: 0 }]);
+    });
+  });
+
+  // ── POST /postings: FX (ADR 0017, 0018). Worked by hand, to the kobo, with fixture rates:
+  //   buy CNY 100,000.00 at FIXTURE_RATE_BUY (100) = NGN 10,000,000.00 -> pool CNY 100,000.00 / NGN 10,000,000.00
+  //   car X: CNY 40,000.00 paid from the pool at its average 100 = NGN 4,000,000.00 -> pool CNY 60,000.00 / NGN 6,000,000.00
+  //   car Y: invoiced CNY 20,000.00 at FIXTURE_RATE_INVOICE (105) = NGN 2,100,000.00 owed; settled from the pool at 100 =
+  //   NGN 2,000,000.00, so the payable's NGN 2,100,000.00 clears with a realized FX gain of NGN 100,000.00 (7000, on car Y).
+  describe('POST /postings: FX', () => {
+    const cars: Record<string, string> = {};
+    let supplier = '';
+    const post = (claims: Record<string, unknown>, body: unknown) => fetch(`${url}/postings`, {
+      method: 'POST', body: JSON.stringify(body), headers: { ...bearer(claims), 'content-type': 'application/json', 'idempotency-key': randomUUID() } });
+    const date = '2026-01-10'; // within 7 days of the stored CBN fixture rate (2026-01-08, 108)
+    const spot = { rate: '108', source: 'cbn' };
+    /** A distinct stored slip for each foreign posting: its document is required (0017). */
+    const slip = async () => (await evidence(ownerA, Buffer.from(`%PDF-1.7
+% fixture slip ${randomUUID()}
+%%EOF
+`), { docType: 'receipt' })).id;
+    const lines = async (res: Response) => {
+      assert.equal(res.status, 201, await res.clone().text());
+      return ((await res.json()) as { lines: { account: string; debitNgn: string; creditNgn: string; amountMinor: string }[] }).lines.map((l) => [l.account, l.debitNgn, l.creditNgn, l.amountMinor]);
+    };
+    before(async () => {
+      supplier = ((await (await send('POST', '/counterparties', ownerA, { kind: 'supplier', name: 'Guangzhou Motors' })).json()) as { id: string }).id;
+      for (const [v, vin] of [['X', 'SALGS2SE5LA000011'], ['Y', 'SALGS2SE5LA000012']] as const) {
+        const job = (await (await send('POST', '/job-orders', ownerA, { customerId: customerA, jobType: 'car_purchase', orderedOn: '2026-01-05',
+          carPrice: { amountMinor: '4500000', currency: 'CNY' }, quoteRate: { rate: '110', source: 'manual', note: 'FIXTURE_RATE_QUOTE' }, landingChargeNgn: '0' })).json()) as { id: string };
+        cars[v] = ((await (await send('POST', '/vehicles', ownerA, { vin, make: 'BYD', model: 'Song Plus', year: 2024 })).json()) as { id: string }).id;
+        await send('POST', `/job-orders/${job.id}/vehicles`, ownerA, { vehicleId: cars[v], carPriceMinor: '4500000', landingChargeNgn: '0' });
+        assert.equal((await send('POST', `/job-orders/${job.id}/accept-quote`, ownerA, { documentId: (await evidence(ownerA, Buffer.from(`%PDF-1.7\n% quote ${v}\n%%EOF\n`))).id })).status, 200);
+        assert.equal((await post(ownerA, { type: 'customer_receipt', vehicleId: cars[v], amountNgn: '600000000', entryDate: date })).status, 201);
+      }
+    });
+
+    test('worked example: buy CNY, pay one car from the pool, invoice another and settle it with realized FX, to the kobo', async () => {
+      assert.deepEqual(await lines(await post(ownerA, { type: 'currency_purchase', currency: 'CNY', amountMinor: '10000000', rate: { rate: '100', source: 'bdc_receipt' }, entryDate: date, evidenceDocumentId: await slip() })),
+        [['1010', '1000000000', '0', '10000000'], ['1000', '0', '1000000000', '1000000000']]);
+      assert.deepEqual(await lines(await post(ownerA, { type: 'pool_payment', vehicleId: cars.X, currency: 'CNY', amountMinor: '4000000', spot, entryDate: date, evidenceDocumentId: await slip() })),
+        [['1150', '400000000', '0', '400000000'], ['1010', '0', '400000000', '4000000']]);
+      assert.deepEqual(await lines(await post(ownerA, { type: 'supplier_invoice', vehicleId: cars.Y, supplierId: supplier, currency: 'CNY', amountMinor: '2000000', invoiceRate: '105', spot, entryDate: date, evidenceDocumentId: await slip() })),
+        [['1150', '210000000', '0', '210000000'], ['2000', '0', '210000000', '2000000']]);
+      const settle = async (amountMinor: string) => ({ type: 'supplier_settlement', vehicleId: cars.Y, supplierId: supplier, currency: 'CNY', amountMinor, spot, entryDate: date, evidenceDocumentId: await slip() });
+      const over = await post(ownerA, await settle('2000001'));
+      assert.deepEqual([over.status, ((await over.json()) as { message: string }).message], [422, 'payment exceeds what is owed to this supplier for this car']);
+      assert.equal((await post(ownerA, await settle('0'))).status, 422); // the rule: an amount is positive
+      assert.deepEqual(await lines(await post(ownerA, await settle('2000000'))),
+        [['2000', '210000000', '0', '2000000'], ['1010', '0', '200000000', '2000000'], ['7000', '0', '10000000', '10000000']]);
+      const pool = await ownerPool.query("SELECT sum(CASE WHEN l.debit_ngn > 0 THEN l.amount_minor ELSE -l.amount_minor END)::text AS cny, sum(l.debit_ngn - l.credit_ngn)::text AS ngn FROM journal_lines l JOIN accounts a ON a.id = l.account_id WHERE a.tenant_id = $1 AND a.code = '1010'", [tenantA]);
+      assert.deepEqual(pool.rows, [{ cny: '4000000', ngn: '400000000' }]); // CNY 40,000.00 left at NGN 4,000,000.00
+    });
+
+    test('the pool, the payable, the spot rate and the supplier are checked against the books, not taken on trust', async () => {
+      const pay = async (extra: Record<string, unknown>) => post(ownerA, { type: 'pool_payment', vehicleId: cars.X, currency: 'CNY', amountMinor: '1000', spot, entryDate: date, evidenceDocumentId: await slip(), ...extra });
+      // Tenant B's own CNY never funds A's payments: A's pool is A's ledger only.
+      const bSlip = (await evidence(ownerB, Buffer.from('%PDF-1.7\n% B slip\n%%EOF\n'), { docType: 'receipt' })).id;
+      assert.equal((await post(ownerB, { type: 'currency_purchase', currency: 'CNY', amountMinor: '50000000', rate: { rate: '100', source: 'bank_receipt' }, entryDate: date, evidenceDocumentId: bSlip })).status, 201);
+      const message = async (res: Response) => [res.status, ((await res.json()) as { message: string }).message];
+      assert.deepEqual(await message(await pay({ amountMinor: '4000001' })), [422, 'payment exceeds the CNY held in the pool']);
+      assert.deepEqual(await message(await pay({ currency: 'USD' })), [422, 'payment exceeds the USD held in the pool']);
+      assert.deepEqual(await message(await pay({ spot: { rate: '108', source: 'manual' } })), [422, 'a manual spot rate needs a note']);
+      assert.equal((await pay({ spot: { rate: '109', source: 'cbn' } })).status, 422); // not the stored CBN rate for the day
+      assert.equal((await pay({ spot: { rate: '109', source: 'manual', note: 'bank quoted 109 at 10:00' } })).status, 201);
+      const bSupplier = ((await (await send('POST', '/counterparties', ownerB, { kind: 'supplier', name: 'B supplier' })).json()) as { id: string }).id;
+      for (const supplierId of [bSupplier, customerA, randomUUID()]) {
+        const res = await post(ownerA, { type: 'supplier_invoice', vehicleId: cars.Y, supplierId, currency: 'CNY', amountMinor: '1000', invoiceRate: '105', spot, entryDate: date, evidenceDocumentId: await slip() });
+        assert.deepEqual(await message(res), [422, 'the supplier must be one of your suppliers or agents']);
+      }
+      // A foreign posting without its document is refused at the door (and by the database behind it).
+      assert.equal((await post(ownerA, { type: 'currency_purchase', currency: 'CNY', amountMinor: '1000', rate: { rate: '100', source: 'bank_receipt' }, entryDate: date })).status, 400);
+      // B's own cars and entries: A's car is no car to B, for every FX type; A's document is no document to B.
+      for (const body of [{ type: 'pool_payment', vehicleId: cars.X, currency: 'CNY', amountMinor: '1000', spot, entryDate: date, evidenceDocumentId: bSlip },
+        { type: 'supplier_invoice', vehicleId: cars.Y, supplierId: bSupplier, currency: 'CNY', amountMinor: '1000', invoiceRate: '105', spot, entryDate: date, evidenceDocumentId: bSlip },
+        { type: 'supplier_settlement', vehicleId: cars.Y, supplierId: bSupplier, currency: 'CNY', amountMinor: '1000', spot, entryDate: date, evidenceDocumentId: bSlip }]) {
+        assert.deepEqual(await message(await post(ownerB, body)), [422, 'that car is not on one of your job orders']);
+      }
+      const bEntry = ((await ownerPool.query<{ id: string }>("SELECT id FROM journal_entries WHERE tenant_id = $1 AND source_type = 'currency_purchase'", [tenantB])).rows[0]?.id) ?? '';
+      const aDoc = await slip();
+      const attachAs = (claims: Record<string, unknown>, entryId: string, documentId: string) => fetch(`${url}/postings/${entryId}/evidence`, {
+        method: 'POST', body: JSON.stringify({ documentId }), headers: { ...bearer(claims), 'content-type': 'application/json', 'idempotency-key': randomUUID() } });
+      assert.deepEqual(await message(await attachAs(ownerB, bEntry, aDoc)), [422, 'evidence must be a stored document: confirm the upload first']);
+      assert.equal((await attachAs(viewerA, randomUUID(), aDoc)).status, 403);
+      assert.equal((await fetch(`${url}/postings/${randomUUID()}/evidence`, { method: 'POST', body: JSON.stringify({ documentId: aDoc }),
+        headers: { ...bearer({ sub: 'user_reviewer', fva: [1, 1] }, { 'x-tenant-id': tenantA }), 'content-type': 'application/json', 'idempotency-key': randomUUID() } })).status, 403);
+      assert.equal((await post(ownerA, { type: 'currency_purchase', currency: 'CNY', amountMinor: '1000', rate: { rate: '0', source: 'bank_receipt' }, entryDate: date, evidenceDocumentId: await slip() })).status, 400);
+      assert.equal((await post(ownerA, { type: 'currency_purchase', currency: 'NGN', amountMinor: '1000', rate: { rate: '1', source: 'bank_receipt' }, entryDate: date, evidenceDocumentId: await slip() })).status, 400);
+      // Rounding: CNY 3.00 at 3.333333 costs 999.9999 kobo, posted as NGN 10.00; then CNY 0.01 from a pool whose average no
+      // longer divides evenly. The database re-computes the pool cost to the kobo, half-up, and accepts only the same figure.
+      assert.deepEqual(await lines(await post(ownerA, { type: 'currency_purchase', currency: 'CNY', amountMinor: '300', rate: { rate: '3.333333', source: 'bank_receipt' }, entryDate: date, evidenceDocumentId: await slip() })),
+        [['1010', '1000', '0', '300'], ['1000', '0', '1000', '1000']]);
+      // pool now CNY 39,993.00 / NGN 3,999,010.00: CNY 0.01 costs 99.99275 kobo, half-up NGN 1.00
+      assert.deepEqual(await lines(await pay({ amountMinor: '1' })), [['1150', '100', '0', '100'], ['1010', '0', '100', '1']]);
     });
   });
 });

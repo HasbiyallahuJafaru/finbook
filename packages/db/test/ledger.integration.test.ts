@@ -19,7 +19,22 @@ type Line = {
   account: string; debit?: bigint; credit?: bigint;
   currency?: string; amountMinor?: bigint; rate?: string; rateSource?: string; rateNote?: string;
 };
-type Entry = { periodId: string; date: string; lines: Line[]; key?: string; memo?: string; reverses?: string; sourceType?: string };
+type Entry = { periodId: string; date: string; lines: Line[]; key?: string; memo?: string; reverses?: string; sourceType?: string; fixtureEvidence?: boolean };
+
+/**
+ * A stored fixture document for a test entry whose foreign lines carry none: foreign lines need their evidence (0017). A
+ * reversal carries its original's, as a real one would.
+ */
+async function fixtureEvidence(c: pg.ClientBase, tenant: string, reverses: string | null | undefined): Promise<string> {
+  if (reverses) {
+    const theirs = await one(c, "SELECT evidence_document_id AS id FROM journal_lines WHERE entry_id = $1 AND currency <> 'NGN' AND evidence_document_id IS NOT NULL LIMIT 1", [reverses]);
+    if (theirs) return theirs;
+  }
+  const d = await one(c, "INSERT INTO documents (tenant_id, doc_type, mime, size_bytes, sha256, original_filename) VALUES ($1, 'receipt', 'application/pdf', 100, $2, 'fixture.pdf') RETURNING id",
+    [tenant, randomBytes(32).toString('hex')]);
+  await c.query("UPDATE documents SET status = 'stored', evidence_key = 'evidence/' || tenant_id || '/2026/01/' || id || '.pdf', stored_at = now() WHERE id = $1", [d]);
+  return d;
+}
 
 /**
  * The entry type a test entry posts as (migration 0015): what the API sets from the rule it ran. Tests name it when they
@@ -96,14 +111,15 @@ async function insertEntry(c: pg.ClientBase, tenant: string, e: Entry): Promise<
      VALUES ($1, $2, $3, $4, coalesce($7, (SELECT source_type FROM journal_entries WHERE id = $6)), uuidv7(), $5, $6) RETURNING id`,
     [tenant, e.periodId, e.date, e.memo ?? 'test entry', e.key ?? `k-${String(++keySeq)}`, e.reverses ?? null, e.sourceType ?? (e.reverses ? null : entryTypeOf(e.lines))]);
   const ids = accounts[tenant] ?? {};
+  const evidence = e.fixtureEvidence !== false && e.lines.some((l) => (l.currency ?? 'NGN') !== 'NGN') ? await fixtureEvidence(c, tenant, e.reverses) : null;
   for (const l of e.lines) {
     const debit = l.debit ?? 0n;
     const credit = l.credit ?? 0n;
     await c.query(
-      `INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, rate_note)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      `INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, rate_note, evidence_document_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
       [tenant, entryId, ids[l.account] ?? l.account, debit, credit, l.currency ?? 'NGN', l.amountMinor ?? debit + credit,
-        l.rate ?? null, l.rateSource ?? null, l.rateNote ?? null]);
+        l.rate ?? null, l.rateSource ?? null, l.rateNote ?? null, (l.currency ?? 'NGN') !== 'NGN' ? evidence : null]);
   }
   return entryId;
 }
@@ -494,20 +510,21 @@ describe('phase 2: posting rules through the database', () => {
   };
   const job = (v: string) => ({ vehicleId: v, counterpartyId: v });
 
-  type PostOpts = { date?: string; reverses?: string | null; sourceType?: string };
+  type PostOpts = { date?: string; reverses?: string | null; sourceType?: string; fixtureEvidence?: boolean };
   /** Insert one posting-rule result as one journal entry, inside an open transaction (what the API will do). */
   const insertPosting = async (c: pg.ClientBase, tenant: string, period: string, lines: LedgerLine[], opts: PostOpts = {}) => {
     const ids = accounts[tenant] ?? {};
     const entryId = await one(c,
       'INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, reverses_entry_id) VALUES ($1, $2, $3, \'posting rule\', coalesce($4, (SELECT source_type FROM journal_entries WHERE id = $6)), uuidv7(), $5, $6) RETURNING id',
       [tenant, period, opts.date ?? '2026-01-10', opts.sourceType ?? (opts.reverses ? null : entryTypeOf(lines)), `pr-${String(++keySeq)}`, opts.reverses ?? null]);
+    const evidence = opts.fixtureEvidence !== false && lines.some((l) => l.currency !== 'NGN' && !l.evidenceDocumentId) ? await fixtureEvidence(c, tenant, opts.reverses) : null;
     for (const l of lines) {
       await c.query(
         `INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, spot_rate, spot_source, rate_note, vehicle_id, counterparty_id,
            evidence_document_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
         [tenant, entryId, ids[l.account], l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null, l.spotRate ?? null, l.spotSource ?? null, l.rateNote ?? null,
           l.vehicleId ? carOf(tenant, l.vehicleId) : null, l.counterpartyId ? (l.counterpartyId.length === 36 ? counterpartyIn(tenant, l.counterpartyId) : customer(tenant, l.counterpartyId)) : null,
-          l.evidenceDocumentId ?? null]);
+          l.evidenceDocumentId ?? (l.currency !== 'NGN' ? evidence : null)]);
     }
     return entryId;
   };
@@ -609,9 +626,11 @@ describe('phase 2: posting rules through the database', () => {
     const reverse = (lines: LedgerLine[]) => tx(id, async (t) => {
       const entryId = await one(t.client, "INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, reverses_entry_id) VALUES ($1, $2, '2026-01-11', 'reversal', 'pool_payment', uuidv7(), $3, $4) RETURNING id",
         [id, period, `rev-${String(++keySeq)}`, original]);
+      const evidence = await fixtureEvidence(t.client, id, original); // the original's slip
       for (const l of lines) {
-        await t.client.query('INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, spot_rate, spot_source, vehicle_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)',
-          [id, entryId, accounts[id]?.[l.account], l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null, l.spotRate ?? null, l.spotSource ?? null, l.vehicleId ? carOf(id, l.vehicleId) : null]);
+        await t.client.query('INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, spot_rate, spot_source, vehicle_id, evidence_document_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)',
+          [id, entryId, accounts[id]?.[l.account], l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null, l.spotRate ?? null, l.spotSource ?? null, l.vehicleId ? carOf(id, l.vehicleId) : null,
+            l.currency !== 'NGN' ? evidence : null]);
       }
     });
     await assert.rejects(reverse(mirror('B')), /does not mirror/);
@@ -1560,6 +1579,50 @@ describe('phase 2: posting rules through the database', () => {
     });
     await postLines(id, period, customerReceipt({ ...job('A'), amountNgn: 200_000_000n, evidenceDocumentId: slip }));
     await assert.rejects(approve(id, 'A', 'supplier_cost_not_covered'), /signed off by someone who touched nothing it is about/);
+  });
+
+  test('evidence: foreign lines need theirs; anything else without it is pending until attached; shared slips are listed for review (0017)', async () => {
+    const { id, period } = await funded('Evidence rules', { held: false, jobs: { B: { jobType: 'clearing_only', funding: 'customer_funded', landing: 100_000_000n } } });
+    const doc = (sha = randomHex()) => tx(id, async (t) => {
+      const d = await one(t.client, "INSERT INTO documents (tenant_id, doc_type, mime, size_bytes, sha256, original_filename) VALUES ($1, 'receipt', 'application/pdf', 100, $2, 'r.pdf') RETURNING id", [id, sha]);
+      await t.client.query("UPDATE documents SET status = 'stored', evidence_key = 'evidence/' || tenant_id || '/2026/01/' || id || '.pdf', stored_at = now() WHERE id = $1", [d]);
+      return d;
+    });
+    const pending = async () => (await tx(id, (t) => t.client.query<{ entry_id: string }>('SELECT entry_id FROM entries_missing_evidence ORDER BY entry_date, entry_id'))).rows.map((r) => r.entry_id);
+    const shared = async () => (await tx(id, (t) => t.client.query<{ entry_ids: string[] }>('SELECT entry_ids FROM evidence_shared'))).rows.map((r) => [...r.entry_ids].sort());
+    const attach = (entryId: string, documentId: string) => tx(id, (t) => t.client.query('INSERT INTO entry_evidence (tenant_id, entry_id, document_id) VALUES ($1, $2, $3)', [id, entryId, documentId]));
+    // A foreign line without its document is refused: its rate is provable only from it.
+    await assert.rejects(postLines(id, period, buyCurrency({ currency: 'CNY', amountMinor: 1_000_000n, rate: parseRate('100.000000'), rateSource: 'bdc_receipt' }), { fixtureEvidence: false }),
+      /journal_lines_foreign_evidence/);
+    assert.deepEqual(await pending(), []); // funded()'s purchases carry their receipts
+    // An NGN receipt without its slip posts, pending; attaching the slip clears it, once.
+    const bare = await postLines(id, period, customerReceipt({ ...job('B'), amountNgn: 5_000_000n }));
+    assert.deepEqual(await pending(), [bare]);
+    await assert.rejects(attach(bare, (await tx(id, (t) => one(t.client, "INSERT INTO documents (tenant_id, doc_type, mime, size_bytes, sha256, original_filename) VALUES ($1, 'receipt', 'application/pdf', 100, $2, 'p.pdf') RETURNING id", [id, randomHex()])))),
+      /evidence must be a stored document/); // a pending upload
+    const slip = await doc();
+    await attach(bare, slip);
+    assert.deepEqual(await pending(), []);
+    await assert.rejects(attach(bare, await doc()), /already has its evidence, or takes none/);
+    // One transfer paying for two things is two entries on one slip: both post, and the slip is listed for a reviewer. The
+    // same bytes uploaded again count as the same slip.
+    const second = await postLines(id, period, customerReceipt({ ...job('B'), amountNgn: 2_000_000n, evidenceDocumentId: slip }));
+    assert.deepEqual(await shared(), [[bare, second].sort()]);
+    const sha = (await tx(id, (t) => t.client.query<{ sha256: string }>('SELECT sha256 FROM documents WHERE id = $1', [slip]))).rows[0]?.sha256 ?? '';
+    const third = await postLines(id, period, customerReceipt({ ...job('B'), amountNgn: 1_000_000n, evidenceDocumentId: await doc(sha) }));
+    assert.deepEqual(await shared(), [[bare, second, third].sort()]);
+    // A correction: reversing the second receipt releases its slip, so the corrected receipt takes it and nothing extra is shared.
+    await postLines(id, period, swap(customerReceipt({ ...job('B'), amountNgn: 2_000_000n, evidenceDocumentId: slip })), { reverses: second });
+    assert.deepEqual(await shared(), [[bare, third].sort()]);
+    // A completion takes no evidence of its own (the accepted quote is its evidence); a cost does.
+    const cost = await postLines(id, period, sharedCost({ amountNgn: 50_000_000n, vehicleIds: ['B'] }));
+    const done = await postLines(id, period, completeClearingJob({ ...job('B'), landingChargeNgn: 100_000_000n, history: await historyOf(id, 'B') }).lines);
+    assert.deepEqual(await pending(), [cost]);
+    await assert.rejects(attach(done, await doc()), /already has its evidence, or takes none/);
+    // Four eyes: the reviewer who attaches the cost's invoice doesn't sign off the car's flags.
+    await withTenant(apiPool, as(id, REVIEWER), (t) => t.client.query('INSERT INTO entry_evidence (tenant_id, entry_id, document_id) VALUES ($1, $2, $3)', [id, cost, slip]));
+    await postLines(id, period, sharedCost({ amountNgn: 1n, vehicleIds: ['B'], evidenceDocumentId: await doc() })); // a late cost: flagged
+    await assert.rejects(approve(id, 'B', 'cost_after_completion'), /signed off by someone who touched nothing it is about/);
   });
 
   test('a sign-off answers one flag, by a firm reviewer or admin who touched nothing the flag is about (0014)', async () => {

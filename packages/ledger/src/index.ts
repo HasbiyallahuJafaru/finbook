@@ -132,6 +132,8 @@ function spotOf(spot: Spot, rateNote: string | undefined): Pick<Line, 'spotRate'
 /** Currency leaving the pool at its weighted-average cost, with the day's spot rate recorded for the spot basis. */
 function poolOut(e: { pool: Pool; currency: string; amountMinor: bigint; spot: Spot; rateNote?: string }, tags: Tags): { line: Line; pool: Pool } {
   const spot = spotOf(e.spot, e.rateNote);
+  positive(e.amountMinor, 'amount');
+  if (e.amountMinor > e.pool.balanceMinor) throw new RuleError(`payment exceeds the ${e.currency} held in the pool`);
   const { costNgn, pool } = poolSpend(e.pool, e.amountMinor);
   // ponytail: a pool left holding currency with no NGN cost (rounding at extreme rates) refuses payments. 1010 takes no NGN
   // lines (migration 0006) and revaluation only moves 1019, so clearing it needs its own entry type; add one if it ever happens.
@@ -175,6 +177,7 @@ export function supplierInvoice(e: SupplierBill & { currency: string; amountMino
 export function payPayableFromPool(e: SupplierBill & {
   pool: Pool; payable: Pool; currency: string; amountMinor: bigint; spot: Spot; rateNote?: string; evidenceDocumentId?: string;
 }): { lines: Line[]; pool: Pool; payable: Pool } {
+  positive(e.amountMinor, 'amount');
   if (e.amountMinor > e.payable.balanceMinor) throw new RuleError('payment exceeds what is owed to this supplier for this car');
   const settled = poolSpend(e.payable, e.amountMinor);
   const out = poolOut(e, { counterpartyId: e.supplierId, evidenceDocumentId: e.evidenceDocumentId });

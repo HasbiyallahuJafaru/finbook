@@ -26,7 +26,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { convert, parseRate, type Pool } from '@app/money';
 import {
-  arriveInYard, buyCurrency, completeAgentJob, completeClearingJob, convertToStock, customerReceipt, jobPosition, payFromPool, payPayableFromPool, revalue, sellStockCar,
+  RuleError, arriveInYard, buyCurrency, completeAgentJob, completeClearingJob, convertToStock, customerReceipt, jobPosition, payFromPool, payPayableFromPool, revalue, sellStockCar,
   customerRefund, receivableReceipt, refundStockDeposit, sharedCost, supplierCredit, spotCarCost, stockDeposit, supplierInvoice, type Line,
 } from './index.ts';
 
@@ -420,4 +420,16 @@ test('customer refund, receivable receipt and supplier credit: each within what 
   assert.deepEqual(only(supplierCredit({ vehicleId: 'K', amountNgn: 150_000n, history: costs })), [['1000', 150_000n, 0n, null], ['1150', 0n, 150_000n, 'K']]);
   assert.throws(() => supplierCredit({ vehicleId: 'K', amountNgn: 150_001n, history: costs }), /credit exceeds the job costs/);
   assert.throws(() => supplierCredit({ vehicleId: 'K', amountNgn: 0n, history: costs }), /credit must be positive/);
+});
+
+test('a pool payment is positive and within the currency the pool holds: the rule refuses it in its own words', () => {
+  const pool = { balanceMinor: 1_000_000n, costNgn: 100_000_000n };
+  assert.throws(() => payFromPool({ pool, currency: 'CNY', amountMinor: 1_000_001n, vehicleId: 'A', spot: SPOT_CBN }), /payment exceeds the CNY held in the pool/);
+  assert.throws(() => payFromPool({ pool, currency: 'CNY', amountMinor: 0n, vehicleId: 'A', spot: SPOT_CBN }), /amount must be positive/);
+});
+
+test('a zero settlement is the rule refusing it, not a pool error', () => {
+  const payable = { balanceMinor: 2_000_000n, costNgn: 210_000_000n };
+  assert.throws(() => payPayableFromPool({ vehicleId: 'D', supplierId: 'S', pool: { balanceMinor: 10_000_000n, costNgn: 1_000_000_000n }, payable, currency: 'CNY', amountMinor: 0n, spot: SPOT_CBN }),
+    (err: unknown) => err instanceof RuleError && /amount must be positive/.test(err.message));
 });
