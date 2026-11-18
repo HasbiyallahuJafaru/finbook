@@ -3,7 +3,7 @@ import { writeFileSync } from 'node:fs';
 import { z } from 'zod';
 import {
   AcceptQuote, AddJobVehicle, AddShipmentVehicle, RemoveShipmentVehicle, CostType, CreateCostType, CreateShipment, Shipment, SignOffFlag, Counterparty, CreateCounterparty, CreateJobOrder, CreatePosting, CreateReversal, Posting, AttachEvidence, EntryEvidence, CreateUpload, CreateVehicle, Document, DownloadTicket, IdempotencyKeyHeader, JobOrder,
-  ListCounterpartiesQuery, ListJobOrdersQuery, ListVehiclesQuery, MeResponse, TenantIdHeader, UploadTicket, Vehicle,
+  CarProfitQuery, CarProfitReport, ListCounterpartiesQuery, ListJobOrdersQuery, ListVehiclesQuery, MeResponse, TenantIdHeader, UploadTicket, Vehicle,
 } from './index.ts';
 
 const json = (schema: z.ZodType) => z.toJSONSchema(schema, { target: 'openapi-3.0' });
@@ -54,6 +54,8 @@ const doc = {
       responses: { 200: ok('Quote accepted; the quote and cars are now fixed', JobOrder), ...writeErrors } } },
     '/job-orders/{id}/sign-offs': { post: { parameters: [tenantHeader, idempotencyHeader, idPath], requestBody: body(SignOffFlag),
       responses: { 201: ok('One flag signed off by a firm reviewer or admin; who and when are stamped by the database', JobOrder), ...writeErrors } } },
+    '/reports/car-profit': { get: { parameters: [tenantHeader, ...queryParams(CarProfitQuery)],
+      responses: { 200: ok('Each car sold in the range, by sale date; clients get the spot basis only (ADR 0009, ADR 0020)', CarProfitReport), ...errors } } },
     '/postings': { post: { parameters: [tenantHeader, idempotencyHeader], requestBody: body(CreatePosting),
       responses: { 201: ok('Posted: the lines the rule built from the facts and the ledger, and any flags the entry raised', Posting), ...writeErrors } } },
     '/postings/{entryId}/evidence': { post: { parameters: [tenantHeader, idempotencyHeader, { name: 'entryId', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } }],

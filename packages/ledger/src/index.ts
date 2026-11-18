@@ -217,6 +217,8 @@ function carCost(history: readonly Line[], vehicleId: string) {
  * day, each supplier invoice at the spot rate on its invoice day. Pool basis stays in jobPosition, for the firm.
  */
 export const spotCarCost = (history: readonly Line[], vehicleId: string): bigint => carCost(history, vehicleId).spotNgn;
+/** Booked cost of a car's foreign purchase (pool cost, or the invoice rate), across currencies: what reports read (ADR 0020). */
+export const bookedCarCost = (history: readonly Line[], vehicleId: string): bigint => carCost(history, vehicleId).ngn;
 
 /**
  * How a car cost is split (spec → landed cost; cost types carry a default). per_car: one car. equal: in kobo. by_value: by

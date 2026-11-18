@@ -245,3 +245,33 @@ export const CreateReversal = z.strictObject({ entryDate: isoDate, memo: posting
 export type CreateReversal = z.infer<typeof CreateReversal>;
 export const EntryEvidence = z.object({ entryId: z.uuid(), documentId: z.uuid(), attachedBy: z.string(), attachedAt: z.string() });
 export type EntryEvidence = z.infer<typeof EntryEvidence>;
+
+/**
+ * Per-car profitability (spec → Reports; ADR 0020): each car whose completion or stock sale is dated in the range. Clients see the
+ * spot basis only (ADR 0009); the pool basis is the firm's management view. Amounts are kobo as strings, signed (losses negative).
+ */
+export const ReportBasis = z.enum(['spot', 'pool']);
+const DAY_MS = 86_400_000;
+export const CarProfitQuery = z.strictObject({ from: isoDate, to: isoDate, basis: ReportBasis.default('spot') })
+  .refine((q) => q.from <= q.to, { path: ['to'], message: 'the range ends before it starts' })
+  .refine((q) => Date.parse(q.to) - Date.parse(q.from) <= 366 * DAY_MS, { path: ['to'], message: 'a report covers at most 366 days' });
+const SignedKobo = z.string().regex(/^-?(0|[1-9]\d{0,17})$/, 'a signed whole number of kobo, as a string');
+export const CarProfit = z.object({
+  vehicleId: z.uuid(), vin: z.string().nullable(), soldOn: isoDate, entryId: z.uuid(), kind: z.enum(['agent', 'stock']), basis: ReportBasis,
+  /** billed = carCost + landedCost + tradingProfit + quoteFx; net = tradingProfit + fx + otherProfit; fx = quoteFx + poolVsSpot + otherFx */
+  currency: z.literal('NGN'), billedNgn: SignedKobo, carCostNgn: SignedKobo, landedCostNgn: SignedKobo, tradingProfitNgn: SignedKobo,
+  /** FX on the sale entry: the quote rate against the car's cost on this basis */
+  quoteFxNgn: SignedKobo,
+  /** the gap between the car's booked cost (pool, or the invoice rate) and its spot cost; zero on the pool basis */
+  poolVsSpotNgn: SignedKobo,
+  /** the car's other FX lines up to the report's end (a supplier settlement) */
+  otherFxNgn: SignedKobo, fxNgn: SignedKobo,
+  /** P&L on the car outside the sale entry that isn't FX (a second standing sale): not zero means a reviewer should look */
+  otherProfitNgn: SignedKobo, netProfitNgn: SignedKobo,
+  /** trading profit / billed, in basis points (1137 = 11.37%), half-up; null when nothing was billed */
+  marginBp: z.string().regex(/^-?(0|[1-9]\d{0,17})$/).nullable(),
+});
+export type CarProfit = z.infer<typeof CarProfit>;
+/** asOfSeq: the tenant's ledger position the report was read at (any later posting, even backdated, moves it); the PDF keeps it. */
+export const CarProfitReport = z.object({ asOfSeq: MinorUnits, cars: z.array(CarProfit) });
+export type CarProfitReport = z.infer<typeof CarProfitReport>;

@@ -26,7 +26,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { convert, parseRate, type Pool } from '@app/money';
 import {
-  RuleError, arriveInYard, buyCurrency, completeAgentJob, completeClearingJob, convertToStock, customerReceipt, jobPosition, payFromPool, payPayableFromPool, revalue, sellStockCar,
+  RuleError, arriveInYard, bookedCarCost, buyCurrency, completeAgentJob, completeClearingJob, convertToStock, customerReceipt, jobPosition, payFromPool, payPayableFromPool, revalue, sellStockCar,
   allocateCarCost, customerRefund, receivableReceipt, refundStockDeposit, sharedCost, type CostBasis, supplierCredit, spotCarCost, stockDeposit, supplierInvoice, type Line,
 } from './index.ts';
 
@@ -110,6 +110,7 @@ test('worked example: 3 cars, 1 shared container, 3 rates, 1 sale, to the kobo',
     '7000': -13_333_333n,
   });
   assert.equal(jobPosition(entries.flat(), 'A').costNgn, 0n, 'completion clears car A capitalized cost to exactly zero');
+  assert.deepEqual([bookedCarCost(entries.flat(), 'A'), spotCarCost(entries.flat(), 'A')], [426_666_667n, 432_000_000n]); // CNY 40,000.00 at 108
   assert.equal(Object.values(balances(entries.flat())).reduce((a, b) => a + b, 0n), 0n, 'trial balance nets to zero');
 });
 

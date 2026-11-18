@@ -1121,4 +1121,103 @@ describe('documents and job orders', () => {
       assert.equal((await call('POST', '/cost-types', { sub: 'user_staff_a', o: { id: 'org_a' } }, { name: 'CPH extra fee (2)', defaultBasis: 'per_car' })).status, 403);
     });
   });
+
+  // ── Per-car profitability (ADR 0020), on tenant B (no postings of its own before this), worked by hand to the kobo:
+  //   Car Q: USD 1,000.00 bought at FIXTURE 1,500 = NGN 1,500,000.00 and paid on a day whose spot rate was FIXTURE 1,520 (spot cost
+  //   NGN 1,520,000.00); IDEC bill NGN 300,000.00. Quote USD 1,100.00 at FIXTURE 1,450 + landing NGN 1,500,000.00 = billed NGN 3,095,000.00.
+  //   Markup 145,000.00 + clearing 1,500,000.00 - 300,000.00 = 1,200,000.00 -> trading profit NGN 1,345,000.00; FX on the quote
+  //   1,450,000.00 - 1,500,000.00 = (50,000.00); net NGN 1,295,000.00; margin 1,345,000.00 / 3,095,000.00 = 43.4572% -> 4,346 bp.
+  //   Spot: car 1,520,000.00; FX on the quote 1,450,000.00 - 1,520,000.00 = (70,000.00) + spot vs pool 20,000.00 = the same (50,000.00).
+  //   Car R, the same figures, but its completion is posted after the pool payment and dated three days before it.
+  describe('per-car profitability report', () => {
+    const accountantB = { sub: 'user_accountant_b', fva: [1, 1] };
+    const report = (claims: Record<string, unknown>, query: string, tenant?: string) =>
+      get(`/reports/car-profit?${query}`, bearer(claims, tenant ? { 'x-tenant-id': tenant } : {}));
+    const april = 'from=2026-04-01&to=2026-04-30';
+    type Report = { asOfSeq: string; cars: Record<string, unknown>[] };
+    const cars: Record<string, string> = {};
+    const completions: Record<string, string> = {};
+    before(async () => {
+      await ownerPool.query("INSERT INTO firm_staff (clerk_user_id) VALUES ('user_accountant_b') ON CONFLICT DO NOTHING");
+      await ownerPool.query("INSERT INTO firm_access (tenant_id, clerk_user_id, role, granted_by) VALUES ($1, 'user_accountant_b', 'firm_accountant', 'user_admin') ON CONFLICT DO NOTHING", [tenantB]);
+      const ok = async (res: Response) => {
+        assert.ok(res.status < 300, await res.clone().text());
+        return (await res.json()) as { id: string; entryId: string };
+      };
+      const slip = async () => (await evidence(ownerB, Buffer.from(`%PDF-1.7\n% fixture slip ${randomUUID()}\n%%EOF\n`), { docType: 'receipt' })).id;
+      const customer = (await ok(await send('POST', '/counterparties', ownerB, { kind: 'customer', name: 'Aisha Bello' }))).id;
+      const idec = ((await (await send('GET', '/cost-types', ownerB)).json()) as { id: string; name: string }[]).find((t) => t.name === 'IDEC bill')?.id;
+      for (const [v, vin, paidOn, doneOn] of [['Q', 'SALGS2SE5LA000041', '2026-04-20', '2026-04-20'], ['R', 'SALGS2SE5LA000042', '2026-04-25', '2026-04-22']] as const) {
+        const job = (await ok(await send('POST', '/job-orders', ownerB, { customerId: customer, jobType: 'car_purchase', orderedOn: '2026-04-01',
+          carPrice: { amountMinor: '110000', currency: 'USD' }, quoteRate: { rate: '1450', source: 'manual', note: 'FIXTURE_RATE_QUOTE' }, landingChargeNgn: '150000000' }))).id;
+        cars[v] = (await ok(await send('POST', '/vehicles', ownerB, { vin, make: 'Toyota', model: 'Camry', year: 2022 }))).id;
+        await ok(await send('POST', `/job-orders/${job}/vehicles`, ownerB, { vehicleId: cars[v], carPriceMinor: '110000', landingChargeNgn: '150000000' }));
+        await ok(await send('POST', `/job-orders/${job}/accept-quote`, ownerB, { documentId: (await evidence(ownerB, Buffer.from(`%PDF-1.7\n% quote ${v}\n%%EOF\n`))).id }));
+        for (const body of [
+          { type: 'customer_receipt', vehicleId: cars[v], amountNgn: '400000000', entryDate: paidOn },
+          { type: 'currency_purchase', currency: 'USD', amountMinor: '100000', rate: { rate: '1500', source: 'bank_receipt' }, entryDate: paidOn, evidenceDocumentId: await slip() },
+          { type: 'pool_payment', vehicleId: cars[v], currency: 'USD', amountMinor: '100000', spot: { rate: '1520', source: 'manual', note: 'FIXTURE spot' }, entryDate: paidOn, evidenceDocumentId: await slip() },
+          { type: 'car_cost', costTypeId: idec, amountNgn: '30000000', split: { basis: 'per_car', vehicleId: cars[v] }, entryDate: paidOn },
+        ]) await ok(await send('POST', '/postings', ownerB, body));
+        completions[v] = (await ok(await send('POST', '/postings', ownerB, { type: 'job_completion', vehicleId: cars[v], entryDate: doneOn }))).entryId;
+      }
+    });
+
+    test('worked example: the client sees the spot basis, the firm also the pool basis, to the kobo; every row foots and ties to the ledger', async () => {
+      const res = await report(ownerB, april);
+      assert.equal(res.status, 200);
+      const { asOfSeq, cars: rows } = (await res.json()) as Report;
+      const expected = (v: string, soldOn: string) => ({ vehicleId: cars[v], vin: v === 'Q' ? 'SALGS2SE5LA000041' : 'SALGS2SE5LA000042', soldOn, entryId: completions[v],
+        kind: 'agent', basis: 'spot', currency: 'NGN', billedNgn: '309500000', carCostNgn: '152000000', landedCostNgn: '30000000', tradingProfitNgn: '134500000',
+        quoteFxNgn: '-7000000', poolVsSpotNgn: '2000000', otherFxNgn: '0', fxNgn: '-5000000', otherProfitNgn: '0', netProfitNgn: '129500000', marginBp: '4346' });
+      // R's completion is dated before its payment, and still clears (and reports) the car's full cost
+      assert.deepEqual(rows, [expected('Q', '2026-04-20'), expected('R', '2026-04-22')]);
+      assert.deepEqual(((await (await report(ownerB, 'from=2026-04-01&to=2026-04-22')).json()) as Report).cars[1]?.carCostNgn, '152000000');
+      const pl = await ownerPool.query<{ net: string }>(`SELECT sum(l.credit_ngn - l.debit_ngn)::text AS net FROM journal_lines l JOIN accounts a ON a.id = l.account_id
+        WHERE l.vehicle_id = $1 AND a.code IN ('4000', '4100', '4200', '5000', '7000')`, [cars.Q]);
+      assert.equal(pl.rows[0]?.net, '129500000');
+      assert.match(asOfSeq, /^[1-9]\d*$/);
+      assert.deepEqual(await (await report(ownerB, `${april}&basis=spot`)).json(), { asOfSeq, cars: rows });
+
+      const pool = (await (await report(accountantB, `${april}&basis=pool`, tenantB)).json()) as Report;
+      assert.deepEqual(pool.cars.map((p) => [p.carCostNgn, p.tradingProfitNgn, p.quoteFxNgn, p.poolVsSpotNgn, p.fxNgn, p.netProfitNgn, p.basis]),
+        [['150000000', '134500000', '-5000000', '0', '-5000000', '129500000', 'pool'], ['150000000', '134500000', '-5000000', '0', '-5000000', '129500000', 'pool']]);
+      assert.deepEqual(((await (await report(ownerB, 'from=2026-04-26&to=2026-04-30')).json()) as Report).cars, []);
+    });
+
+    test('a reversal dated after the range leaves the sale standing in it; inside the range it takes the car out; the ledger position moves', async () => {
+      const before = ((await (await report(ownerB, april)).json()) as Report).asOfSeq;
+      const reversed = await fetch(`${url}/postings/${completions.Q ?? ''}/reversal`, { method: 'POST', body: JSON.stringify({ entryDate: '2026-05-02' }),
+        headers: { ...bearer(accountantB, { 'x-tenant-id': tenantB }), 'content-type': 'application/json', 'idempotency-key': randomUUID() } });
+      assert.equal(reversed.status, 201, await reversed.clone().text());
+      const after = (await (await report(ownerB, april)).json()) as Report;
+      assert.ok(BigInt(after.asOfSeq) > BigInt(before), 'a later posting moves the ledger position');
+      assert.deepEqual(after.cars.map((c) => c.vehicleId), [cars.Q, cars.R]); // on 30/04 Q's completion still stood
+      const toMay = (await (await report(ownerB, 'from=2026-04-01&to=2026-05-31')).json()) as Report;
+      assert.deepEqual(toMay.cars.map((c) => c.vehicleId), [cars.R]); // reversed by 31/05: not a sale
+      // Q completed again, dated before the first one's reversal: on 30/04 both stand. The second is the sale; the first cut, its FX
+      // included (1,345,000.00 - 50,000.00), is other profit for a reviewer, never FX. By 31/05 only the second stands.
+      const again = await send('POST', '/postings', ownerB, { type: 'job_completion', vehicleId: cars.Q, entryDate: '2026-04-25' });
+      assert.equal(again.status, 201, await again.clone().text());
+      const second = ((await again.json()) as { entryId: string }).entryId;
+      const q = (r: Report) => r.cars.find((c) => c.vehicleId === cars.Q);
+      const doubled = q((await (await report(ownerB, april)).json()) as Report);
+      assert.deepEqual([doubled?.entryId, doubled?.tradingProfitNgn, doubled?.fxNgn, doubled?.otherFxNgn, doubled?.otherProfitNgn, doubled?.netProfitNgn],
+        [second, '134500000', '-5000000', '0', '129500000', '259000000']);
+      const single = q((await (await report(ownerB, 'from=2026-04-01&to=2026-05-31')).json()) as Report);
+      assert.deepEqual([single?.entryId, single?.otherProfitNgn, single?.netProfitNgn], [second, '0', '129500000']);
+    });
+
+    test('clients get no pool basis; viewers no report; bad ranges are refused; another tenant, or firm staff without access, sees none of these cars', async () => {
+      assert.equal((await report(ownerB, `${april}&basis=pool`)).status, 403);
+      assert.equal((await report(viewerA, april)).status, 403);
+      for (const q of ['from=2026-04-30&to=2026-04-01', 'from=2026-04-01', `${april}&basis=book`, 'from=01/04/2026&to=2026-04-30', `${april}&x=1`, 'from=2025-01-01&to=2026-04-30']) {
+        assert.equal((await report(ownerB, q)).status, 400, q);
+      }
+      assert.deepEqual(((await (await report(ownerA, april)).json()) as Report).cars, []);
+      assert.equal((await report(ownerB, april, tenantA)).status, 404); // naming another tenant
+      assert.equal((await report(accountantB, april, tenantA)).status, 404); // firm staff with no access to A
+      assert.equal((await report({ sub: 'user_accountant_b', fva: [1, -1] }, `${april}&basis=pool`, tenantB)).status, 403); // no second factor
+    });
+  });
 });

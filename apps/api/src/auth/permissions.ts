@@ -35,6 +35,10 @@ export const PERMISSIONS = {
   // A firm reviewer or admin signs off a flag the database raised on a client's job (owner 2026-11-17). It clears that flag and
   // never unlocks a posting. The database checks the role too, and refuses anyone who touched what the flag is about (0014).
   'job_orders.sign_off': ['firm_reviewer', 'firm_admin'],
+  // Reports on screen (spec → Reports): the people who read the books' detail. Clients see the spot basis only (ADR 0009); the
+  // pool basis is the firm's management view. ponytail: no per-client basis setting yet, add it when the firm moves a client to pool.
+  'reports.read': READERS,
+  'reports.pool_basis': ['firm_admin', 'firm_accountant', 'firm_reviewer'],
 } as const satisfies Record<string, readonly Role[]>;
 
 export type Permission = keyof typeof PERMISSIONS;

@@ -2,7 +2,7 @@
 
 Read this first in every new session. Update it before you stop: current phase, what's built, what's next, open questions. Keep it a snapshot of now, not a diary; history lives in git, decisions in `docs/decisions/`.
 
-_Last updated: 2026-11-18 (session: POST /postings batches 3–4, car costs and containers; migrations 0018–0019)_
+_Last updated: 2026-11-18 (sessions: POST /postings batches 3–4, car costs and containers, migrations 0018–0019; then C4 replayed from the client workbook through the API)_
 
 **We are the clients' bookkeepers, never part of their business** (CLAUDE.md → Who we are). The books record what the client did; the database refuses only what would make them wrong or untraceable, and flags policy questions for a firm reviewer.
 
@@ -32,7 +32,9 @@ _Last updated: 2026-11-18 (session: POST /postings batches 3–4, car costs and 
 
    - **Car costs and containers (0019, ADR 0019):** `car_cost` on `POST /postings` carries its cost type and split (per car, equal or by value over a container, or by hand); the split is kept in `cost_allocations` and re-performed by the database. Cost types per client (`/cost-types`, seeded by `seed_default_cost_types` at onboarding); containers (`/shipments`) close for good.
 
-   **Next:** the phase 2 gate: run the worked example (3 cars, 1 shared container, 3 rates, 1 sale) against the accountant's spreadsheet, then reports by basis (`spot` | `pool`, ADR 0009). Not built yet (ADR 0019): non-capitalized costs, foreign non-price car costs, costs on a naira supplier invoice, renaming cost types, duplicate-cost flags. Owner defaults (memory, ADR 0016) applied in 0019:
+   **2026-11-18, C4 replayed through the real API** (scratchpad script, never committed; client figures stay out of the repo). All 12 cashbook rows for container C4 were posted through `POST /postings`: car costs with equal and manual splits, the Song Plus bought through the pool, and three completions. Cash out ties to the cashbook to the kobo, the trial balance nets to zero, and every split adds up to its payment. Findings for the accountant and the client: (1) the workbook's Song Plus markup leaves out the RMB 600 extra; (2) its clearing margin of about ₦1m is the CPH fee, which has no cashbook payment; (3) the cashbook's ₦160,000 of repairs and boosting is missing from the workbook's landed costs, so the bz3 and EQE clearing cuts are negative (flagged `negative_cut`); (4) the EQE was billed 6 kobo under its cost sheet. C4 has only one RMB rate, so "3 different rates" is covered by the synthetic worked examples alone. The gate still needs the accountant's own spreadsheet.
+
+   **Next:** the phase 2 gate: run the worked example (3 cars, 1 shared container, 3 rates, 1 sale) against the accountant's spreadsheet. **Per-car profitability is built** (2026-11-18, owner asked for it ahead of phase 4; ADR 0020): `GET /reports/car-profit?from&to&basis`, `packages/reports`. Clients get spot only, firm roles also pool. Every row foots twice (billed = car + landed + trading + quote FX; net = trading + FX + other profit), and the response carries `asOfSeq`, the ledger position it was read at. Ledger audit PASS WITH NOTES after two rounds; security review PASS WITH NOTES. Not built: cost by component (per cost type), the per-client basis setting. Open for the owner (ADR 0020 → Consequences): clients can work out pool cost from the spot report (the books are at pool); whether `client_staff` should see margins; whether to flag a completion dated before the payment it clears, a completion dated before the previous one's reversal, and a cost on a sold stock car. The accountant signs off ADR 0020's definitions. Not built yet (ADR 0019): non-capitalized costs, foreign non-price car costs, costs on a naira supplier invoice, renaming cost types, duplicate-cost flags. Owner defaults (memory, ADR 0016) applied in 0019:
    - split by value at pool cost;
    - evidence may be pending unless the cost type requires a receipt;
    - containers close for good;
@@ -110,7 +112,7 @@ Research behind the next slices: `docs/research/2026-11-15-existing-platforms.md
    - every cash-paid car cost carries a cost type, and the car price is never one.
 
    Vehicles, job orders and their ledger rules are built (0011–0014).
-3. **Reports take a basis** (`spot` | `pool`); client-facing ones default to and only accept `spot` (ADR 0009).
+3. **Reports take a basis** (`spot` | `pool`); client-facing ones default to and only accept `spot` (ADR 0009). Per-car profitability built (ADR 0020); the rest are phase 4.
 
 ## Waiting on the owner
 
@@ -123,12 +125,12 @@ Research behind the next slices: `docs/research/2026-11-15-existing-platforms.md
 ## What exists
 
 - **Apps:** `apps/api` (NestJS 12, `GET /health` public, `POST /webhooks/clerk` (Svix-signed), `GET /me`, `POST/GET /counterparties`, `POST/GET /vehicles`, `GET /vehicles/:id`, documents (presigned upload, confirm, download), job orders and their sign-offs, `POST /postings` and `POST /postings/:entryId/evidence` behind the global Clerk guard and the Redis rate limiter, Sentry tagged with tenant and request id), `apps/worker` (NestJS + BullMQ, `system` queue with a `ping` job, Sentry), `apps/web` (Next.js 16 on Cloudflare Workers via vinext, placeholder page). No auth or business endpoints yet.
-- **Packages:** `money`, `ledger`, `db` (Drizzle schema; migrations 0000–0019; `withTenant()`, `resolveAccess()`; `migrate()`), `contracts` (Zod, VIN rule; `pnpm openapi` writes `packages/contracts/openapi.json`).
+- **Packages:** `money`, `ledger`, `db` (Drizzle schema; migrations 0000–0019; `withTenant()`, `resolveAccess()`; `migrate()`), `contracts` (Zod, VIN rule; `pnpm openapi` writes `packages/contracts/openapi.json`), `reports` (per-car profitability: query + pure fold, 100% branch coverage).
 - **Database guarantees** (ADR 0006): API logs in as `finbook_api` (non-superuser) and runs as `finbook_app` under forced RLS; owner URL only for migrations. Balance at commit, append-only ledger and audit log, period lock, reversals mirror exactly, accounts frozen once posted to, FX checks, DB-stamped actor and time, audit rows, per-tenant hash chain with `ledger_chain_breaks()`. Known limit: chain tampering by a DB superuser needs an off-site anchor (backup manifest, phase 5).
-- **Tests:** money 10 and ledger 21 (100% branch coverage), api 2 unit + 48 integration (postings batches 1–4, reversals, car costs and containers, evidence, job-order sign-offs, documents via S3Mock, job orders, vehicles, counterparties, idempotency per tenant and user, races, 429, viewer 403, auth, template tokens refused, cross-tenant 404, suspended tenant, MFA, default deny, signed webhook, ordering, firm staff never mirrored), worker 7 (1 needs Redis), db integration 102 (Testcontainers Postgres 18, needs Docker; the two fuzz tests take about 7 minutes together).
+- **Tests:** money 10 and ledger 21 (100% branch coverage), reports 3, api 2 unit + 51 integration (per-car report, postings batches 1–4, reversals, car costs and containers, evidence, job-order sign-offs, documents via S3Mock, job orders, vehicles, counterparties, idempotency per tenant and user, races, 429, viewer 403, auth, template tokens refused, cross-tenant 404, suspended tenant, MFA, default deny, signed webhook, ordering, firm staff never mirrored), worker 7 (1 needs Redis), db integration 102 (Testcontainers Postgres 18, needs Docker; the two fuzz tests take about 7 minutes together).
 - **Quality gate:** `.githooks/pre-push` runs install, lint, typecheck, unit, integration and build before every push (ADR 0007). Strict type-aware ESLint bans float money (`parseFloat`, `Number()`, `Math.round` and friends, `toFixed`).
 - **Staging (Railway project `finbook`, env `staging`):** Postgres 18, Redis, api (https://api-staging-c68d0388.up.railway.app/health), worker, and a one-off `migrate` service. Production environment exists, empty, owner-run only. Details: `docs/deploy.md`.
-- **Decisions:** ADRs 0001–0019 in `docs/decisions/`. Research notes in `docs/research/`.
+- **Decisions:** ADRs 0001–0020 in `docs/decisions/`. Research notes in `docs/research/`.
 
 ## Gotchas for the next session
 

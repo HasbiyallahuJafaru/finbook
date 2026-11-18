@@ -3165,6 +3165,207 @@
         }
       }
     },
+    "/reports/car-profit": {
+      "get": {
+        "parameters": [
+          {
+            "name": "X-Tenant-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "description": "The tenant to act for. Required for firm staff; client users may rely on their active organization."
+          },
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "date",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+            }
+          },
+          {
+            "name": "basis",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "default": "spot",
+              "type": "string",
+              "enum": [
+                "spot",
+                "pool"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Each car sold in the range, by sale date; clients get the spot basis only (ADR 0009, ADR 0020)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "asOfSeq": {
+                      "type": "string",
+                      "pattern": "^(0|[1-9]\\d{0,17})$"
+                    },
+                    "cars": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "vehicleId": {
+                            "type": "string",
+                            "format": "uuid",
+                            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                          },
+                          "vin": {
+                            "nullable": true,
+                            "type": "string"
+                          },
+                          "soldOn": {
+                            "type": "string",
+                            "format": "date",
+                            "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))$"
+                          },
+                          "entryId": {
+                            "type": "string",
+                            "format": "uuid",
+                            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                          },
+                          "kind": {
+                            "type": "string",
+                            "enum": [
+                              "agent",
+                              "stock"
+                            ]
+                          },
+                          "basis": {
+                            "type": "string",
+                            "enum": [
+                              "spot",
+                              "pool"
+                            ]
+                          },
+                          "currency": {
+                            "type": "string",
+                            "enum": [
+                              "NGN"
+                            ]
+                          },
+                          "billedNgn": {
+                            "type": "string",
+                            "pattern": "^-?(0|[1-9]\\d{0,17})$"
+                          },
+                          "carCostNgn": {
+                            "type": "string",
+                            "pattern": "^-?(0|[1-9]\\d{0,17})$"
+                          },
+                          "landedCostNgn": {
+                            "type": "string",
+                            "pattern": "^-?(0|[1-9]\\d{0,17})$"
+                          },
+                          "tradingProfitNgn": {
+                            "type": "string",
+                            "pattern": "^-?(0|[1-9]\\d{0,17})$"
+                          },
+                          "quoteFxNgn": {
+                            "type": "string",
+                            "pattern": "^-?(0|[1-9]\\d{0,17})$"
+                          },
+                          "poolVsSpotNgn": {
+                            "type": "string",
+                            "pattern": "^-?(0|[1-9]\\d{0,17})$"
+                          },
+                          "otherFxNgn": {
+                            "type": "string",
+                            "pattern": "^-?(0|[1-9]\\d{0,17})$"
+                          },
+                          "fxNgn": {
+                            "type": "string",
+                            "pattern": "^-?(0|[1-9]\\d{0,17})$"
+                          },
+                          "otherProfitNgn": {
+                            "type": "string",
+                            "pattern": "^-?(0|[1-9]\\d{0,17})$"
+                          },
+                          "netProfitNgn": {
+                            "type": "string",
+                            "pattern": "^-?(0|[1-9]\\d{0,17})$"
+                          },
+                          "marginBp": {
+                            "nullable": true,
+                            "type": "string",
+                            "pattern": "^-?(0|[1-9]\\d{0,17})$"
+                          }
+                        },
+                        "required": [
+                          "vehicleId",
+                          "vin",
+                          "soldOn",
+                          "entryId",
+                          "kind",
+                          "basis",
+                          "currency",
+                          "billedNgn",
+                          "carCostNgn",
+                          "landedCostNgn",
+                          "tradingProfitNgn",
+                          "quoteFxNgn",
+                          "poolVsSpotNgn",
+                          "otherFxNgn",
+                          "fxNgn",
+                          "otherProfitNgn",
+                          "netProfitNgn",
+                          "marginBp"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": [
+                    "asOfSeq",
+                    "cars"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Error"
+          },
+          "401": {
+            "description": "Error"
+          },
+          "403": {
+            "description": "Error"
+          },
+          "404": {
+            "description": "Error"
+          },
+          "503": {
+            "description": "Error"
+          }
+        }
+      }
+    },
     "/postings": {
       "post": {
         "parameters": [

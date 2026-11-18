@@ -199,6 +199,9 @@ importers:
       '@app/money':
         specifier: workspace:*
         version: link:../../packages/money
+      '@app/reports':
+        specifier: workspace:*
+        version: link:../../packages/reports
       '@aws-sdk/client-s3':
         specifier: 3.1169.0
         version: 3.1169.0
@@ -370,6 +373,15 @@ importers:
         version: link:../money
 
   packages/money: {}
+
+  packages/reports:
+    dependencies:
+      '@app/ledger':
+        specifier: workspace:*
+        version: link:../ledger
+      '@app/money':
+        specifier: workspace:*
+        version: link:../money
 
 packages:
 
