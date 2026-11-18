@@ -2,13 +2,13 @@
 
 Read this first in every new session. Update it before you stop: current phase, what's built, what's next, open questions. Keep it a snapshot of now, not a diary; history lives in git, decisions in `docs/decisions/`.
 
-_Last updated: 2026-11-18 (session: POST /postings batch 3: supplier credit, completion, reversal; migration 0018)_
+_Last updated: 2026-11-18 (session: POST /postings batches 3–4: credit, completion, reversal, stock; migration 0018)_
 
 **We are the clients' bookkeepers, never part of their business** (CLAUDE.md → Who we are). The books record what the client did; the database refuses only what would make them wrong or untraceable, and flags policy questions for a firm reviewer.
 
 ## Start here (next session)
 
-1. **Where the code is:** `main` is at `f5e6405`. `phase2-revaluation` was pushed at `3e55eff`; local on top of it, not pushed: `eef6fae` (postings batch 1, 0016), `19fa687` (evidence rules + FX batch, 0017) and the batch 3 commit (0018). Ask the owner before pushing or merging.
+1. **Where the code is:** `main` is at `f5e6405`. `phase2-revaluation` is pushed up to `6e4987c`: `eef6fae` (postings batch 1, 0016), `19fa687` (evidence rules + FX batch, 0017) and the batch 3 commit `6e4987c` (0018) are pushed; batch 4 (stock) is committed on top. Ask the owner before pushing or merging.
    - **Entry shapes (0015, ADR 0017):**
      - Every posting rule is a named entry type (`source_type`) with one shape in `entry_shapes`; the database refuses an entry that doesn't fit. A reversal keeps its type.
      - A manual journal names no car and keeps off the job, pool, inventory and receivable accounts.
@@ -17,6 +17,7 @@ _Last updated: 2026-11-18 (session: POST /postings batch 3: supplier credit, com
      - batch 1, customer money: receipt, refund, receivable receipt;
      - batch 2, FX: currency purchase, pool payment, supplier invoice, settlement;
      - batch 3: supplier credit, job completion (quote from the job order, cut re-performed by the database), and `POST /postings/:entryId/reversal` (firm accountants and admins, checked in the API and the database; dated on or after the original; each line keeps its evidence);
+     - batch 4, stock: deposit, deposit refund, arrival, sale (each naming its buyer, one of the business's customers) and conversion; a balance owed is paid by whoever owes it on the car (the buyer after a stock sale);
      - `POST /postings/:entryId/evidence`: attach evidence later.
    - **The books' dates (0016):** entries from the client's `go_live_on` to today (Lagos). The first entry in a month opens it; no month opens before go-live or behind a locked one. `seed_default_chart` seeds each client's chart (`docs/deploy.md` → Adding a client).
    - **Evidence (0016–0017):**
@@ -29,7 +30,7 @@ _Last updated: 2026-11-18 (session: POST /postings batch 3: supplier credit, com
    - **Lock timeouts:** `withTenant` sets `lock_timeout` 5 s and `idle_in_transaction_session_timeout` 30 s; a timed-out write is a 503 (retry with the same key).
    - **Reviews:** every slice had a ledger audit and a security review; all end PASS WITH NOTES. Fixed notes are in git; open ones are in ADR 0017/0018 → Consequences. Open from batch 3, for the accountant: per-car balance checks are all-time, not as of the entry date, so a backdated entry can make an earlier day read below zero.
 
-   **Next: posting batch 4, stock:** deposit, deposit refund, arrival, sale, conversion. A stock sale's receivable may be owed by a buyer other than the job's customer, so `receivable_receipt` must then take the counterparty from the car's open 1100 balance. **Then** shipments/containers, cost types and `cost_allocations`, with `POST /costs`, which also brings the `car_cost` posting (moved out of batch 3: every cash-paid car cost carries a cost type). Owner defaults (memory, ADR 0016):
+   **Next:** shipments/containers, cost types and `cost_allocations`, with `POST /costs`, which also brings the `car_cost` posting (moved out of batch 3: every cash-paid car cost carries a cost type). Owner defaults (memory, ADR 0016):
    - split by value at pool cost;
    - evidence may be pending unless the cost type requires a receipt;
    - containers close for good;
@@ -122,7 +123,7 @@ Research behind the next slices: `docs/research/2026-11-15-existing-platforms.md
 - **Apps:** `apps/api` (NestJS 12, `GET /health` public, `POST /webhooks/clerk` (Svix-signed), `GET /me`, `POST/GET /counterparties`, `POST/GET /vehicles`, `GET /vehicles/:id`, documents (presigned upload, confirm, download), job orders and their sign-offs, `POST /postings` and `POST /postings/:entryId/evidence` behind the global Clerk guard and the Redis rate limiter, Sentry tagged with tenant and request id), `apps/worker` (NestJS + BullMQ, `system` queue with a `ping` job, Sentry), `apps/web` (Next.js 16 on Cloudflare Workers via vinext, placeholder page). No auth or business endpoints yet.
 - **Packages:** `money`, `ledger`, `db` (Drizzle schema; migrations 0000–0018; `withTenant()`, `resolveAccess()`; `migrate()`), `contracts` (Zod, VIN rule; `pnpm openapi` writes `packages/contracts/openapi.json`).
 - **Database guarantees** (ADR 0006): API logs in as `finbook_api` (non-superuser) and runs as `finbook_app` under forced RLS; owner URL only for migrations. Balance at commit, append-only ledger and audit log, period lock, reversals mirror exactly, accounts frozen once posted to, FX checks, DB-stamped actor and time, audit rows, per-tenant hash chain with `ledger_chain_breaks()`. Known limit: chain tampering by a DB superuser needs an off-site anchor (backup manifest, phase 5).
-- **Tests:** money 10 and ledger 20 (100% branch coverage), api 2 unit + 44 integration (postings batches 1–3 and reversals, evidence, job-order sign-offs, documents via S3Mock, job orders, vehicles, counterparties, idempotency per tenant and user, races, 429, viewer 403, auth, template tokens refused, cross-tenant 404, suspended tenant, MFA, default deny, signed webhook, ordering, firm staff never mirrored), worker 7 (1 needs Redis), db integration 100 (Testcontainers Postgres 18, needs Docker; the two fuzz tests take about 7 minutes together).
+- **Tests:** money 10 and ledger 20 (100% branch coverage), api 2 unit + 46 integration (postings batches 1–4 and reversals, evidence, job-order sign-offs, documents via S3Mock, job orders, vehicles, counterparties, idempotency per tenant and user, races, 429, viewer 403, auth, template tokens refused, cross-tenant 404, suspended tenant, MFA, default deny, signed webhook, ordering, firm staff never mirrored), worker 7 (1 needs Redis), db integration 100 (Testcontainers Postgres 18, needs Docker; the two fuzz tests take about 7 minutes together).
 - **Quality gate:** `.githooks/pre-push` runs install, lint, typecheck, unit, integration and build before every push (ADR 0007). Strict type-aware ESLint bans float money (`parseFloat`, `Number()`, `Math.round` and friends, `toFixed`).
 - **Staging (Railway project `finbook`, env `staging`):** Postgres 18, Redis, api (https://api-staging-c68d0388.up.railway.app/health), worker, and a one-off `migrate` service. Production environment exists, empty, owner-run only. Details: `docs/deploy.md`.
 - **Decisions:** ADRs 0001–0018 in `docs/decisions/`. Research notes in `docs/research/`.

@@ -338,17 +338,20 @@ export function arriveInYard(e: { vehicleId: string; history: readonly Line[] })
  * 1210 to 5000. The database refuses a sale that doesn't clear the car's 1210 (migration 0008).
  * ponytail: NGN price only; an RMB-priced stock sale needs the quote-day rate and FX-on-sale line like completeAgentJob.
  */
-export function sellStockCar(e: Job & { priceNgn: bigint; history: readonly Line[] }): Line[] {
+export function sellStockCar(e: Job & { priceNgn: bigint; history: readonly Line[]; evidenceDocumentId?: string }): Line[] {
   positive(e.priceNgn, 'price');
   if (carBalance(e.history, e.vehicleId, '1200') !== 0n) throw new RuleError('the car is still in transit: record its arrival in the yard first');
   const cost = carBalance(e.history, e.vehicleId, '1210');
   positive(cost, 'cost in the yard');
-  // Only this buyer's deposits on this car: another buyer's deposit stays theirs (refundStockDeposit).
-  const deposits = -carBalance(e.history.filter((l) => l.counterpartyId === e.counterpartyId), e.vehicleId, '2100');
-  if (deposits > e.priceNgn) throw new RuleError('deposits exceed the price: refund the difference first (refundStockDeposit)');
+  // Only this buyer's deposits on this car: another buyer's deposit stays theirs (refundStockDeposit). Deposits beyond the
+  // price stay on 2100 as theirs too, until refunded: the sale is recorded either way (CLAUDE.md: never refused for policy).
+  const held = -carBalance(e.history.filter((l) => l.counterpartyId === e.counterpartyId), e.vehicleId, '2100');
+  const deposits = held < e.priceNgn ? held : e.priceNgn;
   const car = { vehicleId: e.vehicleId };
+  const job = { vehicleId: e.vehicleId, counterpartyId: e.counterpartyId };
   return [
-    ...ngn('2100', deposits, e), ...ngn('1100', e.priceNgn - deposits, e), ...ngn('4000', -e.priceNgn, car),
+    // the sale invoice backs the revenue line
+    ...ngn('2100', deposits, job), ...ngn('1100', e.priceNgn - deposits, job), ...ngn('4000', -e.priceNgn, { ...car, evidenceDocumentId: e.evidenceDocumentId }),
     ...ngn('5000', cost, car), ...ngn('1210', -cost, car),
   ];
 }
@@ -369,8 +372,9 @@ export function convertToStock(e: Job & { history: readonly Line[]; evidenceDocu
   if (p.fundsHeldNgn < 0n) throw new RuleError('customer funds held for this job are negative');
   const car = { vehicleId: e.vehicleId };
   return [
-    ...ngn('1200', p.costNgn, car), ...ngn('1150', -p.costNgn, car),
-    ...ngn('2150', p.fundsHeldNgn, e), ...ngn('1000', -p.fundsHeldNgn, { evidenceDocumentId: e.evidenceDocumentId }),
+    // the conversion's document backs the inventory line, which every conversion has (a cash refund may be nil)
+    ...ngn('1200', p.costNgn, { ...car, evidenceDocumentId: e.evidenceDocumentId }), ...ngn('1150', -p.costNgn, car),
+    ...ngn('2150', p.fundsHeldNgn, { vehicleId: e.vehicleId, counterpartyId: e.counterpartyId }), ...ngn('1000', -p.fundsHeldNgn),
   ];
 }
 

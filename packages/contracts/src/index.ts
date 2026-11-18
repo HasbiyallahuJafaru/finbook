@@ -175,6 +175,17 @@ export const CreatePosting = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('supplier_credit'), vehicleId: z.uuid(), amountNgn: MinorUnits, supplierId: z.uuid().optional(), ...postingFacts }),
   /** The car's job completes: the cut comes from its accepted quote and its own ledger, never from the request. The accepted quote is its evidence. */
   z.strictObject({ type: z.literal('job_completion'), vehicleId: z.uuid(), entryDate: isoDate, memo: postingFacts.memo }),
+  // Stock (EMM-funded or converted, ADR 0012): a stock car's buyer may be someone other than the job's customer, so these name them.
+  /** A buyer's deposit towards a stock car: theirs until the sale (2100). */
+  z.strictObject({ type: z.literal('stock_deposit'), vehicleId: z.uuid(), buyerId: z.uuid(), amountNgn: MinorUnits, ...postingFacts }),
+  /** A buyer's deposit paid back, never more than they paid for that car. */
+  z.strictObject({ type: z.literal('stock_deposit_refund'), vehicleId: z.uuid(), buyerId: z.uuid(), amountNgn: MinorUnits, ...postingFacts }),
+  /** A stock car reaches the yard: its whole in-transit cost moves to 1210, from its ledger. */
+  z.strictObject({ type: z.literal('yard_arrival'), vehicleId: z.uuid(), entryDate: isoDate, memo: postingFacts.memo }),
+  /** A stock car sold at its naira price: gross revenue, paid first from that buyer's deposits, the rest owed; its own cost to 5000. */
+  z.strictObject({ type: z.literal('stock_sale'), vehicleId: z.uuid(), buyerId: z.uuid(), priceNgn: MinorUnits, ...postingFacts }),
+  /** A customer's job becomes stock: the car's job costs move to inventory and the customer's funds held are repaid in full (flagged for review). */
+  z.strictObject({ type: z.literal('stock_conversion'), vehicleId: z.uuid(), ...postingFacts }),
 ]);
 export type CreatePosting = z.infer<typeof CreatePosting>;
 export const Posting = z.object({

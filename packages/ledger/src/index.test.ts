@@ -347,12 +347,18 @@ test('EMM-funded guards: in transit, nothing to move, deposits over the price; s
   const inYard = [...paid, ...arriveInYard({ vehicleId: 'S', history: paid })];
   assert.throws(() => sellStockCar({ ...buyer, priceNgn: 0n, history: inYard }), /price must be positive/);
   assert.throws(() => sellStockCar({ ...buyer, priceNgn: 450_000_000n, history: [] }), /cost in the yard must be positive/);
-  assert.throws(() => sellStockCar({ ...buyer, priceNgn: 100_000_000n, history: [...inYard, ...stockDeposit({ ...buyer, amountNgn: 200_000_000n })] }), /deposits exceed the price/);
+  // Deposits over the price: the sale applies NGN 1,000,000.00 of the buyer's NGN 2,000,000.00; the other NGN 1,000,000.00 stays
+  // theirs on 2100 until refunded (a real sale is recorded, never refused for it).
+  const overpaid = sellStockCar({ ...buyer, priceNgn: 100_000_000n, history: [...inYard, ...stockDeposit({ ...buyer, amountNgn: 200_000_000n })] });
+  assert.deepEqual(only(overpaid).slice(0, 2), [['2100', 100_000_000n, 0n, 'S'], ['4000', 0n, 100_000_000n, 'S']]);
   assert.throws(() => stockDeposit({ ...buyer, amountNgn: 0n }), /deposit must be positive/);
   const invoice = supplierInvoice({ ...supplier, vehicleId: 'S', currency: 'CNY', amountMinor: 2_000_000n, rate: FIXTURE_RATE_INVOICE, spot: SPOT_CBN, funding: 'emm_funded' });
   assert.deepEqual(only(invoice)[0], ['1200', 210_000_000n, 0n, 'S']);
   // A sale with no deposit is all receivable.
   assert.deepEqual(only(sellStockCar({ ...buyer, priceNgn: 450_000_000n, history: inYard })).slice(0, 2), [['1100', 450_000_000n, 0n, 'S'], ['4000', 0n, 450_000_000n, 'S']]);
+  // The sale invoice backs the revenue line, and only it.
+  const invoiced = sellStockCar({ ...buyer, priceNgn: 450_000_000n, history: inYard, evidenceDocumentId: 'doc-sale' });
+  assert.deepEqual(invoiced.map((l) => [l.account, l.evidenceDocumentId]), [['1100', undefined], ['4000', 'doc-sale'], ['5000', undefined], ['1210', undefined]]);
 });
 
 test('convert to stock: the abandoned job\'s cost becomes inventory and the customer is repaid in full', () => {
@@ -369,6 +375,9 @@ test('convert to stock: the abandoned job\'s cost becomes inventory and the cust
   // Nothing held yet (the customer hadn't paid): only the cost moves.
   const unpaid = history.filter((l) => l.account !== '2150' && !(l.account === '1000' && l.debit > 0n));
   assert.deepEqual(only(convertToStock({ ...job('A'), history: unpaid })).map((r) => r[0]), ['1200', '1150']);
+  // The conversion's document backs the inventory line, so it is kept even when no cash moves.
+  assert.deepEqual(convertToStock({ ...job('A'), history: unpaid, evidenceDocumentId: 'doc-convert' }).map((l) => [l.account, l.evidenceDocumentId]),
+    [['1200', 'doc-convert'], ['1150', undefined]]);
   assert.throws(() => convertToStock({ ...job('A'), history: customerReceipt({ ...job('A'), amountNgn: 1n }) }), /job cost must be positive/);
   assert.throws(() => convertToStock({ ...job('A'), history: [...history, ...ngnRefund('A', 700_000_000n)] }), /negative/);
 });

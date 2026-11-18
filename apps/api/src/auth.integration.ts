@@ -900,4 +900,89 @@ describe('documents and job orders', () => {
       assert.deepEqual([undone.memo, await docs(undone.entryId)], ['wrong rate on the slip', await docs(receipt)]);
     });
   });
+
+  // ── POST /postings: stock (ADR 0012, 0018). Worked by hand, to the kobo, fixture rates; the USD pool is empty when this starts.
+  //   Car S, EMM-funded: buy USD 2,000.00 at FIXTURE_RATE_BUY 1,500 = NGN 3,000,000.00; pay the supplier all of it -> 1200 NGN 3,000,000.00.
+  //   Buyer K (not the job's customer) deposits NGN 1,000,000.00 -> 2100. Arrival: 1200 -> 1210 NGN 3,000,000.00.
+  //   Sale at NGN 3,600,000.00: 2100 Dr 1,000,000.00 (K's deposit), 1100 Dr 2,600,000.00 (K owes), 4000 Cr 3,600,000.00,
+  //   5000 Dr 3,000,000.00, 1210 Cr 3,000,000.00: gross profit NGN 600,000.00. K then pays the NGN 2,600,000.00 owed.
+  //   Car T, customer-funded: receipt NGN 2,000,000.00; USD 1,000.00 at 1,500 = NGN 1,500,000.00 paid; the customer walks away:
+  //   conversion 1200 Dr 1,500,000.00 / 1150 Cr 1,500,000.00, and 2150 Dr 2,000,000.00 / cash Cr 2,000,000.00 (refunded in full).
+  describe('POST /postings: stock', () => {
+    // its own client owner: the suites above have used up ownerA's write limit (60 a minute)
+    const keeper = { sub: 'user_owner_a2', o: { id: 'org_a' } };
+    const cars: Record<string, string> = {};
+    let buyerK = '';
+    let supplierX = '';
+    const date = '2026-02-12';
+    const spot = { rate: '1500', source: 'manual', note: 'FIXTURE spot' };
+    const post = (body: unknown) => fetch(`${url}/postings`, { method: 'POST', body: JSON.stringify(body),
+      headers: { ...bearer(keeper), 'content-type': 'application/json', 'idempotency-key': randomUUID() } });
+    const slip = async () => (await evidence(keeper, Buffer.from(`%PDF-1.7\n% fixture slip ${randomUUID()}\n%%EOF\n`), { docType: 'receipt' })).id;
+    type Out = { lines: { account: string; debitNgn: string; creditNgn: string; counterpartyId: string | null }[]; flags: { kind: string }[]; entryId: string };
+    const ok = async (res: Response) => {
+      assert.equal(res.status, 201, await res.clone().text());
+      return (await res.json()) as Out;
+    };
+    const rows = (o: Out) => o.lines.map((l) => [l.account, l.debitNgn, l.creditNgn]);
+    const message = async (res: Response) => [res.status, ((await res.json()) as { message: string }).message];
+    before(async () => {
+      await ownerPool.query("INSERT INTO memberships (tenant_id, clerk_user_id, role) VALUES ($1, 'user_owner_a2', 'client_owner')", [tenantA]);
+      buyerK = ((await (await send('POST', '/counterparties', keeper, { kind: 'customer', name: 'Kemi Adeyemi' })).json()) as { id: string }).id;
+      supplierX = ((await (await send('POST', '/counterparties', keeper, { kind: 'supplier', name: 'Ningbo Autos' })).json()) as { id: string }).id;
+      for (const [v, vin, funding] of [['S', 'SALGS2SE5LA000014', 'emm_funded'], ['T', 'SALGS2SE5LA000015', 'customer_funded']] as const) {
+        const job = (await (await send('POST', '/job-orders', keeper, { customerId: customerA, jobType: 'car_purchase', orderedOn: '2026-02-01', funding,
+          ...(funding === 'emm_funded' && { fundingReason: 'bought for the yard' }),
+          carPrice: { amountMinor: '250000', currency: 'USD' }, quoteRate: { rate: '1450', source: 'manual', note: 'FIXTURE_RATE_QUOTE' }, landingChargeNgn: '0' })).json()) as { id: string };
+        cars[v] = ((await (await send('POST', '/vehicles', keeper, { vin, make: 'Lexus', model: 'RX 350', year: 2022 })).json()) as { id: string }).id;
+        await send('POST', `/job-orders/${job.id}/vehicles`, keeper, { vehicleId: cars[v], carPriceMinor: '250000', landingChargeNgn: '0' });
+        assert.equal((await send('POST', `/job-orders/${job.id}/accept-quote`, keeper, { documentId: (await evidence(keeper, Buffer.from(`%PDF-1.7\n% quote ${v}\n%%EOF\n`))).id })).status, 200);
+      }
+    });
+
+    test('worked example: an EMM-funded car bought, deposited on, arrived, sold to a buyer of its own and paid for, to the kobo', async () => {
+      await ok(await post({ type: 'currency_purchase', currency: 'USD', amountMinor: '200000', rate: { rate: '1500', source: 'bank_receipt' }, entryDate: date, evidenceDocumentId: await slip() }));
+      const paid = await ok(await post({ type: 'pool_payment', vehicleId: cars.S, currency: 'USD', amountMinor: '200000', spot, entryDate: date, evidenceDocumentId: await slip() }));
+      assert.deepEqual(rows(paid), [['1200', '300000000', '0'], ['1010', '0', '300000000']]);
+      const deposit = (amountNgn: string, extra: Record<string, unknown> = {}) => ({ type: 'stock_deposit', vehicleId: cars.S, buyerId: buyerK, amountNgn, entryDate: date, ...extra });
+      assert.deepEqual(await message(await post(deposit('100', { buyerId: supplierX }))), [422, 'the buyer must be one of your customers']);
+      const dep = await ok(await post(deposit('100000000')));
+      assert.deepEqual(dep.lines.map((l) => [l.account, l.creditNgn, l.counterpartyId]), [['1000', '0', null], ['2100', '100000000', buyerK]]);
+      const refund = { type: 'stock_deposit_refund', vehicleId: cars.S, buyerId: buyerK, amountNgn: '100000001', entryDate: date };
+      assert.deepEqual(await message(await post(refund)), [422, 'refund exceeds what this buyer paid towards this car']);
+      assert.deepEqual(await message(await post({ ...refund, buyerId: customerA, amountNgn: '1' })), [422, 'refund exceeds what this buyer paid towards this car']); // another buyer's deposit stays theirs
+      const sale = { type: 'stock_sale', vehicleId: cars.S, buyerId: buyerK, priceNgn: '360000000', entryDate: date };
+      assert.deepEqual(await message(await post(sale)), [422, 'the car is still in transit: record its arrival in the yard first']);
+      assert.equal((await post({ type: 'yard_arrival', vehicleId: cars.S, entryDate: date, amountNgn: '1' })).status, 400); // the cost comes from the ledger
+      assert.deepEqual(rows(await ok(await post({ type: 'yard_arrival', vehicleId: cars.S, entryDate: date }))), [['1210', '300000000', '0'], ['1200', '0', '300000000']]);
+      const invoice = await slip();
+      const sold = await ok(await post({ ...sale, evidenceDocumentId: invoice }));
+      assert.deepEqual(sold.lines.map((l) => [l.account, l.debitNgn, l.creditNgn, l.counterpartyId]), [
+        ['2100', '100000000', '0', buyerK], ['1100', '260000000', '0', buyerK], ['4000', '0', '360000000', null], ['5000', '300000000', '0', null], ['1210', '0', '300000000', null]]);
+      const backing = await ownerPool.query<{ code: string }>('SELECT a.code FROM journal_lines l JOIN accounts a ON a.id = l.account_id WHERE l.entry_id = $1 AND l.evidence_document_id = $2', [sold.entryId, invoice]);
+      assert.deepEqual(backing.rows, [{ code: '4000' }]);
+      // The balance owed is the buyer's, not the job's customer's: the receipt names K.
+      const owed = { type: 'receivable_receipt', vehicleId: cars.S, amountNgn: '260000001', entryDate: date };
+      assert.deepEqual(await message(await post(owed)), [422, 'receipt exceeds what this customer owes for this car']);
+      const settled = await ok(await post({ ...owed, amountNgn: '260000000' }));
+      assert.deepEqual(settled.lines.map((l) => [l.account, l.debitNgn, l.creditNgn, l.counterpartyId]), [['1000', '260000000', '0', null], ['1100', '0', '260000000', buyerK]]);
+    });
+
+    test('worked example: a customer-funded job converted to stock moves its cost to inventory and refunds the customer in full, flagged', async () => {
+      await ok(await post({ type: 'customer_receipt', vehicleId: cars.T, amountNgn: '200000000', entryDate: date }));
+      await ok(await post({ type: 'currency_purchase', currency: 'USD', amountMinor: '100000', rate: { rate: '1500', source: 'bank_receipt' }, entryDate: date, evidenceDocumentId: await slip() }));
+      await ok(await post({ type: 'pool_payment', vehicleId: cars.T, currency: 'USD', amountMinor: '100000', spot, entryDate: date, evidenceDocumentId: await slip() }));
+      // Stock postings wait for the conversion: a deposit on a customer's job is refused by the database.
+      const early = await message(await post({ type: 'stock_deposit', vehicleId: cars.T, buyerId: buyerK, amountNgn: '100', entryDate: date }));
+      assert.equal(early[0], 422);
+      assert.match(String(early[1]), /this car is a customer-funded job: convert it to stock before posting it as EMM stock/);
+      const doc = await slip();
+      const converted = await ok(await post({ type: 'stock_conversion', vehicleId: cars.T, entryDate: date, evidenceDocumentId: doc }));
+      const backing = await ownerPool.query<{ code: string }>('SELECT a.code FROM journal_lines l JOIN accounts a ON a.id = l.account_id WHERE l.entry_id = $1 AND l.evidence_document_id = $2', [converted.entryId, doc]);
+      assert.deepEqual(backing.rows, [{ code: '1200' }]); // the document backs the inventory line
+      assert.deepEqual(rows(converted), [['1200', '150000000', '0'], ['1150', '0', '150000000'], ['2150', '200000000', '0'], ['1000', '0', '200000000']]);
+      assert.deepEqual(converted.flags.map((f) => f.kind), ['converted_to_stock']);
+      assert.equal((await post({ type: 'stock_conversion', vehicleId: cars.T, entryDate: date })).status, 422); // once
+    });
+  });
 });

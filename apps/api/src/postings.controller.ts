@@ -6,8 +6,8 @@ import type { Tx } from '@app/db';
 import { AttachEvidence, CreatePosting, CreateReversal, type EntryEvidence, type Posting } from '@app/contracts';
 import { parseRate, type Pool } from '@app/money';
 import {
-  buyCurrency, completeAgentJob, completeClearingJob, customerReceipt, customerRefund, payFromPool, payPayableFromPool, receivableReceipt, RuleError, supplierCredit,
-  supplierInvoice, type EntryType, type Funding, type Line,
+  arriveInYard, buyCurrency, completeAgentJob, completeClearingJob, convertToStock, customerReceipt, customerRefund, payFromPool, payPayableFromPool, receivableReceipt,
+  refundStockDeposit, RuleError, sellStockCar, stockDeposit, supplierCredit, supplierInvoice, type EntryType, type Funding, type Line,
 } from '@app/ledger';
 import { Can } from './auth/permissions.js';
 import type { Caller } from './auth/auth.guard.js';
@@ -58,6 +58,26 @@ async function supplierOf(t: Tx, supplierId: string): Promise<string> {
   const found = await t.client.query("SELECT 1 FROM counterparties WHERE id = $1 AND kind IN ('supplier', 'agent')", [supplierId]);
   if (found.rowCount !== 1) throw new UnprocessableEntityException('the supplier must be one of your suppliers or agents');
   return supplierId;
+}
+
+/** A stock car's buyer: one of this business's customers (another tenant's looks like none). */
+async function buyerOf(t: Tx, buyerId: string): Promise<string> {
+  const found = await t.client.query("SELECT 1 FROM counterparties WHERE id = $1 AND kind = 'customer'", [buyerId]);
+  if (found.rowCount !== 1) throw new UnprocessableEntityException('the buyer must be one of your customers');
+  return buyerId;
+}
+
+/**
+ * Who owes for a car (1100), from its ledger: the job's customer after a completion, the buyer after a stock sale (ADR 0018).
+ * Nobody owing leaves the job's customer, and the rule refuses the receipt. ponytail: one debtor per car; two at once is refused
+ * until the request names the payer.
+ */
+function debtorOf(history: readonly Line[], customerId: string): string {
+  const owed = new Map<string, bigint>();
+  for (const l of history) if (l.account === '1100' && l.counterpartyId) owed.set(l.counterpartyId, (owed.get(l.counterpartyId) ?? 0n) + l.debit - l.credit);
+  const owing = [...owed].filter(([, n]) => n > 0n).map(([id]) => id);
+  if (owing.length > 1) throw new UnprocessableEntityException('more than one party owes for this car');
+  return owing[0] ?? customerId;
 }
 
 /** The foreign-currency pool for one currency, from the ledger (ADR 0008): what it holds and what that cost in naira. */
@@ -148,6 +168,8 @@ const MEMOS: Record<CreatePosting['type'], string> = {
   customer_receipt: 'Customer receipt', customer_refund: 'Refund to customer', receivable_receipt: 'Customer payment of balance owed',
   currency_purchase: 'Foreign currency bought', pool_payment: 'Supplier paid from the pool', supplier_invoice: 'Supplier invoice',
   supplier_settlement: 'Supplier invoice paid from the pool', supplier_credit: 'Supplier credit', job_completion: 'Job completed',
+  stock_deposit: 'Buyer deposit on a stock car', stock_deposit_refund: 'Buyer deposit refunded', yard_arrival: 'Car arrived in the yard',
+  stock_sale: 'Stock car sold', stock_conversion: 'Job converted to stock',
 };
 
 /** The rule's lines for one posting, from the facts and what the ledger already says. */
@@ -160,7 +182,27 @@ async function linesFor(t: Tx, p: CreatePosting): Promise<Line[]> {
       const facts = { vehicleId: p.vehicleId, counterpartyId: customerId, amountNgn: BigInt(p.amountNgn), ...evidence };
       if (p.type === 'customer_receipt') return rule(() => customerReceipt(facts));
       const history = await historyOf(t, p.vehicleId);
-      return p.type === 'customer_refund' ? rule(() => customerRefund({ ...facts, history })) : rule(() => receivableReceipt({ ...facts, history }));
+      if (p.type === 'customer_refund') return rule(() => customerRefund({ ...facts, history }));
+      // the payer is whoever owes for the car: after a stock sale, the buyer, not the job's customer
+      return rule(() => receivableReceipt({ ...facts, counterpartyId: debtorOf(history, customerId), history }));
+    }
+    case 'stock_deposit': case 'stock_deposit_refund': case 'stock_sale': {
+      await jobOf(t, p.vehicleId);
+      const buyer = { vehicleId: p.vehicleId, counterpartyId: await buyerOf(t, p.buyerId) };
+      if (p.type === 'stock_deposit') return rule(() => stockDeposit({ ...buyer, amountNgn: BigInt(p.amountNgn), ...evidence }));
+      const history = await historyOf(t, p.vehicleId);
+      if (p.type === 'stock_deposit_refund') return rule(() => refundStockDeposit({ ...buyer, amountNgn: BigInt(p.amountNgn), history, ...evidence }));
+      return rule(() => sellStockCar({ ...buyer, priceNgn: BigInt(p.priceNgn), history, ...evidence }));
+    }
+    case 'yard_arrival': {
+      await jobOf(t, p.vehicleId);
+      const history = await historyOf(t, p.vehicleId);
+      return rule(() => arriveInYard({ vehicleId: p.vehicleId, history }));
+    }
+    case 'stock_conversion': {
+      const { customerId } = await jobOf(t, p.vehicleId);
+      const history = await historyOf(t, p.vehicleId);
+      return rule(() => convertToStock({ vehicleId: p.vehicleId, counterpartyId: customerId, history, ...evidence }));
     }
     case 'currency_purchase':
       return rule(() => buyCurrency({ currency: p.currency, amountMinor: BigInt(p.amountMinor), rate: parseRate(p.rate.rate), rateSource: p.rate.source,
