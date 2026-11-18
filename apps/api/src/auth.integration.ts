@@ -77,7 +77,7 @@ before(async () => {
   try {
     await seeding.query('BEGIN');
     await seeding.query("SELECT set_config('app.user_id', 'user_admin', true)");
-    await seeding.query('SELECT seed_default_chart(id) FROM tenants');
+    await seeding.query('SELECT seed_default_chart(id), seed_default_cost_types(id) FROM tenants');
     await seeding.query('COMMIT');
   } finally {
     seeding.release();
@@ -552,22 +552,9 @@ describe('documents and job orders', () => {
     const early = await review(tenantA, path, { flagId: randomUUID(), reason: 'nothing to sign yet' });
     assert.equal(early.status, 422); // nothing posted for the car yet: no flag on this job
     assert.match(await early.text(), /that flag is not on this job order/);
-    // The client buys the car for naira (Dr 1200 / Cr 1000). There is no posting endpoint yet, so the owner posts it here.
-    const owner = await ownerPool.connect();
-    try {
-      await owner.query('BEGIN');
-      const account = async (code: string) => (await owner.query<{ id: string }>('SELECT id FROM accounts WHERE tenant_id = $1 AND code = $2', [tenantA, code])).rows[0]?.id;
-      const [cash, transit] = [await account('1000'), await account('1200')];
-      const period = (await owner.query<{ id: string }>("INSERT INTO periods (tenant_id, starts_on, ends_on) VALUES ($1, '2026-01-01', '2026-01-31') RETURNING id", [tenantA])).rows[0]?.id;
-      const entry = (await owner.query<{ id: string }>(
-        `INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, created_by)
-         VALUES ($1, $2, '2026-01-10', 'car bought for naira', 'car_cost', uuidv7(), 'api-flag-1', 'user_owner_a') RETURNING id`, [tenantA, period])).rows[0]?.id;
-      await owner.query("INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, vehicle_id) VALUES ($1, $2, $3, 500000000, 0, 'NGN', 500000000, $4), ($1, $2, $5, 0, 500000000, 'NGN', 500000000, NULL)",
-        [tenantA, entry, transit, car.id, cash]);
-      await owner.query('COMMIT');
-    } finally {
-      owner.release();
-    }
+    // The client pays a naira cost on its stock car (Dr 1200 / Cr 1000): the first posting for an EMM-funded car raises the flag.
+    const idec = ((await (await get('/cost-types', bearer(ownerA))).json()) as { id: string; name: string }[]).find((t) => t.name === 'IDEC bill')?.id;
+    assert.equal((await send('POST', '/postings', ownerA, { type: 'car_cost', costTypeId: idec, amountNgn: '500000000', split: { basis: 'per_car', vehicleId: car.id }, entryDate: '2026-01-10' })).status, 201);
     // The database raised the flag as the entry committed; the job order lists it, not yet signed off.
     const raised = ((await (await get(`/job-orders/${job.id}`, bearer(ownerA))).json()) as { flags: { id: string; kind: string; vehicleId: string; signOff: unknown }[] }).flags;
     assert.deepEqual(raised.map(({ kind, vehicleId, signOff }) => ({ kind, vehicleId, signOff })), [{ kind: 'emm_funded', vehicleId: car.id, signOff: null }]);
@@ -983,6 +970,155 @@ describe('documents and job orders', () => {
       assert.deepEqual(rows(converted), [['1200', '150000000', '0'], ['1150', '0', '150000000'], ['2150', '200000000', '0'], ['1000', '0', '200000000']]);
       assert.deepEqual(converted.flags.map((f) => f.kind), ['converted_to_stock']);
       assert.equal((await post({ type: 'stock_conversion', vehicleId: cars.T, entryDate: date })).status, 422); // once
+      // A cost on the converted car is stock's now: inventory (1200), not job costs (ledger audit of 0019).
+      const repairs = ((await (await send('POST', '/cost-types', keeper, { name: 'Panel beating', defaultBasis: 'per_car' })).json()) as { id: string }).id;
+      const cost = await ok(await post({ type: 'car_cost', costTypeId: repairs, amountNgn: '5000000', split: { basis: 'per_car', vehicleId: cars.T }, entryDate: date }));
+      assert.deepEqual(rows(cost), [['1200', '5000000', '0'], ['1000', '0', '5000000']]);
+    });
+  });
+
+  // ── Car costs and containers (0019). Worked by hand, to the kobo, fixture rates; the USD pool is empty when this starts.
+  //   Cars P1, P2, P3 (customer-funded, each quoted USD 1,100.00 at FIXTURE_RATE_QUOTE 1,450, landing charge NGN 1,500,000.00), each
+  //   bought for USD 1,000.00 at a different rate: FIXTURE_RATE_BUY 1,500 / 1,600 / 1,700 = NGN 1,500,000.00 / 1,600,000.00 / 1,700,000.00.
+  //   Container C4 holds all three:
+  //     Form M NGN 1,000,000.01 equally          -> P1 333,333.35, P2 333,333.33, P3 333,333.33 (1 kobo x 2 remainder on P1)
+  //     Shipping fee NGN 2,400,000.00 by value   -> weights 1,500,000 : 1,600,000 : 1,700,000 -> P1 750,000.00, P2 800,000.00, P3 850,000.00
+  //     Transport NGN 100,000.00 by hand          -> P1 60,000.00, P3 40,000.00
+  //   IDEC bill NGN 300,000.00 on P2 alone; CPH extra fee NGN 50,000.00 on P3, which needs its receipt.
+  //   P1 completes: job costs 1,500,000.00 + 333,333.35 + 750,000.00 + 60,000.00 = NGN 2,643,333.35
+  //     car markup 1,100.00 x 1,450 - 1,000.00 x 1,450 = 1,595,000.00 - 1,450,000.00 = NGN 145,000.00
+  //     FX 1,450,000.00 - 1,500,000.00 = NGN 50,000.00 loss; clearing margin 1,500,000.00 - (2,643,333.35 - 1,500,000.00) = NGN 356,666.65
+  //     bill 1,595,000.00 + 1,500,000.00 = NGN 3,095,000.00 from the NGN 4,000,000.00 held. Dr 3,095,000.00 + 50,000.00 = Cr 2,643,333.35 + 145,000.00 + 356,666.65
+  describe('car costs and containers', () => {
+    const keeper = { sub: 'user_owner_a3', o: { id: 'org_a' } };
+    const cars: Record<string, string> = {};
+    const types: Record<string, string> = {};
+    let c4 = '';
+    const date = '2026-02-14';
+    const call = (method: string, path: string, claims: Record<string, unknown>, body?: unknown, key: string = randomUUID()) => fetch(`${url}${path}`, {
+      method, body: body === undefined ? undefined : JSON.stringify(body), headers: { ...bearer(claims), 'content-type': 'application/json', 'idempotency-key': key } });
+    const post = (body: unknown) => call('POST', '/postings', keeper, body);
+    const slip = async () => (await evidence(keeper, Buffer.from(`%PDF-1.7\n% fixture slip ${randomUUID()}\n%%EOF\n`), { docType: 'receipt' })).id;
+    type Out = { entryId: string; lines: { account: string; debitNgn: string; creditNgn: string; vehicleId: string | null }[]; flags: { kind: string }[] };
+    const ok = async (res: Response) => {
+      assert.equal(res.status, 201, await res.clone().text());
+      return (await res.json()) as Out;
+    };
+    const message = async (res: Response) => [res.status, ((await res.json()) as { message: string }).message];
+    const shares = (o: Out) => o.lines.filter((l) => l.account === '1150').map((l) => [Object.keys(cars).find((k) => cars[k] === l.vehicleId), l.debitNgn]);
+    const cost = (name: string, amountNgn: string, split: unknown, extra: Record<string, unknown> = {}) => ({ type: 'car_cost', costTypeId: types[name], amountNgn, split, entryDate: date, ...extra });
+    before(async () => {
+      await ownerPool.query("INSERT INTO memberships (tenant_id, clerk_user_id, role) VALUES ($1, 'user_owner_a3', 'client_owner')", [tenantA]);
+      for (const t of (await (await call('GET', '/cost-types', keeper)).json()) as { id: string; name: string }[]) types[t.name] = t.id;
+      const rates = { P1: '1500', P2: '1600', P3: '1700' } as const;
+      for (const [v, vin] of [['P1', 'SALGS2SE5LA000016'], ['P2', 'SALGS2SE5LA000017'], ['P3', 'SALGS2SE5LA000018']] as const) {
+        const job = (await (await call('POST', '/job-orders', keeper, { customerId: customerA, jobType: 'car_purchase', orderedOn: '2026-02-01',
+          carPrice: { amountMinor: '110000', currency: 'USD' }, quoteRate: { rate: '1450', source: 'manual', note: 'FIXTURE_RATE_QUOTE' }, landingChargeNgn: '150000000' })).json()) as { id: string };
+        cars[v] = ((await (await call('POST', '/vehicles', keeper, { vin, make: 'Toyota', model: 'Corolla', year: 2021 })).json()) as { id: string }).id;
+        await call('POST', `/job-orders/${job.id}/vehicles`, keeper, { vehicleId: cars[v], carPriceMinor: '110000', landingChargeNgn: '150000000' });
+        assert.equal((await call('POST', `/job-orders/${job.id}/accept-quote`, keeper, { documentId: (await evidence(keeper, Buffer.from(`%PDF-1.7\n% quote ${v}\n%%EOF\n`))).id })).status, 200);
+        await ok(await post({ type: 'customer_receipt', vehicleId: cars[v], amountNgn: '400000000', entryDate: date }));
+        await ok(await post({ type: 'currency_purchase', currency: 'USD', amountMinor: '100000', rate: { rate: rates[v], source: 'bank_receipt' }, entryDate: date, evidenceDocumentId: await slip() }));
+        await ok(await post({ type: 'pool_payment', vehicleId: cars[v], currency: 'USD', amountMinor: '100000', spot: { rate: rates[v], source: 'manual', note: 'FIXTURE spot' }, entryDate: date, evidenceDocumentId: await slip() }));
+      }
+    });
+
+    test('containers: created, filled and closed for good; codes and cars are unique; another tenant sees none of it', async () => {
+      const key = randomUUID();
+      const made = await call('POST', '/shipments', keeper, { code: 'C4', billOfLading: 'MSKU1234567', port: 'Apapa', arrivedOn: '2026-02-10' }, key);
+      assert.equal(made.status, 201);
+      const shipment = (await made.json()) as { id: string; code: string; arrivedOn: string; vehicleIds: string[]; closedAt: string | null };
+      assert.deepEqual([shipment.code, shipment.arrivedOn, shipment.vehicleIds, shipment.closedAt], ['C4', '2026-02-10', [], null]);
+      assert.equal(((await (await call('POST', '/shipments', keeper, { code: 'C4', billOfLading: 'MSKU1234567', port: 'Apapa', arrivedOn: '2026-02-10' }, key)).json()) as { id: string }).id, shipment.id); // same key: one container
+      assert.deepEqual(await message(await call('POST', '/shipments', keeper, { code: 'C4' })), [409, 'a container with that code already exists']);
+      c4 = shipment.id;
+      for (const v of ['P1', 'P2', 'P3']) assert.equal((await call('POST', `/shipments/${c4}/vehicles`, keeper, { vehicleId: cars[v] })).status, 201);
+      const c5 = ((await (await call('POST', '/shipments', keeper, { code: 'C5' })).json()) as { id: string }).id;
+      assert.deepEqual(await message(await call('POST', `/shipments/${c5}/vehicles`, keeper, { vehicleId: cars.P1 })), [409, 'that car is already in a container']);
+      assert.equal((await call('POST', `/shipments/${c4}/vehicles`, ownerB, { vehicleId: cars.P1 })).status, 404);
+      assert.equal((await call('GET', `/shipments/${c4}`, ownerB)).status, 404);
+      assert.deepEqual(await (await call('GET', '/shipments', ownerB)).json(), []);
+      assert.equal((await call('POST', '/shipments', viewerA, { code: 'C9' })).status, 403);
+      const audit = await ownerPool.query("SELECT actor FROM audit_log WHERE entity = 'shipments' AND entity_id = $1", [c4]);
+      assert.deepEqual(audit.rows, [{ actor: 'user_owner_a3' }]);
+      // cost types: seeded per client, and the client can add its own
+      assert.ok(['IDEC bill', 'Form M', 'CPH extra fee', 'Transport to Abuja', 'Repairs, labour, boosting'].every((n) => types[n])); // seeded (12; another suite added one)
+      const added = await call('POST', '/cost-types', keeper, { name: 'Port storage', defaultBasis: 'equal' });
+      assert.deepEqual([added.status, ((await added.json()) as { requiresReceipt: boolean }).requiresReceipt], [201, false]);
+      assert.deepEqual(await message(await call('POST', '/cost-types', keeper, { name: 'Port storage', defaultBasis: 'equal' })), [409, 'a cost type with that name already exists']);
+      assert.equal((await call('POST', '/cost-types', keeper, { name: 'Odd', defaultBasis: 'manual' })).status, 400);
+      assert.equal(((await (await call('GET', '/cost-types', ownerB)).json()) as unknown[]).length, 12); // B's own seeded types only
+    });
+
+    test('worked example: container costs split equally, by value and by hand, per-car costs, then a completion, to the kobo', async () => {
+      assert.deepEqual(shares(await ok(await post(cost('Form M', '100000001', { basis: 'equal', shipmentId: c4 })))), [['P1', '33333335'], ['P2', '33333333'], ['P3', '33333333']]);
+      const shipping = await ok(await post(cost('Shipping company fee', '240000000', { basis: 'by_value', shipmentId: c4 })));
+      assert.deepEqual(shares(shipping), [['P1', '75000000'], ['P2', '80000000'], ['P3', '85000000']]);
+      const kept = await ownerPool.query<{ basis: string; weight_ngn: string; share_ngn: string }>(
+        'SELECT basis, weight_ngn, share_ngn FROM cost_allocations WHERE entry_id = $1 ORDER BY position', [shipping.entryId]);
+      assert.deepEqual(kept.rows, [{ basis: 'by_value', weight_ngn: '150000000', share_ngn: '75000000' }, { basis: 'by_value', weight_ngn: '160000000', share_ngn: '80000000' },
+        { basis: 'by_value', weight_ngn: '170000000', share_ngn: '85000000' }]);
+      const manual = (a: string, b: string) => cost('Transport out of Apapa', '10000000', { basis: 'manual', shipmentId: c4, shares: [{ vehicleId: cars.P1, amountNgn: a }, { vehicleId: cars.P3, amountNgn: b }] });
+      assert.deepEqual(await message(await post(manual('6000000', '3999999'))), [422, 'the cars\' shares must add up to the cost']);
+      assert.deepEqual(shares(await ok(await post(manual('6000000', '4000000')))), [['P1', '6000000'], ['P3', '4000000']]);
+      assert.deepEqual(shares(await ok(await post(cost('IDEC bill', '30000000', { basis: 'per_car', vehicleId: cars.P2 })))), [['P2', '30000000']]);
+      const cph = (extra: Record<string, unknown> = {}) => post(cost('CPH extra fee', '5000000', { basis: 'per_car', vehicleId: cars.P3 }, extra));
+      const noReceipt = await message(await cph());
+      assert.equal(noReceipt[0], 422);
+      assert.match(String(noReceipt[1]), /this cost type needs its receipt before it posts/);
+      assert.equal((await cph({ evidenceDocumentId: await slip() })).status, 201);
+      // The request carries the split, never the shares of an equal or by-value one, and never another tenant's cost type or container.
+      assert.equal((await post(cost('Form M', '100', { basis: 'equal', shipmentId: c4, shares: [] }))).status, 400);
+      assert.equal((await post(cost('Form M', '100', { basis: 'per_car', vehicleId: cars.P1 }, { lines: [] }))).status, 400);
+      const theirType = ((await (await call('GET', '/cost-types', ownerB)).json()) as { id: string }[])[0]?.id;
+      assert.deepEqual(await message(await post({ ...cost('Form M', '100', { basis: 'per_car', vehicleId: cars.P1 }), costTypeId: theirType })), [422, 'that cost type is not one of yours']);
+      const theirs = ((await (await call('POST', '/shipments', ownerB, { code: 'B1' })).json()) as { id: string }).id;
+      assert.deepEqual(await message(await post(cost('Form M', '100', { basis: 'equal', shipmentId: theirs }))), [422, 'that container has no cars of yours']);
+      // P1 completes from its own ledger: every split share is in its job costs.
+      const done = await ok(await post({ type: 'job_completion', vehicleId: cars.P1, entryDate: date }));
+      assert.deepEqual(done.lines.map((l) => [l.account, l.debitNgn, l.creditNgn]), [
+        ['2150', '309500000', '0'], ['1150', '0', '264333335'], ['4100', '0', '14500000'], ['4200', '0', '35666665'], ['7000', '5000000', '0']]);
+      // Closed for good: no cost or car joins C4 after, and it doesn't close twice.
+      const closed = await call('POST', `/shipments/${c4}/close`, keeper);
+      assert.equal(closed.status, 200);
+      assert.equal(((await closed.json()) as { closedBy: string }).closedBy, 'user_owner_a3');
+      // A late bill for a closed container is real: it posts, flagged on each car for a reviewer (and on P1, completed, as a cost after completion).
+      const late = await ok(await post(cost('Form M', '300', { basis: 'equal', shipmentId: c4 })));
+      assert.deepEqual(late.flags.map((f) => f.kind).sort(), ['cost_after_completion', 'cost_after_container_closed', 'cost_after_container_closed', 'cost_after_container_closed']);
+      assert.deepEqual(await message(await call('POST', `/shipments/${c4}/close`, keeper)), [422, 'container C4 is closed for good']);
+      assert.deepEqual(await message(await call('POST', `/shipments/${c4}/vehicles`, keeper, { vehicleId: cars.P1 })), [422, 'that container is closed for good: no car joins it']);
+      assert.deepEqual(await message(await call('POST', `/shipments/${c4}/vehicles/${cars.P2 ?? ""}/remove`, keeper, { reason: 'wrong container' })),
+        [422, 'that container is closed for good: its cars stay as they are']);
+    });
+
+    test("another tenant's container, car and cost type are none of yours; viewers and reviewers keep out; client staff add no cost types", async () => {
+      const bCar = ((await (await call('POST', '/vehicles', ownerB, { vin: 'SALGS2SE5LA000019', make: 'Kia', model: 'Sorento', year: 2020 })).json()) as { id: string }).id;
+      const c6 = ((await (await call('POST', '/shipments', keeper, { code: 'C6' })).json()) as { id: string }).id;
+      assert.deepEqual(await message(await call('POST', `/shipments/${c6}/vehicles`, keeper, { vehicleId: bCar })), [422, 'that car is not one of yours']);
+      assert.equal((await call('POST', `/shipments/${c6}/close`, ownerB)).status, 404);
+      // A car put in C6 by mistake comes out, with the reason; it can then join its real container.
+      const stray = ((await (await call('POST', '/vehicles', keeper, { vin: 'SALGS2SE5LA000020', make: 'Kia', model: 'Rio', year: 2019 })).json()) as { id: string }).id;
+      assert.equal((await call('POST', `/shipments/${c6}/vehicles`, keeper, { vehicleId: stray })).status, 201);
+      assert.equal((await call('POST', `/shipments/${c6}/vehicles/${stray}/remove`, ownerB, { reason: 'not mine' })).status, 404);
+      assert.equal((await call('POST', `/shipments/${c6}/vehicles/${stray}/remove`, keeper, { reason: ' ' })).status, 400);
+      const removed = await call('POST', `/shipments/${c6}/vehicles/${stray}/remove`, keeper, { reason: 'sailed in C7' });
+      assert.deepEqual([removed.status, ((await removed.json()) as { vehicleIds: string[] }).vehicleIds], [200, []]);
+      assert.equal((await call('POST', `/shipments/${c6}/vehicles/${stray}/remove`, keeper, { reason: 'again' })).status, 404);
+      const c7 = ((await (await call('POST', '/shipments', keeper, { code: 'C7' })).json()) as { id: string }).id;
+      assert.equal((await call('POST', `/shipments/${c7}/vehicles`, keeper, { vehicleId: stray })).status, 201);
+      assert.equal(((await (await call('GET', `/shipments/${c6}`, keeper)).json()) as { closedAt: string | null }).closedAt, null); // still open
+      const bShipment = ((await (await call('GET', '/shipments', ownerB)).json()) as { id: string }[])[0]?.id;
+      assert.deepEqual(await message(await post(cost('Form M', '100', { basis: 'manual', shipmentId: bShipment, shares: [{ vehicleId: cars.P2, amountNgn: '100' }] }))),
+        [422, 'that container is not one of yours']);
+      assert.deepEqual(await message(await post(cost('Form M', '100', { basis: 'per_car', vehicleId: bCar }))), [422, 'that car is not on one of your job orders']);
+      for (const [method, path] of [['GET', '/shipments'], ['GET', `/shipments/${c6}`], ['GET', '/cost-types'], ['POST', '/cost-types'], ['POST', `/shipments/${c6}/close`]]) {
+        assert.equal((await call(method ?? 'GET', path ?? '', viewerA, method === 'POST' ? { name: 'X', defaultBasis: 'equal' } : undefined)).status, 403, `${String(method)} ${String(path)}`);
+      }
+      const reviewer = (path: string, body?: unknown) => fetch(`${url}${path}`, { method: 'POST', body: JSON.stringify(body ?? {}),
+        headers: { ...bearer({ sub: 'user_reviewer', fva: [1, 1] }, { 'x-tenant-id': tenantA }), 'content-type': 'application/json', 'idempotency-key': randomUUID() } });
+      assert.equal((await reviewer('/shipments', { code: 'C7' })).status, 403);
+      assert.equal((await reviewer(`/shipments/${c6}/close`)).status, 403);
+      assert.equal((await call('POST', '/cost-types', { sub: 'user_staff_a', o: { id: 'org_a' } }, { name: 'CPH extra fee (2)', defaultBasis: 'per_car' })).status, 403);
     });
   });
 });

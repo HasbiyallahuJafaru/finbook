@@ -75,6 +75,7 @@ BEGIN;
 SELECT set_config('app.user_id', '<your Clerk user id>', true);           -- every audit row names who did it
 INSERT INTO tenants (legal_name, clerk_org_id, go_live_on) VALUES ('<legal name>', '<Clerk org id>', '<first day of the books>') RETURNING id;
 SELECT seed_default_chart('<that id>');                                    -- the default chart of accounts (migration 0016)
+SELECT seed_default_cost_types('<that id>');                               -- the default car cost types (migration 0019)
 COMMIT;
 ```
 

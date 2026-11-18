@@ -9,7 +9,7 @@ import pg from 'pg';
 import { vinProblem } from '@app/contracts';
 import { convert, formatRate, parseRate, RATE_SCALE } from '@app/money';
 import {
-  arriveInYard, buyCurrency, completeAgentJob, completeClearingJob, convertToStock, customerReceipt, customerRefund, payFromPool, payPayableFromPool, receivableReceipt, refundStockDeposit, revalue, sellStockCar, sharedCost, stockDeposit,
+  allocateCarCost, arriveInYard, buyCurrency, completeAgentJob, completeClearingJob, convertToStock, type CostBasis, customerReceipt, customerRefund, payFromPool, payPayableFromPool, receivableReceipt, refundStockDeposit, revalue, sellStockCar, sharedCost, stockDeposit,
   supplierCredit, supplierInvoice,
   type Line as LedgerLine, type RevaluationItem,
 } from '@app/ledger';
@@ -95,6 +95,7 @@ const FIXTURE_RATE_INVOICE = parseRate('105.000000');
 const SPOT_CBN = { rate: parseRate(FIXTURE_RATE_SPOT), source: 'cbn' as const };
 const SUPPLIER = '019a0000-0000-7000-8000-0000000000f1'; // stands for the tenant's own test supplier (suppliers below)
 const suppliers: Record<string, string> = {}; // tenant -> its test supplier (a real counterparty of kind supplier, 0015)
+const costTypes: Record<string, string> = {}; // tenant -> its test cost type: every car cost carries one (0019)
 const counterpartyIn = (tenant: string, id: string) => (id === SUPPLIER ? (suppliers[tenant] ?? '') : id);
 const rateString = (scaled: bigint) => `${String(scaled / RATE_SCALE)}.${String(scaled % RATE_SCALE).padStart(6, '0')}`;
 
@@ -155,6 +156,7 @@ async function freshTenant(name: string): Promise<{ id: string; period: string }
         [id, code, `Account ${code}`, type, currency]);
     }
     suppliers[id] = await one(t.client, "INSERT INTO counterparties (tenant_id, kind, name) VALUES ($1, 'supplier', 'Test supplier') RETURNING id", [id]);
+    costTypes[id] = await one(t.client, "INSERT INTO cost_types (tenant_id, name, default_basis) VALUES ($1, 'Test cost', 'per_car') RETURNING id", [id]);
     return one(t.client, "INSERT INTO periods (tenant_id, starts_on, ends_on) VALUES ($1, '2026-01-01', '2026-01-31') RETURNING id", [id]);
   });
   return { id, period };
@@ -513,7 +515,8 @@ describe('phase 2: posting rules through the database', () => {
   };
   const job = (v: string) => ({ vehicleId: v, counterpartyId: v });
 
-  type PostOpts = { date?: string; reverses?: string | null; sourceType?: string; fixtureEvidence?: boolean };
+  type Split = { basis?: string; shipmentId?: string; costTypeId?: string; rows?: { vehicleId: string; shareNgn: bigint; weightNgn?: bigint }[] };
+  type PostOpts = { date?: string; reverses?: string | null; sourceType?: string; fixtureEvidence?: boolean; split?: Split | false };
   /** Insert one posting-rule result as one journal entry, inside an open transaction (what the API will do). */
   const insertPosting = async (c: pg.ClientBase, tenant: string, period: string, lines: LedgerLine[], opts: PostOpts = {}) => {
     const ids = accounts[tenant] ?? {};
@@ -528,6 +531,16 @@ describe('phase 2: posting rules through the database', () => {
         [tenant, entryId, ids[l.account], l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null, l.spotRate ?? null, l.spotSource ?? null, l.rateNote ?? null,
           l.vehicleId ? carOf(tenant, l.vehicleId) : null, l.counterpartyId ? (l.counterpartyId.length === 36 ? counterpartyIn(tenant, l.counterpartyId) : customer(tenant, l.counterpartyId)) : null,
           l.evidenceDocumentId ?? (l.currency !== 'NGN' ? evidence : null)]);
+    }
+    // A car cost carries its cost type and split (0019): here a manual split, exactly its own cost lines, as the API writes it.
+    if (opts.split !== false && (opts.sourceType ?? (opts.reverses ? null : entryTypeOf(lines))) === 'car_cost') {
+      const split = opts.split ?? {};
+      const rows: NonNullable<Split['rows']> = split.rows ?? lines.filter((x) => (x.account === '1150' || x.account === '1200') && x.debit > 0n && x.vehicleId).map((x) => ({ vehicleId: x.vehicleId ?? '', shareNgn: x.debit }));
+      let position = 0;
+      for (const r of rows) {
+        await c.query('INSERT INTO cost_allocations (tenant_id, entry_id, position, vehicle_id, cost_type_id, shipment_id, basis, weight_ngn, share_ngn) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+          [tenant, entryId, ++position, carOf(tenant, r.vehicleId), split.costTypeId ?? costTypes[tenant], split.shipmentId ?? null, split.basis ?? 'manual', r.weightNgn ?? null, r.shareNgn]);
+      }
     }
     return entryId;
   };
@@ -666,6 +679,111 @@ describe('phase 2: posting rules through the database', () => {
     // Never dated before what it reverses (purchases are dated 2026-01-10).
     await assert.rejects(postLines(id, period, first.map((l) => ({ ...l, debit: l.credit, credit: l.debit })), { reverses: purchases[0] ?? '', date: '2026-01-09' }),
       /a reversal is dated on or after the entry it reverses \(10\/01\/2026\)/);
+  });
+
+  // A car cost's split, re-performed by the database (0019). Cars A and B paid from the funded pool; container C4 holds A, B, C.
+  // The rule (allocateCarCost) and the database must agree on every share to the kobo; a one-kobo shift is refused.
+  test('a car cost carries its cost type and split, and the database re-performs it; a closed container takes nothing more', async () => {
+    const { id, period } = await funded('Car cost splits');
+    const history: LedgerLine[] = [];
+    for (const [v, minor] of [['A', 4_000_000n], ['B', 2_000_000n]] as const) {
+      const paid = payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: minor, vehicleId: v, spot: SPOT_CBN }).lines;
+      await postLines(id, period, paid);
+      history.push(...paid);
+    }
+    const cost = (basis: CostBasis, cars: string[], amountNgn = 100_000_001n) => allocateCarCost({ amountNgn, basis, cars: cars.map((vehicleId) => ({ vehicleId })), history });
+    const rows = (c: ReturnType<typeof cost>, cars: string[]) => cars.map((vehicleId, i) => ({ vehicleId, shareNgn: c.shares[i] ?? 0n, ...(c.weights && { weightNgn: c.weights[i] ?? 0n }) }));
+    const byValue = cost('by_value', ['A', 'B']);
+    await postLines(id, period, byValue.lines, { split: { basis: 'by_value', rows: rows(byValue, ['A', 'B']) } });
+    // One kobo moved from A to B, lines and split alike: balanced and matching, but not the split by value.
+    const shifted = byValue.lines.map((l, i) => (i === 0 ? { ...l, debit: l.debit - 1n, amountMinor: l.amountMinor - 1n } : i === 1 ? { ...l, debit: l.debit + 1n, amountMinor: l.amountMinor + 1n } : l));
+    const shiftedRows = rows(byValue, ['A', 'B']).map((r, i) => ({ ...r, shareNgn: r.shareNgn + (i === 0 ? -1n : 1n) }));
+    await assert.rejects(postLines(id, period, shifted, { split: { basis: 'by_value', rows: shiftedRows } }), /the by_value split must be re-performable/);
+    await assert.rejects(postLines(id, period, byValue.lines, { split: { basis: 'by_value', rows: rows(byValue, ['A', 'B']).map((r) => ({ ...r, weightNgn: (r.weightNgn ?? 0n) + 1n })) } }),
+      /weighs each car by its supplier cost in NGN at pool cost/);
+    await assert.rejects(postLines(id, period, byValue.lines, { split: false }), /a car cost carries its cost type and its split/);
+    await assert.rejects(postLines(id, period, byValue.lines, { split: { rows: [{ vehicleId: 'A', shareNgn: 100_000_001n }] } }), /the split must be the entry's own cost lines/);
+    // Container C4 holds A, B and C: an equal split covers all three, or it is a manual split.
+    const c4 = await tx(id, async (t) => {
+      const s = await one(t.client, "INSERT INTO shipments (tenant_id, code) VALUES ($1, 'C4') RETURNING id", [id]);
+      for (const v of ['A', 'B', 'C']) await t.client.query('INSERT INTO shipment_vehicles (tenant_id, shipment_id, vehicle_id) VALUES ($1, $2, $3)', [id, s, carOf(id, v)]);
+      return s;
+    });
+    const two = cost('equal', ['A', 'B']);
+    await assert.rejects(postLines(id, period, two.lines, { split: { basis: 'equal', shipmentId: c4, rows: rows(two, ['A', 'B']) } }), /split across all its cars \(2 of 3\)/);
+    await postLines(id, period, two.lines, { split: { basis: 'manual', shipmentId: c4, rows: rows(two, ['A', 'B']) } });
+    const three = cost('equal', ['A', 'B', 'C']);
+    assert.deepEqual(three.shares, [33_333_335n, 33_333_333n, 33_333_333n]);
+    await postLines(id, period, three.lines, { split: { basis: 'equal', shipmentId: c4, rows: rows(three, ['A', 'B', 'C']) } });
+    // A cost type that needs its receipt (CPH extra fee) posts only with it.
+    const cph = await tx(id, (t) => one(t.client, "INSERT INTO cost_types (tenant_id, name, default_basis, requires_receipt) VALUES ($1, 'CPH extra fee', 'per_car', true) RETURNING id", [id]));
+    const fee = cost('per_car', ['A'], 100_000_000n);
+    await assert.rejects(postLines(id, period, fee.lines, { split: { basis: 'per_car', costTypeId: cph } }), /this cost type needs its receipt before it posts/);
+    const receipt = await tx(id, (t) => fixtureEvidence(t.client, id, null));
+    await postLines(id, period, fee.lines.map((l) => (l.account === '1000' ? { ...l, evidenceDocumentId: receipt } : l)), { split: { basis: 'per_car', costTypeId: cph } });
+    // A car put in C4 by mistake comes out with a reason, once; a car a standing C4 cost is split onto stays until that cost is reversed.
+    const stray = await tx(id, async (t) => {
+      const v = await one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, 'TESTCARM000000000', 'Test', 'Car', 2024) RETURNING id", [id]);
+      await t.client.query('INSERT INTO shipment_vehicles (tenant_id, shipment_id, vehicle_id) VALUES ($1, $2, $3)', [id, c4, v]);
+      return v;
+    });
+    const takeOut = (v: string, reason = 'sailed in C5, not C4') => tx(id, (t) => t.client.query('UPDATE shipment_vehicles SET removed_reason = $3 WHERE shipment_id = $1 AND vehicle_id = $2', [c4, v, reason]));
+    await assert.rejects(postLines(id, period, three.lines, { split: { basis: 'equal', shipmentId: c4, rows: rows(three, ['A', 'B', 'C']) } }), /split across all its cars \(3 of 4\)/);
+    await assert.rejects(takeOut(stray, '  '), /shipment_vehicles_removed/);
+    await takeOut(stray);
+    const out = await owner<{ removed_by: string }>('SELECT removed_by FROM shipment_vehicles WHERE vehicle_id = $1', [stray]);
+    assert.deepEqual(out.rows, [{ removed_by: USER }]);
+    await assert.rejects(takeOut(stray), /that car is already out of this container/);
+    await assert.rejects(takeOut(carOf(id, 'A')), /a standing cost of this container is split onto that car: reverse it first/);
+    // Closed for good: no car joins C4, and it doesn't close twice; a late C4 bill posts, flagged on each car. A split is never added to a sealed entry.
+    await tx(id, (t) => t.client.query('UPDATE shipments SET closed_at = now() WHERE id = $1', [c4]));
+    const closed = await owner<{ closed_by: string }>('SELECT closed_by FROM shipments WHERE id = $1', [c4]);
+    assert.deepEqual(closed.rows, [{ closed_by: USER }]);
+    const late = await postLines(id, period, three.lines, { split: { basis: 'equal', shipmentId: c4, rows: rows(three, ['A', 'B', 'C']) } });
+    const flagged = await owner<{ n: number }>("SELECT count(*)::int AS n FROM job_order_flags WHERE entry_id = $1 AND kind = 'cost_after_container_closed'", [late]);
+    assert.deepEqual(flagged.rows, [{ n: 3 }]);
+    await assert.rejects(takeOut(carOf(id, 'C')), /closed for good: its cars stay as they are|reverse it first/);
+    await assert.rejects(tx(id, (t) => t.client.query('UPDATE shipments SET closed_at = now() WHERE id = $1', [c4])), /container C4 is closed for good/);
+    await assert.rejects(tx(id, async (t) => {
+      const late = await one(t.client, "INSERT INTO vehicles (tenant_id, vin, make, model, year) VALUES ($1, 'TESTCARL000000000', 'Test', 'Car', 2024) RETURNING id", [id]);
+      await t.client.query('INSERT INTO shipment_vehicles (tenant_id, shipment_id, vehicle_id) VALUES ($1, $2, $3)', [id, c4, late]);
+    }), /closed for good: no car joins it/);
+    const sealed = await tx(id, (t) => one(t.client, "SELECT id FROM journal_entries WHERE source_type = 'car_cost' LIMIT 1"));
+    await assert.rejects(tx(id, (t) => t.client.query("INSERT INTO cost_allocations (tenant_id, entry_id, position, vehicle_id, cost_type_id, basis, share_ngn) VALUES ($1, $2, 9, $3, $4, 'manual', 1)",
+      [id, sealed, carOf(id, 'C'), costTypes[id]])), /a cost split is written with its own car cost, as it posts/);
+  });
+
+  // Random amounts and weights (ledger audit of 0019): the database must accept exactly the rule's equal and by-value splits,
+  // to the kobo, and refuse the same split with one kobo moved. A fixed seed keeps any failure reproducible.
+  test('random container costs: the database re-performs every equal and by-value split the rule makes, and refuses a one-kobo shift', async () => {
+    const { id, period } = await funded('Random splits');
+    let seed = 20_261_118n;
+    const rand = (below: bigint) => {
+      seed = (seed * 6_364_136_223_846_793_005n + 1_442_695_040_888_963_407n) % 2n ** 64n;
+      return (seed >> 16n) % below;
+    };
+    const history: LedgerLine[] = [];
+    for (const v of ['A', 'B', 'C']) {
+      const paid = payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 100_000n + rand(3_000_000n), vehicleId: v, spot: SPOT_CBN }).lines;
+      await postLines(id, period, paid);
+      history.push(...paid);
+    }
+    const c = await tx(id, async (t) => {
+      const s = await one(t.client, "INSERT INTO shipments (tenant_id, code) VALUES ($1, 'R1') RETURNING id", [id]);
+      for (const v of ['A', 'B', 'C']) await t.client.query('INSERT INTO shipment_vehicles (tenant_id, shipment_id, vehicle_id) VALUES ($1, $2, $3)', [id, s, carOf(id, v)]);
+      return s;
+    });
+    for (let i = 0; i < 24; i++) {
+      const basis: CostBasis = i % 2 === 0 ? 'equal' : 'by_value';
+      const split = allocateCarCost({ amountNgn: 3n + rand(10_000_000_000n), basis, cars: ['A', 'B', 'C'].map((vehicleId) => ({ vehicleId })), history });
+      const rows = ['A', 'B', 'C'].map((vehicleId, k) => ({ vehicleId, shareNgn: split.shares[k] ?? 0n, ...(split.weights && { weightNgn: split.weights[k] ?? 0n }) }));
+      if (i % 6 === 5) {
+        const moved = split.lines.map((l, k) => (k === 0 ? { ...l, debit: l.debit - 1n, amountMinor: l.amountMinor - 1n } : k === 1 ? { ...l, debit: l.debit + 1n, amountMinor: l.amountMinor + 1n } : l));
+        await assert.rejects(postLines(id, period, moved, { split: { basis, shipmentId: c, rows: rows.map((r, k) => ({ ...r, shareNgn: r.shareNgn + (k === 0 ? -1n : k === 1 ? 1n : 0n) })) } }),
+          /split must be re-performable/);
+      }
+      await postLines(id, period, split.lines, { split: { basis, shipmentId: c, rows } });
+    }
   });
 
   test('a pool payment without the day spot rate is refused', async () => {

@@ -3,7 +3,7 @@
 // the API maps them to account ids and persists each result as one journal entry.
 // ponytail: cash is always 1000, costs are paid in cash, and the foreign-currency pool is account 1010 for every
 // currency; add bank-account and per-currency pool accounts when the API needs them.
-import { allocateEqual, convert, formatRate, parseRate, poolSpend, rateOf, type Pool } from '@app/money';
+import { allocateByWeight, allocateEqual, convert, formatRate, parseRate, poolSpend, rateOf, type Pool } from '@app/money';
 
 /**
  * The entry type (journal_entries.source_type) each rule's lines post as. The database holds one shape per type and refuses
@@ -218,15 +218,47 @@ function carCost(history: readonly Line[], vehicleId: string) {
  */
 export const spotCarCost = (history: readonly Line[], vehicleId: string): bigint => carCost(history, vehicleId).spotNgn;
 
-/** An NGN cost for one or more cars (a container charge, or one car's IDEC bill), split equally in kobo, remainder on the first car. */
-export function sharedCost(e: { amountNgn: bigint; vehicleIds: readonly string[]; evidenceDocumentId?: string; funding?: Funding }): Line[] {
+/**
+ * How a car cost is split (spec → landed cost; cost types carry a default). per_car: one car. equal: in kobo. by_value: by
+ * each car's supplier cost in NGN at pool cost (owner default), the weights returned so they are stored. manual: as typed.
+ * Every split adds up to the amount paid, the remainder on the first car.
+ */
+export type CostBasis = 'per_car' | 'equal' | 'by_value' | 'manual';
+export type CostCar = { vehicleId: string; funding?: Funding; shareNgn?: bigint };
+
+/** An NGN cost paid in cash for one or more cars (a container charge, one car's IDEC bill): each car's share to its job costs or inventory. */
+export function allocateCarCost(e: { amountNgn: bigint; basis: CostBasis; cars: readonly CostCar[]; history?: readonly Line[]; evidenceDocumentId?: string }):
+  { lines: Line[]; shares: bigint[]; weights: bigint[] | null } {
   positive(e.amountNgn, 'cost');
-  if (e.vehicleIds.length === 0) throw new RuleError('a cost needs at least one car');
-  if (new Set(e.vehicleIds).size !== e.vehicleIds.length) throw new RuleError('a car can appear only once in a cost split');
-  const shares = allocateEqual(e.amountNgn, e.vehicleIds.length);
-  // ponytail: one funding for every car in the split; split a container holding both kinds of car into two costs.
-  return [...shares.flatMap((share, i) => ngn(costAccount(e.funding), share, { vehicleId: e.vehicleIds[i] })), ...ngn('1000', -e.amountNgn, { evidenceDocumentId: e.evidenceDocumentId })];
+  const ids = e.cars.map((c) => c.vehicleId);
+  if (ids.length === 0) throw new RuleError('a cost needs at least one car');
+  if (new Set(ids).size !== ids.length) throw new RuleError('a car can appear only once in a cost split');
+  if (e.basis !== 'manual' && e.cars.some((c) => c.shareNgn !== undefined)) throw new RuleError('only a manual split takes shares');
+  if (e.basis === 'per_car' && ids.length !== 1) throw new RuleError('a per-car cost names one car');
+  const weights = e.basis === 'by_value' ? ids.map((v) => carCost(e.history ?? [], v).ngn) : null;
+  if (weights?.some((w) => w <= 0n)) throw new RuleError('split by value needs a supplier cost on every car');
+  let shares: bigint[];
+  if (e.basis === 'manual') {
+    shares = e.cars.map((c) => c.shareNgn ?? 0n);
+    if (shares.some((s) => s <= 0n)) throw new RuleError('each car\'s share must be positive');
+    if (shares.reduce((a, b) => a + b, 0n) !== e.amountNgn) throw new RuleError('the cars\' shares must add up to the cost');
+  } else {
+    shares = weights ? allocateByWeight(e.amountNgn, weights) : allocateEqual(e.amountNgn, ids.length);
+    if (shares.some((x) => x === 0n)) throw new RuleError('the cost is too small to split across these cars: split it by hand');
+  }
+  return {
+    // each share beside its car (the split has one share per car, in order)
+    lines: [...shares.flatMap((share, i) => ({ share, ...e.cars[i] })).flatMap((c) => ngn(costAccount(c.funding), c.share, { vehicleId: c.vehicleId })),
+      ...ngn('1000', -e.amountNgn, { evidenceDocumentId: e.evidenceDocumentId })],
+    shares,
+    weights,
+  };
 }
+
+/** An NGN cost for one or more cars of one funding, split equally (the cost rules' tests and fixtures use it). */
+export const sharedCost = (e: { amountNgn: bigint; vehicleIds: readonly string[]; evidenceDocumentId?: string; funding?: Funding }): Line[] =>
+  allocateCarCost({ amountNgn: e.amountNgn, basis: 'equal', cars: e.vehicleIds.map((vehicleId) => ({ vehicleId, ...(e.funding && { funding: e.funding }) })),
+    ...(e.evidenceDocumentId && { evidenceDocumentId: e.evidenceDocumentId }) }).lines;
 
 /** What the ledger says about one car's job: its supplier cost, everything capitalized, and the customer's funds held. */
 export function jobPosition(history: readonly Line[], vehicleId: string) {

@@ -5,6 +5,7 @@ import { ThrottlerModule } from '@nestjs/throttler';
 import type pg from 'pg';
 import { AuthGuard } from './auth/auth.guard.js';
 import { ClerkWebhookController } from './clerk-webhook.controller.js';
+import { CostTypesController, ShipmentsController } from './costs.controller.js';
 import { CounterpartiesController } from './counterparties.controller.js';
 import { HOOK_POOL, hookPoolProvider, POOL, poolProvider, storageProvider } from './db.js';
 import { DocumentsController } from './documents.controller.js';
@@ -17,7 +18,7 @@ import { VehiclesController } from './vehicles.controller.js';
 
 @Module({
   imports: [SentryModule.forRoot(), ThrottlerModule.forRootAsync({ useFactory: () => ({ throttlers: [DEFAULT_LIMIT], storage: throttlerStorage() }) })],
-  controllers: [HealthController, MeController, ClerkWebhookController, CounterpartiesController, VehiclesController, DocumentsController, JobOrdersController, PostingsController],
+  controllers: [HealthController, MeController, ClerkWebhookController, CounterpartiesController, VehiclesController, DocumentsController, JobOrdersController, PostingsController, CostTypesController, ShipmentsController],
   providers: [poolProvider, hookPoolProvider, storageProvider, { provide: APP_FILTER, useClass: SentryGlobalFilter }, { provide: APP_GUARD, useClass: CallerThrottlerGuard }, { provide: APP_GUARD, useClass: AuthGuard }], // limits first, so failed sign-ins count
 })
 export class AppModule implements OnApplicationShutdown {

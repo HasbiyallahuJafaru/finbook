@@ -2,7 +2,7 @@
 import { writeFileSync } from 'node:fs';
 import { z } from 'zod';
 import {
-  AcceptQuote, AddJobVehicle, SignOffFlag, Counterparty, CreateCounterparty, CreateJobOrder, CreatePosting, CreateReversal, Posting, AttachEvidence, EntryEvidence, CreateUpload, CreateVehicle, Document, DownloadTicket, IdempotencyKeyHeader, JobOrder,
+  AcceptQuote, AddJobVehicle, AddShipmentVehicle, RemoveShipmentVehicle, CostType, CreateCostType, CreateShipment, Shipment, SignOffFlag, Counterparty, CreateCounterparty, CreateJobOrder, CreatePosting, CreateReversal, Posting, AttachEvidence, EntryEvidence, CreateUpload, CreateVehicle, Document, DownloadTicket, IdempotencyKeyHeader, JobOrder,
   ListCounterpartiesQuery, ListJobOrdersQuery, ListVehiclesQuery, MeResponse, TenantIdHeader, UploadTicket, Vehicle,
 } from './index.ts';
 
@@ -61,6 +61,21 @@ const doc = {
     '/postings/{entryId}/reversal': { post: { parameters: [tenantHeader, idempotencyHeader, { name: 'entryId', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } }],
       description: 'Firm accountants and admins only. Posts the exact mirror of a standing entry, with the same type and each line\'s own evidence.',
       requestBody: body(CreateReversal), responses: { 201: ok('Reversed', Posting), ...writeErrors } } },
+    '/cost-types': {
+      get: { parameters: [tenantHeader], responses: { 200: ok('The cost types of this business, by sort order', z.array(CostType)), ...errors } },
+      post: { parameters: [tenantHeader, idempotencyHeader], requestBody: body(CreateCostType), responses: { 201: ok('Created', CostType), ...writeErrors } },
+    },
+    '/shipments': {
+      get: { parameters: [tenantHeader], responses: { 200: ok('Containers, newest first, with their cars', z.array(Shipment)), ...errors } },
+      post: { parameters: [tenantHeader, idempotencyHeader], requestBody: body(CreateShipment), responses: { 201: ok('Created, open', Shipment), ...writeErrors } },
+    },
+    '/shipments/{id}': { get: { parameters: [tenantHeader, idPath], responses: { 200: ok('Container', Shipment), ...errors } } },
+    '/shipments/{id}/vehicles': { post: { parameters: [tenantHeader, idempotencyHeader, idPath], requestBody: body(AddShipmentVehicle),
+      responses: { 201: ok('Car added; a car travels in one container, and a closed one takes none', Shipment), ...writeErrors } } },
+    '/shipments/{id}/vehicles/{vehicleId}/remove': { post: { parameters: [tenantHeader, idempotencyHeader, idPath, { name: 'vehicleId', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } }],
+      requestBody: body(RemoveShipmentVehicle), responses: { 200: ok('Car taken out, with the reason, while the container is open and none of its standing costs names the car', Shipment), ...writeErrors } } },
+    '/shipments/{id}/close': { post: { parameters: [tenantHeader, idempotencyHeader, idPath],
+      responses: { 200: ok('Closed for good: no car or cost joins it after; who and when stamped by the database', Shipment), ...writeErrors } } },
     '/me': { get: { parameters: [tenantHeader], responses: { 200: { description: 'The caller in this tenant', content: { 'application/json': { schema: json(MeResponse) } } }, ...errors } } },
   },
 };

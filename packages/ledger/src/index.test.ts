@@ -27,7 +27,7 @@ import assert from 'node:assert/strict';
 import { convert, parseRate, type Pool } from '@app/money';
 import {
   RuleError, arriveInYard, buyCurrency, completeAgentJob, completeClearingJob, convertToStock, customerReceipt, jobPosition, payFromPool, payPayableFromPool, revalue, sellStockCar,
-  customerRefund, receivableReceipt, refundStockDeposit, sharedCost, supplierCredit, spotCarCost, stockDeposit, supplierInvoice, type Line,
+  allocateCarCost, customerRefund, receivableReceipt, refundStockDeposit, sharedCost, type CostBasis, supplierCredit, spotCarCost, stockDeposit, supplierInvoice, type Line,
 } from './index.ts';
 
 const FIXTURE_RATE_BUY_1 = parseRate('100.000000');
@@ -441,4 +441,43 @@ test('a zero settlement is the rule refusing it, not a pool error', () => {
   const payable = { balanceMinor: 2_000_000n, costNgn: 210_000_000n };
   assert.throws(() => payPayableFromPool({ vehicleId: 'D', supplierId: 'S', pool: { balanceMinor: 10_000_000n, costNgn: 1_000_000_000n }, payable, currency: 'CNY', amountMinor: 0n, spot: SPOT_CBN }),
     (err: unknown) => err instanceof RuleError && /amount must be positive/.test(err.message));
+});
+
+// A car cost of NGN 1,000,000.01 (100,000,001 kobo), split three ways (spec → landed cost; owner default: by value = each car's
+// supplier cost in NGN at pool cost). Pool: CNY 60,000.00 at FIXTURE_RATE_BUY_1 100 = NGN 6,000,000.00; car A paid CNY 40,000.00
+// (NGN 4,000,000.00), car B CNY 20,000.00 (NGN 2,000,000.00); car C, clearing only, has no supplier cost.
+//   by value A:B = 4:2 -> A 100,000,001 x 4/6 = 66,666,667.33 -> 66,666,667, B 33,333,333.67 -> 33,333,333; 1 kobo left -> A 66,666,668
+//   equal A, B, C      -> 33,333,333 each, 2 kobo left -> A 33,333,335
+//   manual             -> exactly as given, adding up to the cost
+test('a car cost splits per car, equally, by value at pool cost or by hand, to the kobo, the remainder on the first car', () => {
+  const history: Line[] = [...buyCurrency({ currency: 'CNY', amountMinor: 6_000_000n, rate: FIXTURE_RATE_BUY_1, rateSource: 'bdc_receipt' })];
+  let pool: Pool = { balanceMinor: 6_000_000n, costNgn: 600_000_000n };
+  for (const [v, minor] of [['A', 4_000_000n], ['B', 2_000_000n]] as const) {
+    const paid = payFromPool({ pool, currency: 'CNY', amountMinor: minor, vehicleId: v, spot: SPOT_CBN });
+    history.push(...paid.lines);
+    pool = paid.pool;
+  }
+  const cost = (basis: CostBasis, cars: { vehicleId: string; funding?: 'emm_funded'; shareNgn?: bigint }[]) =>
+    allocateCarCost({ amountNgn: 100_000_001n, basis, cars, history, evidenceDocumentId: 'doc-formm' });
+  const byValue = cost('by_value', [{ vehicleId: 'A' }, { vehicleId: 'B', funding: 'emm_funded' }]);
+  assert.deepEqual(only(byValue.lines), [['1150', 66_666_668n, 0n, 'A'], ['1200', 33_333_333n, 0n, 'B'], ['1000', 0n, 100_000_001n, null]]);
+  assert.deepEqual([byValue.shares, byValue.weights], [[66_666_668n, 33_333_333n], [400_000_000n, 200_000_000n]]);
+  assert.equal(byValue.lines[2]?.evidenceDocumentId, 'doc-formm');
+  const equal = cost('equal', [{ vehicleId: 'A' }, { vehicleId: 'B' }, { vehicleId: 'C' }]);
+  assert.deepEqual([equal.shares, equal.weights, balanced(equal.lines)], [[33_333_335n, 33_333_333n, 33_333_333n], null, true]);
+  assert.deepEqual(cost('manual', [{ vehicleId: 'A', shareNgn: 60_000_000n }, { vehicleId: 'C', shareNgn: 40_000_001n }]).shares, [60_000_000n, 40_000_001n]);
+  assert.deepEqual(cost('per_car', [{ vehicleId: 'C' }]).shares, [100_000_001n]);
+  const refused = (basis: CostBasis, cars: { vehicleId: string; shareNgn?: bigint }[], message: RegExp) => {
+    assert.throws(() => cost(basis, cars), (err: unknown) => err instanceof RuleError && message.test(err.message));
+  };
+  refused('per_car', [{ vehicleId: 'A' }, { vehicleId: 'B' }], /a per-car cost names one car/);
+  refused('by_value', [{ vehicleId: 'A' }, { vehicleId: 'C' }], /split by value needs a supplier cost on every car/);
+  refused('manual', [{ vehicleId: 'A', shareNgn: 60_000_000n }, { vehicleId: 'C', shareNgn: 40_000_000n }], /the cars' shares must add up to the cost/);
+  refused('manual', [{ vehicleId: 'A', shareNgn: 100_000_001n }, { vehicleId: 'C', shareNgn: 0n }], /each car's share must be positive/);
+  refused('manual', [{ vehicleId: 'A' }], /each car's share must be positive/);
+  refused('equal', [{ vehicleId: 'A', shareNgn: 1n }], /only a manual split takes shares/);
+  // 2 kobo over three cars would leave two cars a share of nothing: the rule says so, rather than posting a nil share
+  assert.throws(() => allocateCarCost({ amountNgn: 2n, basis: 'equal', cars: [{ vehicleId: 'A' }, { vehicleId: 'B' }, { vehicleId: 'C' }] }), /too small to split across these cars/);
+  // by value with no ledger history: nothing to weigh by
+  assert.throws(() => allocateCarCost({ amountNgn: 1n, basis: 'by_value', cars: [{ vehicleId: 'A' }] }), /split by value needs a supplier cost on every car/);
 });

@@ -21,6 +21,13 @@ export const PERMISSIONS = {
   'documents.read': READERS,
   'job_orders.read': READERS,
   'job_orders.write': RECORDERS,
+  'cost_types.read': READERS,
+  // Cost types are the client's configuration and decide which costs need a receipt (security review of 0019): the firm's
+  // accountants and admins and the client's owner add them, not client staff (a look-alike type could skip the receipt rule).
+  'cost_types.write': ['firm_admin', 'firm_accountant', 'client_owner'],
+  // A client's containers: kept by the people who record its costs (0019); any recorder closes one (owner default, 2026-11-17).
+  'shipments.read': READERS,
+  'shipments.write': RECORDERS,
   // Recording a business event in the ledger (ADR 0017): the same people who record the business.
   'postings.write': RECORDERS,
   // A correction is our accounting call (owner 2026-11-17): a reversal is posted by firm accountants and admins only.

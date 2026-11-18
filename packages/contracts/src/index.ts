@@ -98,7 +98,7 @@ export const Funding = z.enum(['customer_funded', 'emm_funded']);
 export const JobStatus = z.enum(['draft', 'quote_accepted', 'completed', 'abandoned', 'cancelled']);
 export const QuoteRateSource = z.enum(['cbn', 'market', 'manual']);
 /** A question about how we book something the client recorded, raised by the database as the entry commits; a firm sign-off answers it, and never unlocks a posting (ADR 0016). */
-export const FlagKind = z.enum(['emm_funded', 'converted_to_stock', 'posted_before_quote', 'supplier_cost_not_covered', 'cost_after_completion', 'cost_credited', 'negative_cut', 'funds_after_completion']);
+export const FlagKind = z.enum(['emm_funded', 'converted_to_stock', 'posted_before_quote', 'supplier_cost_not_covered', 'cost_after_completion', 'cost_credited', 'negative_cut', 'funds_after_completion', 'cost_after_container_closed']);
 
 export const CreateJobOrder = z.strictObject({
   customerId: z.uuid(),
@@ -155,6 +155,36 @@ const Spot = z.strictObject({ rate: RateString, source: z.enum(['cbn', 'manual']
 // A foreign-currency posting needs its document: the rate is provable only from it (CLAUDE.md; owner 2026-11-17).
 const foreign = { currency: ForeignCurrency, amountMinor: MinorUnits };
 const foreignFacts = { ...postingFacts, evidenceDocumentId: z.uuid() };
+
+/** How a car cost splits (each cost type has a default the form pre-fills; 0019). */
+export const CostBasis = z.enum(['per_car', 'equal', 'by_value', 'manual']);
+export const CostSplit = z.discriminatedUnion('basis', [
+  z.strictObject({ basis: z.literal('per_car'), vehicleId: z.uuid() }),
+  z.strictObject({ basis: z.literal('equal'), shipmentId: z.uuid() }),
+  z.strictObject({ basis: z.literal('by_value'), shipmentId: z.uuid() }),
+  /** Shares as typed, adding up to the cost; within a container if it names one. */
+  z.strictObject({ basis: z.literal('manual'), shipmentId: z.uuid().optional(), shares: z.array(z.strictObject({ vehicleId: z.uuid(), amountNgn: MinorUnits })).min(1).max(100) }),
+]);
+export const CreateCostType = z.strictObject({
+  name: z.string().trim().min(1).max(100),
+  defaultBasis: CostBasis.exclude(['manual']),
+  requiresReceipt: z.boolean().default(false),
+  sort: z.int().min(0).max(10_000).default(0),
+});
+export const CostType = z.object({ id: z.uuid(), name: z.string(), defaultBasis: CostBasis, requiresReceipt: z.boolean(), sort: z.int() });
+export type CostType = z.infer<typeof CostType>;
+/** A shipping container (C4): its shared costs split across its cars; closed for good once its costs are in. */
+export const CreateShipment = z.strictObject({
+  code: z.string().trim().min(1).max(50), billOfLading: optionalText, vessel: optionalText, port: optionalText, arrivedOn: isoDate.optional(), clearedOn: isoDate.optional(),
+});
+export const Shipment = z.object({
+  id: z.uuid(), code: z.string(), billOfLading: z.string().nullable(), vessel: z.string().nullable(), port: z.string().nullable(),
+  arrivedOn: isoDate.nullable(), clearedOn: isoDate.nullable(), closedAt: z.string().nullable(), closedBy: z.string().nullable(), vehicleIds: z.array(z.uuid()),
+});
+export type Shipment = z.infer<typeof Shipment>;
+export const AddShipmentVehicle = z.strictObject({ vehicleId: z.uuid() });
+/** A car put in the wrong container comes out, with the reason (it stays on the record). */
+export const RemoveShipmentVehicle = z.strictObject({ reason: z.string().trim().min(1).max(500) });
 export const CreatePosting = z.discriminatedUnion('type', [
   /** The job's customer pays towards a car: held in 2150 until the job completes. */
   z.strictObject({ type: z.literal('customer_receipt'), vehicleId: z.uuid(), amountNgn: MinorUnits, ...postingFacts }),
@@ -186,6 +216,12 @@ export const CreatePosting = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('stock_sale'), vehicleId: z.uuid(), buyerId: z.uuid(), priceNgn: MinorUnits, ...postingFacts }),
   /** A customer's job becomes stock: the car's job costs move to inventory and the customer's funds held are repaid in full (flagged for review). */
   z.strictObject({ type: z.literal('stock_conversion'), vehicleId: z.uuid(), ...postingFacts }),
+  /**
+   * A naira car cost paid in cash (spec → landed cost): it carries its cost type and how it splits. One car; a container's cars,
+   * equally or by value (each car's supplier cost at pool cost, worked out from the ledger); or by hand. The split is kept with
+   * the entry and re-performed by the database.
+   */
+  z.strictObject({ type: z.literal('car_cost'), costTypeId: z.uuid(), amountNgn: MinorUnits, split: CostSplit, ...postingFacts }),
 ]);
 export type CreatePosting = z.infer<typeof CreatePosting>;
 export const Posting = z.object({

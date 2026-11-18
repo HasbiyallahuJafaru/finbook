@@ -7,7 +7,7 @@ import { AttachEvidence, CreatePosting, CreateReversal, type EntryEvidence, type
 import { parseRate, type Pool } from '@app/money';
 import {
   arriveInYard, buyCurrency, completeAgentJob, completeClearingJob, convertToStock, customerReceipt, customerRefund, payFromPool, payPayableFromPool, receivableReceipt,
-  refundStockDeposit, RuleError, sellStockCar, stockDeposit, supplierCredit, supplierInvoice, type EntryType, type Funding, type Line,
+  allocateCarCost, refundStockDeposit, RuleError, sellStockCar, stockDeposit, supplierCredit, supplierInvoice, type CostBasis, type CostCar, type EntryType, type Funding, type Line,
 } from '@app/ledger';
 import { Can } from './auth/permissions.js';
 import type { Caller } from './auth/auth.guard.js';
@@ -27,10 +27,14 @@ const POSTING_ERRORS = pgErrors({
   // the same key again after its stored answer expired (7 days): the entry stands, nothing is posted twice
   journal_entries_idempotency: [409, 'this Idempotency-Key already posted an entry'],
   journal_entries_reversed_once: [409, 'that entry is already reversed'],
+  // a car cost's split naming another tenant's container, car or cost type: the same answer as none
+  cost_allocations_shipment: [422, 'that container is not one of yours'],
+  cost_allocations_vehicle: [422, 'that car is not one of yours'],
+  cost_allocations_cost_type: [422, 'that cost type is not one of yours'],
 }, true);
 
 /** A rule in packages/ledger refusing the request's own figures (a refund larger than what is held, say): a 422 in its words. */
-function rule(build: () => Line[]): Line[] {
+function rule<T = Line[]>(build: () => T): T {
   try {
     return build();
   } catch (err) {
@@ -43,10 +47,18 @@ type JobRow = {
   customer_id: string; funding: Funding; job_type: 'car_purchase' | 'clearing_only'; car_price_currency: string | null; quote_rate: string | null;
   car_price_minor: string | null; landing_charge_ngn: string;
 };
-/** The job order a car is on: its customer, funding and the car's own quote come from here, never from the request. */
+/**
+ * The job order a car is on: its customer, funding and the car's own quote come from here, never from the request. A car
+ * converted to stock (a standing conversion) is EMM stock from then on, whatever its job's funding (ledger audit of 0019): its
+ * costs go to inventory (1200), as the database requires (0008).
+ */
 async function jobOf(t: Tx, vehicleId: string): Promise<{ customerId: string; funding: Funding; row: JobRow }> {
   const job = (await t.client.query<JobRow>(
-    `SELECT o.customer_id, o.funding, o.job_type, o.car_price_currency, o.quote_rate::text, jv.car_price_minor::text, jv.landing_charge_ngn::text
+    `SELECT o.customer_id, CASE WHEN EXISTS (
+              SELECT 1 FROM journal_lines l JOIN journal_entries x ON x.id = l.entry_id
+               WHERE l.vehicle_id = jv.vehicle_id AND x.source_type = 'stock_conversion' AND x.reverses_entry_id IS NULL
+                 AND NOT EXISTS (SELECT 1 FROM journal_entries r WHERE r.reverses_entry_id = x.id)) THEN 'emm_funded' ELSE o.funding END AS funding,
+            o.job_type, o.car_price_currency, o.quote_rate::text, jv.car_price_minor::text, jv.landing_charge_ngn::text
        FROM job_order_vehicles jv JOIN job_orders o ON o.id = jv.job_order_id WHERE jv.vehicle_id = $1`, [vehicleId])).rows[0];
   // another tenant's car looks exactly like no car
   if (!job) throw new UnprocessableEntityException('that car is not on one of your job orders');
@@ -129,8 +141,13 @@ async function periodFor(t: Tx, tenantId: string, date: string): Promise<string>
     [tenantId, date]).catch(POSTING_ERRORS)).rows[0]?.id ?? '';
 }
 
+/** One car's row of a car cost's split (cost_allocations, 0019), in order: the remainder sits on position 1. */
+type SplitRow = { vehicleId: string; costTypeId: string; shipmentId: string | null; basis: CostBasis; weightNgn: bigint | null; shareNgn: bigint };
+
 /** Insert one rule's lines as one entry of its type, run the whole-entry checks now, and return what posted with its flags. */
-async function postEntry(t: Tx, caller: Caller, key: string, type: EntryType, p: { entryDate: string }, memo: string, lines: Line[], reverses: string | null = null): Promise<Posting> {
+
+async function postEntry(t: Tx, caller: Caller, key: string, type: EntryType, p: { entryDate: string }, memo: string, lines: Line[], reverses: string | null = null,
+  split: SplitRow[] = []): Promise<Posting> {
   const codes = [...new Set(lines.map((l) => l.account))];
   const ids = new Map((await t.client.query<{ id: string; code: string }>('SELECT id, code FROM accounts WHERE code = ANY ($1)', [codes])).rows.map((r) => [r.code, r.id]));
   const missing = codes.find((c) => !ids.has(c));
@@ -151,6 +168,12 @@ async function postEntry(t: Tx, caller: Caller, key: string, type: EntryType, p:
       [caller.tenantId, entryId, ids.get(l.account), l.debit, l.credit, l.currency, l.amountMinor, l.rate ?? null, l.rateSource ?? null, l.rateNote ?? null,
         l.spotRate ?? null, l.spotSource ?? null, l.evidenceDocumentId ?? null, l.vehicleId ?? null, l.counterpartyId ?? null]).catch(POSTING_ERRORS);
   }
+  // A car cost's split is kept with it, before the checks below re-perform it against these lines (0019).
+  for (const [i, r] of split.entries()) {
+    await t.client.query(
+      'INSERT INTO cost_allocations (tenant_id, entry_id, position, vehicle_id, cost_type_id, shipment_id, basis, weight_ngn, share_ngn) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+      [caller.tenantId, entryId, i + 1, r.vehicleId, r.costTypeId, r.shipmentId, r.basis, r.weightNgn, r.shareNgn]).catch(POSTING_ERRORS);
+  }
   // The commit-time checks (balance, shape, job rules, flags) run now, so a refusal is answered here; once the entry's hash
   // is written no line can be added, so running them early opens nothing (0007).
   await t.client.query('SET CONSTRAINTS ALL IMMEDIATE').catch(POSTING_ERRORS);
@@ -169,11 +192,41 @@ const MEMOS: Record<CreatePosting['type'], string> = {
   currency_purchase: 'Foreign currency bought', pool_payment: 'Supplier paid from the pool', supplier_invoice: 'Supplier invoice',
   supplier_settlement: 'Supplier invoice paid from the pool', supplier_credit: 'Supplier credit', job_completion: 'Job completed',
   stock_deposit: 'Buyer deposit on a stock car', stock_deposit_refund: 'Buyer deposit refunded', yard_arrival: 'Car arrived in the yard',
-  stock_sale: 'Stock car sold', stock_conversion: 'Job converted to stock',
+  stock_sale: 'Stock car sold', stock_conversion: 'Job converted to stock', car_cost: 'Car cost',
 };
 
+/**
+ * A car cost's lines and split. The cars come from the request (one car, the shares typed) or from the container; each car's
+ * funding from its job; the weights (by value) from the cars' ledgers; the cost type must be this business's own.
+ */
+async function carCostOf(t: Tx, p: Extract<CreatePosting, { type: 'car_cost' }>): Promise<{ lines: Line[]; split: SplitRow[] }> {
+  if ((await t.client.query('SELECT 1 FROM cost_types WHERE id = $1', [p.costTypeId])).rowCount !== 1) throw new UnprocessableEntityException('that cost type is not one of yours');
+  const s = p.split;
+  const shipmentId = 'shipmentId' in s ? (s.shipmentId ?? null) : null;
+  let ids: string[];
+  if (s.basis === 'per_car') ids = [s.vehicleId];
+  else if (s.basis === 'manual') ids = s.shares.map((x) => x.vehicleId);
+  else {
+    ids = (await t.client.query<{ vehicle_id: string }>('SELECT vehicle_id FROM shipment_vehicles WHERE shipment_id = $1 AND removed_at IS NULL ORDER BY created_at, id', [s.shipmentId])).rows.map((r) => r.vehicle_id);
+    // another tenant's container looks exactly like an empty one
+    if (ids.length === 0) throw new UnprocessableEntityException('that container has no cars of yours');
+  }
+  const cars: CostCar[] = [];
+  const history: Line[] = [];
+  for (const [i, vehicleId] of ids.entries()) {
+    const { funding } = await jobOf(t, vehicleId);
+    if (s.basis === 'by_value') history.push(...await historyOf(t, vehicleId));
+    cars.push({ vehicleId, funding, ...(s.basis === 'manual' && { shareNgn: BigInt(s.shares[i]?.amountNgn ?? '0') }) });
+  }
+  const built = rule(() => allocateCarCost({ amountNgn: BigInt(p.amountNgn), basis: s.basis, cars, history, ...(p.evidenceDocumentId && { evidenceDocumentId: p.evidenceDocumentId }) }));
+  return {
+    lines: built.lines,
+    split: ids.map((vehicleId, i) => ({ vehicleId, costTypeId: p.costTypeId, shipmentId, basis: s.basis, weightNgn: built.weights?.[i] ?? null, shareNgn: built.shares[i] ?? 0n })),
+  };
+}
+
 /** The rule's lines for one posting, from the facts and what the ledger already says. */
-async function linesFor(t: Tx, p: CreatePosting): Promise<Line[]> {
+async function linesFor(t: Tx, p: Exclude<CreatePosting, { type: 'car_cost' }>): Promise<Line[]> {
   const evidence = 'evidenceDocumentId' in p && p.evidenceDocumentId ? { evidenceDocumentId: p.evidenceDocumentId } : {};
   const spotOf = (s: { rate: string; source: 'cbn' | 'manual'; note?: string | undefined }) => ({ spot: { rate: parseRate(s.rate), source: s.source }, ...(s.note && { rateNote: s.note }) });
   switch (p.type) {
@@ -260,7 +313,8 @@ export class PostingsController {
     const out = await idempotentWrite(this.pool, req.caller, key, { route: 'POST /postings', body: p }, async (t) => {
       // The tenant's posting lock first (ADR 0017 §7): the history read below is then the ledger this entry commits against.
       await t.client.query("SELECT pg_advisory_xact_lock(hashtextextended('ledger:' || $1, 0))", [req.caller.tenantId]);
-      return { status: 201, body: await postEntry(t, req.caller, key ?? '', p.type, p, p.memo ?? MEMOS[p.type], await linesFor(t, p)) };
+      const built = p.type === 'car_cost' ? await carCostOf(t, p) : { lines: await linesFor(t, p), split: [] };
+      return { status: 201, body: await postEntry(t, req.caller, key ?? '', p.type, p, p.memo ?? MEMOS[p.type], built.lines, null, built.split) };
     });
     res.status(out.status);
     return out.body;

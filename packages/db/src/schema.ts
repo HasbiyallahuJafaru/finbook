@@ -3,7 +3,7 @@
 // can't express them. ADR 0006.
 import { sql } from 'drizzle-orm';
 import {
-  bigint, boolean, char, check, date, foreignKey, index, inet, integer, jsonb, numeric, pgTable, primaryKey, smallint, text, timestamp, unique, uuid,
+  bigint, boolean, char, check, date, foreignKey, index, inet, integer, jsonb, numeric, pgTable, primaryKey, smallint, text, timestamp, unique, uniqueIndex, uuid,
 } from 'drizzle-orm/pg-core';
 
 const id = () => uuid('id').primaryKey().default(sql`uuidv7()`);
@@ -446,7 +446,7 @@ export const jobOrderFlags = pgTable('job_order_flags', {
   index('job_order_flags_tenant_job').on(t.tenantId, t.jobOrderId),
   foreignKey({ name: 'job_order_flags_job_car', columns: [t.tenantId, t.jobOrderId, t.vehicleId], foreignColumns: [jobOrderVehicles.tenantId, jobOrderVehicles.jobOrderId, jobOrderVehicles.vehicleId] }),
   foreignKey({ name: 'job_order_flags_entry', columns: [t.tenantId, t.entryId], foreignColumns: [journalEntries.tenantId, journalEntries.id] }),
-  check('job_order_flags_kind', sql`${t.kind} in ('emm_funded', 'converted_to_stock', 'posted_before_quote', 'supplier_cost_not_covered', 'cost_after_completion', 'completion_unverified', 'cost_credited', 'negative_cut', 'funds_after_completion')`),
+  check('job_order_flags_kind', sql`${t.kind} in ('emm_funded', 'converted_to_stock', 'posted_before_quote', 'supplier_cost_not_covered', 'cost_after_completion', 'completion_unverified', 'cost_credited', 'negative_cut', 'funds_after_completion', 'cost_after_container_closed')`),
 ]);
 
 /**
@@ -479,3 +479,95 @@ export const postings = pgTable('postings', {
   createdBy: text('created_by').notNull().default(sql`app_user_id()`),
   createdAt: createdAt(),
 }, (t) => [unique('postings_tenant_id_id').on(t.tenantId, t.id)]);
+
+/**
+ * The kinds of car cost a client pays (spec → landed cost components), kept per tenant so another importer can add its own
+ * without code changes. Each has a default split, and some need a receipt before they post (owner default, ADR 0019).
+ * ponytail: capitalized car costs only; operating expenses (travel, salaries) get their own entry type when needed.
+ */
+export const costTypes = pgTable('cost_types', {
+  id: id(),
+  tenantId: tenantId(),
+  name: text('name').notNull(),
+  defaultBasis: text('default_basis').notNull(),
+  requiresReceipt: boolean('requires_receipt').notNull().default(false),
+  sort: integer('sort').notNull().default(0),
+  createdAt: createdAt(),
+}, (t) => [
+  unique('cost_types_tenant_id_id').on(t.tenantId, t.id),
+  unique('cost_types_tenant_name').on(t.tenantId, t.name),
+  check('cost_types_default_basis', sql`${t.defaultBasis} in ('per_car', 'equal', 'by_value')`),
+  check('cost_types_name', sql`btrim(${t.name}) <> ''`),
+]);
+
+/** A shipping container (C4 in the workbook): its shared costs split across its cars. Closed for good once its costs are in (owner default). */
+export const shipments = pgTable('shipments', {
+  id: id(),
+  tenantId: tenantId(),
+  code: text('code').notNull(),
+  billOfLading: text('bill_of_lading'),
+  vessel: text('vessel'),
+  port: text('port'),
+  arrivedOn: date('arrived_on'),
+  clearedOn: date('cleared_on'),
+  closedAt: timestamp('closed_at', { withTimezone: true }),
+  closedBy: text('closed_by'),
+  createdAt: createdAt(),
+}, (t) => [
+  unique('shipments_tenant_id_id').on(t.tenantId, t.id),
+  unique('shipments_tenant_code').on(t.tenantId, t.code),
+  check('shipments_code', sql`btrim(${t.code}) <> ''`),
+  check('shipments_closed', sql`(${t.closedAt} IS NULL) = (${t.closedBy} IS NULL)`),
+]);
+
+/**
+ * The cars in a container; a car travels in one container at a time. A car added by mistake is taken out with a reason (who
+ * and when from the database), never deleted, while the container is open and none of its standing costs names the car (0019).
+ */
+export const shipmentVehicles = pgTable('shipment_vehicles', {
+  id: id(),
+  tenantId: tenantId(),
+  shipmentId: uuid('shipment_id').notNull(),
+  vehicleId: uuid('vehicle_id').notNull(),
+  createdAt: createdAt(),
+  removedAt: timestamp('removed_at', { withTimezone: true }),
+  removedBy: text('removed_by'),
+  removedReason: text('removed_reason'),
+}, (t) => [
+  uniqueIndex('shipment_vehicles_one_per_car').on(t.tenantId, t.vehicleId).where(sql`${t.removedAt} IS NULL`),
+  check('shipment_vehicles_removed', sql`(${t.removedAt} IS NULL) = (${t.removedBy} IS NULL) AND (${t.removedAt} IS NULL) = (btrim(coalesce(${t.removedReason}, '')) = '')`),
+  index('shipment_vehicles_tenant_shipment').on(t.tenantId, t.shipmentId),
+  foreignKey({ name: 'shipment_vehicles_shipment', columns: [t.tenantId, t.shipmentId], foreignColumns: [shipments.tenantId, shipments.id] }),
+  foreignKey({ name: 'shipment_vehicles_vehicle', columns: [t.tenantId, t.vehicleId], foreignColumns: [vehicles.tenantId, vehicles.id] }),
+]);
+
+/**
+ * How one car cost was split (spec: "the split is saved with the entry so reports can be reproduced"): one row per car, in
+ * order (the remainder sits on position 1), with its cost type, container, basis and weight (by value: the car's supplier cost
+ * in NGN at pool cost). The database re-performs the split against the entry's own lines (0019).
+ */
+export const costAllocations = pgTable('cost_allocations', {
+  id: id(),
+  tenantId: tenantId(),
+  entryId: uuid('entry_id').notNull(),
+  position: integer('position').notNull(),
+  vehicleId: uuid('vehicle_id').notNull(),
+  costTypeId: uuid('cost_type_id').notNull(),
+  shipmentId: uuid('shipment_id'),
+  basis: text('basis').notNull(),
+  weightNgn: bigint('weight_ngn', { mode: 'bigint' }),
+  shareNgn: bigint('share_ngn', { mode: 'bigint' }).notNull(),
+  createdAt: createdAt(),
+}, (t) => [
+  unique('cost_allocations_entry_car').on(t.tenantId, t.entryId, t.vehicleId),
+  unique('cost_allocations_entry_position').on(t.tenantId, t.entryId, t.position),
+  index('cost_allocations_tenant_vehicle').on(t.tenantId, t.vehicleId),
+  foreignKey({ name: 'cost_allocations_entry', columns: [t.tenantId, t.entryId], foreignColumns: [journalEntries.tenantId, journalEntries.id] }),
+  foreignKey({ name: 'cost_allocations_vehicle', columns: [t.tenantId, t.vehicleId], foreignColumns: [vehicles.tenantId, vehicles.id] }),
+  foreignKey({ name: 'cost_allocations_cost_type', columns: [t.tenantId, t.costTypeId], foreignColumns: [costTypes.tenantId, costTypes.id] }),
+  foreignKey({ name: 'cost_allocations_shipment', columns: [t.tenantId, t.shipmentId], foreignColumns: [shipments.tenantId, shipments.id] }),
+  check('cost_allocations_basis', sql`${t.basis} in ('per_car', 'equal', 'by_value', 'manual')`),
+  check('cost_allocations_share', sql`${t.shareNgn} > 0`),
+  check('cost_allocations_position', sql`${t.position} > 0`),
+  check('cost_allocations_weight', sql`(${t.basis} = 'by_value') = (${t.weightNgn} IS NOT NULL) AND coalesce(${t.weightNgn}, 1) > 0`),
+]);
