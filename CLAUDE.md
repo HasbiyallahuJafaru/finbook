@@ -40,6 +40,9 @@ Break any of these and the work is wrong, however good it looks.
 - Users record business events (job order, supplier payment, clearing cost, customer receipt, completion); `packages/ledger` turns them into balanced lines. Debits = credits in NGN, enforced by a deferred DB trigger.
 - Posted entries are immutable. Corrections are reversals plus new entries (`reverses_entry_id`). No UPDATE/DELETE on posted rows, ever.
 - Locked periods refuse inserts. Every entry has `source_type`, `source_id`, `created_by` and an idempotency key. Each entry stores a hash chained to the previous entry for its tenant.
+- Every posting rule is a named entry type (`source_type`) with one shape in `entry_shapes`; the database refuses an entry that doesn't fit its type, and a reversal keeps its type. Manual journals name no car and keep off the job, pool, inventory and receivable accounts (ADR 0017).
+- The API posts through `POST /postings`. The request carries facts only (car, amount, date, rates, evidence); the customer, funding, history, pool and payables come from the database, and the API never accepts lines, a customer or an entry type. Each posting's facts are kept in `postings`, and the entry's `source_id` points there (ADR 0018).
+- Entries are dated from the client's `go_live_on` to today (Lagos time). The first entry in a calendar month opens it; no month opens before go-live or behind a locked month.
 
 **How we book EMM's Shop** (the client's business model; see spec → Vehicle module, ADR 0016)
 - Job types: `car_purchase` and `clearing_only`. Funding is set per job and never changes: `customer_funded` (default, agent accounting: the client's revenue = its cut) or `emm_funded` (rare exception, principal accounting: the car is the client's inventory, needs a reason, flagged until a firm reviewer or admin signs off the treatment).
@@ -59,6 +62,7 @@ Break any of these and the work is wrong, however good it looks.
 
 **Evidence and audit**
 - Documents go to private R2 via presigned URLs (10-minute upload, 5-minute download). Never through the API, never public. Evidence is never replaced or deleted; superseding attaches a new file.
+- A line's evidence is one of the tenant's own stored documents. A foreign-currency line is refused without it. Any other posting without evidence posts and shows on `entries_missing_evidence` until a document is attached (`entry_evidence`). A document backing several standing entries is allowed and listed on `evidence_shared` for a firm reviewer (owner, 2026-11-17).
 - Every write goes to `audit_log` with before/after. Gapless numbers for job orders, invoices, receipts and payment vouchers come from a locked per-tenant sequence, never `MAX()+1`.
 - Dates are ISO `date` columns from a date picker; display is DD/MM/YYYY. Never parse user-typed date strings.
 - VINs: 17 characters, no I/O/Q, check digit validated, unique per tenant. Invalid VINs import only with status `vin_needs_correction`.
@@ -120,7 +124,7 @@ pnpm db:migrate              # needs DATABASE_OWNER_URL; local, or staging via t
 pnpm --filter <pkg> <script> # scope to one package
 ```
 
-Not built yet: `pnpm openapi` (arrives with `packages/contracts` and the first real endpoints).
+pnpm openapi                 # writes packages/contracts/openapi.json from the Zod contracts: run after any contract change and commit it
 
 **Infrastructure and deploys (owner-authorized 2026-11-15, staging only):** Claude may create and deploy Railway, Cloudflare, Postgres and Redis resources for the **staging** environment. **Production is never touched from a Claude session**: no deploys, variables, migrations, seeds or SQL against it. The user runs production from `docs/deploy.md`. Rules:
 - Work only in the `staging` Railway environment and the `finbook-web-staging` Worker. If a command could target production (no environment flag, or the linked environment isn't staging), check first with `railway status`.
@@ -136,6 +140,7 @@ Not built yet: `pnpm openapi` (arrives with `packages/contracts` and the first r
 - **Ledger or FX change:** use the `ledger-change` skill. Write the worked-example test first, to the kobo.
 - **Whole-entry DB checks** go in an `assert_*(e journal_entries)` function called from `post_journal_entry` (migration 0007), with `REVOKE EXECUTE ... FROM PUBLIC`. Never as a separate deferred trigger: those can be fired early with `SET CONSTRAINTS` and dodged. An integration test fails if any non-trigger definer function is executable by a non-owner role.
 - **New endpoint:** use the `new-endpoint` skill. **Schema change:** use the `db-migration` skill.
+- **New posting type:** the rule in `packages/ledger` (throwing `RuleError` for the request's own figures), its rows in `entry_shapes` (a migration), and its schema in the `CreatePosting` union. Each transaction takes the tenant ledger lock first, before reading history or locking a job row (ADR 0017 §7).
 - **Before every commit:** the `verify` skill runs. Do not commit with red checks. **Before every push:** `.githooks/pre-push` runs the full CI steps and blocks on red (ADR 0007; GitHub Actions is billing-locked). Never push with `--no-verify`.
 - **Review:** after changes to `packages/ledger`, `packages/money`, posting, reports or permissions, run the `ledger-auditor` subagent. After auth, RLS or document access changes, run the `security-reviewer` subagent.
 - **Frontend:** use the `design-taste-frontend`, `frontend-design` and `ui-ux-pro-max` skills with shadcn/ui. Ponytail does not apply to `apps/web` or `packages/ui`. Tabular figures, right-aligned amounts, ₦ and ¥ always shown, negatives in parentheses on reports, every total clickable down to its journal lines. WCAG AA, down to 360 px.
