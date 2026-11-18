@@ -3,10 +3,11 @@ import { z } from 'zod';
 import { Throttle } from '@nestjs/throttler';
 import type pg from 'pg';
 import type { Tx } from '@app/db';
-import { AttachEvidence, CreatePosting, type EntryEvidence, type Posting } from '@app/contracts';
+import { AttachEvidence, CreatePosting, CreateReversal, type EntryEvidence, type Posting } from '@app/contracts';
 import { parseRate, type Pool } from '@app/money';
 import {
-  buyCurrency, customerReceipt, customerRefund, payFromPool, payPayableFromPool, receivableReceipt, RuleError, supplierInvoice, type EntryType, type Funding, type Line,
+  buyCurrency, completeAgentJob, completeClearingJob, customerReceipt, customerRefund, payFromPool, payPayableFromPool, receivableReceipt, RuleError, supplierCredit,
+  supplierInvoice, type EntryType, type Funding, type Line,
 } from '@app/ledger';
 import { Can } from './auth/permissions.js';
 import type { Caller } from './auth/auth.guard.js';
@@ -25,6 +26,7 @@ const POSTING_ERRORS = pgErrors({
   periods_no_overlap: [422, 'no single accounting period covers that date: ask the firm to set up the period'],
   // the same key again after its stored answer expired (7 days): the entry stands, nothing is posted twice
   journal_entries_idempotency: [409, 'this Idempotency-Key already posted an entry'],
+  journal_entries_reversed_once: [409, 'that entry is already reversed'],
 }, true);
 
 /** A rule in packages/ledger refusing the request's own figures (a refund larger than what is held, say): a 422 in its words. */
@@ -37,13 +39,18 @@ function rule(build: () => Line[]): Line[] {
   }
 }
 
-/** The job order a car is on: its customer and funding come from here, never from the request. */
-async function jobOf(t: Tx, vehicleId: string): Promise<{ customerId: string; funding: Funding }> {
-  const job = (await t.client.query<{ customer_id: string; funding: Funding }>(
-    'SELECT o.customer_id, o.funding FROM job_order_vehicles jv JOIN job_orders o ON o.id = jv.job_order_id WHERE jv.vehicle_id = $1', [vehicleId])).rows[0];
+type JobRow = {
+  customer_id: string; funding: Funding; job_type: 'car_purchase' | 'clearing_only'; car_price_currency: string | null; quote_rate: string | null;
+  car_price_minor: string | null; landing_charge_ngn: string;
+};
+/** The job order a car is on: its customer, funding and the car's own quote come from here, never from the request. */
+async function jobOf(t: Tx, vehicleId: string): Promise<{ customerId: string; funding: Funding; row: JobRow }> {
+  const job = (await t.client.query<JobRow>(
+    `SELECT o.customer_id, o.funding, o.job_type, o.car_price_currency, o.quote_rate::text, jv.car_price_minor::text, jv.landing_charge_ngn::text
+       FROM job_order_vehicles jv JOIN job_orders o ON o.id = jv.job_order_id WHERE jv.vehicle_id = $1`, [vehicleId])).rows[0];
   // another tenant's car looks exactly like no car
   if (!job) throw new UnprocessableEntityException('that car is not on one of your job orders');
-  return { customerId: job.customer_id, funding: job.funding };
+  return { customerId: job.customer_id, funding: job.funding, row: job };
 }
 
 /** A supplier or agent of this business (another tenant's looks like none). */
@@ -70,19 +77,25 @@ async function payableOf(t: Tx, vehicleId: string, supplierId: string, currency:
   return { balanceMinor: BigInt(r?.bal ?? '0'), costNgn: BigInt(r?.cost ?? '0') };
 }
 
-/** Every line naming the car, as the rules read them (ADR 0008: balances come from the ledger, never stored). */
-async function historyOf(t: Tx, vehicleId: string): Promise<Line[]> {
+/** Lines as the rules read them (ADR 0008: balances come from the ledger, never stored), with every column a reversal mirrors. */
+async function linesWhere(t: Tx, where: 'l.vehicle_id = $1' | 'l.entry_id = $1', id: string): Promise<Line[]> {
   const rows = (await t.client.query<{
     code: string; debit_ngn: string; credit_ngn: string; currency: string; amount_minor: string; rate: string | null; rate_source: Line['rateSource'] | null;
-    spot_rate: string | null; counterparty_id: string | null;
-  }>(`SELECT a.code, l.debit_ngn, l.credit_ngn, l.currency, l.amount_minor, l.rate, l.rate_source, l.spot_rate, l.counterparty_id
-        FROM journal_lines l JOIN accounts a ON a.id = l.account_id WHERE l.vehicle_id = $1`, [vehicleId])).rows;
+    rate_note: string | null; spot_rate: string | null; spot_source: Line['spotSource'] | null; evidence_document_id: string | null; vehicle_id: string | null;
+    counterparty_id: string | null;
+  }>(`SELECT a.code, l.debit_ngn, l.credit_ngn, l.currency, l.amount_minor, l.rate, l.rate_source, l.rate_note, l.spot_rate, l.spot_source, l.evidence_document_id,
+             l.vehicle_id, l.counterparty_id
+        FROM journal_lines l JOIN accounts a ON a.id = l.account_id WHERE ${where} ORDER BY l.id`, [id])).rows;
   return rows.map((r) => ({
-    account: r.code, debit: BigInt(r.debit_ngn), credit: BigInt(r.credit_ngn), currency: r.currency.trim(), amountMinor: BigInt(r.amount_minor), vehicleId,
-    ...(r.rate && { rate: r.rate }), ...(r.rate_source && { rateSource: r.rate_source }), ...(r.spot_rate && { spotRate: r.spot_rate }),
+    account: r.code, debit: BigInt(r.debit_ngn), credit: BigInt(r.credit_ngn), currency: r.currency.trim(), amountMinor: BigInt(r.amount_minor),
+    ...(r.rate && { rate: r.rate }), ...(r.rate_source && { rateSource: r.rate_source }), ...(r.rate_note && { rateNote: r.rate_note }),
+    ...(r.spot_rate && { spotRate: r.spot_rate }), ...(r.spot_source && { spotSource: r.spot_source }),
+    ...(r.evidence_document_id && { evidenceDocumentId: r.evidence_document_id }), ...(r.vehicle_id && { vehicleId: r.vehicle_id }),
     ...(r.counterparty_id && { counterpartyId: r.counterparty_id }),
   }));
 }
+/** Every line naming the car. */
+const historyOf = (t: Tx, vehicleId: string) => linesWhere(t, 'l.vehicle_id = $1', vehicleId);
 
 /**
  * The period an entry dated `date` falls in. Periods are calendar months: the first entry in a month opens it. A locked
@@ -97,7 +110,7 @@ async function periodFor(t: Tx, tenantId: string, date: string): Promise<string>
 }
 
 /** Insert one rule's lines as one entry of its type, run the whole-entry checks now, and return what posted with its flags. */
-async function postEntry(t: Tx, caller: Caller, key: string, type: EntryType, p: CreatePosting, memo: string, lines: Line[]): Promise<Posting> {
+async function postEntry(t: Tx, caller: Caller, key: string, type: EntryType, p: { entryDate: string }, memo: string, lines: Line[], reverses: string | null = null): Promise<Posting> {
   const codes = [...new Set(lines.map((l) => l.account))];
   const ids = new Map((await t.client.query<{ id: string; code: string }>('SELECT id, code FROM accounts WHERE code = ANY ($1)', [codes])).rows.map((r) => [r.code, r.id]));
   const missing = codes.find((c) => !ids.has(c));
@@ -108,9 +121,9 @@ async function postEntry(t: Tx, caller: Caller, key: string, type: EntryType, p:
   const source = (await t.client.query<{ id: string }>('INSERT INTO postings (tenant_id, type, facts) VALUES ($1, $2, $3) RETURNING id',
     [caller.tenantId, type, JSON.stringify(p)])).rows[0]?.id ?? '';
   const entryId = (await t.client.query<{ id: string }>(
-    `INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key)
-     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-    [caller.tenantId, period, p.entryDate, memo, type, source, `posting:${key}`]).catch(POSTING_ERRORS)).rows[0]?.id ?? '';
+    `INSERT INTO journal_entries (tenant_id, period_id, entry_date, memo, source_type, source_id, idempotency_key, reverses_entry_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+    [caller.tenantId, period, p.entryDate, memo, type, source, `posting:${key}`, reverses]).catch(POSTING_ERRORS)).rows[0]?.id ?? '';
   for (const l of lines) {
     await t.client.query(
       `INSERT INTO journal_lines (tenant_id, entry_id, account_id, debit_ngn, credit_ngn, currency, amount_minor, rate, rate_source, rate_note, spot_rate, spot_source,
@@ -134,12 +147,12 @@ async function postEntry(t: Tx, caller: Caller, key: string, type: EntryType, p:
 const MEMOS: Record<CreatePosting['type'], string> = {
   customer_receipt: 'Customer receipt', customer_refund: 'Refund to customer', receivable_receipt: 'Customer payment of balance owed',
   currency_purchase: 'Foreign currency bought', pool_payment: 'Supplier paid from the pool', supplier_invoice: 'Supplier invoice',
-  supplier_settlement: 'Supplier invoice paid from the pool',
+  supplier_settlement: 'Supplier invoice paid from the pool', supplier_credit: 'Supplier credit', job_completion: 'Job completed',
 };
 
 /** The rule's lines for one posting, from the facts and what the ledger already says. */
 async function linesFor(t: Tx, p: CreatePosting): Promise<Line[]> {
-  const evidence = p.evidenceDocumentId ? { evidenceDocumentId: p.evidenceDocumentId } : {};
+  const evidence = 'evidenceDocumentId' in p && p.evidenceDocumentId ? { evidenceDocumentId: p.evidenceDocumentId } : {};
   const spotOf = (s: { rate: string; source: 'cbn' | 'manual'; note?: string | undefined }) => ({ spot: { rate: parseRate(s.rate), source: s.source }, ...(s.note && { rateNote: s.note }) });
   switch (p.type) {
     case 'customer_receipt': case 'customer_refund': case 'receivable_receipt': {
@@ -170,6 +183,21 @@ async function linesFor(t: Tx, p: CreatePosting): Promise<Line[]> {
       return rule(() => payPayableFromPool({ vehicleId: p.vehicleId, supplierId, pool, payable, currency: p.currency, amountMinor: BigInt(p.amountMinor),
         ...spotOf(p.spot), ...evidence }).lines);
     }
+    case 'supplier_credit': {
+      await jobOf(t, p.vehicleId);
+      const supplierId = p.supplierId && await supplierOf(t, p.supplierId);
+      const history = await historyOf(t, p.vehicleId);
+      return rule(() => supplierCredit({ vehicleId: p.vehicleId, amountNgn: BigInt(p.amountNgn), history, ...(supplierId && { supplierId }), ...evidence }));
+    }
+    case 'job_completion': {
+      // The car's own quote (owner 2026-11-17) and ledger. The database re-performs the cut, and refuses a job whose quote isn't accepted (0015).
+      const { customerId, row } = await jobOf(t, p.vehicleId);
+      const job = { vehicleId: p.vehicleId, counterpartyId: customerId, history: await historyOf(t, p.vehicleId) };
+      const landingChargeNgn = BigInt(row.landing_charge_ngn);
+      if (row.job_type === 'clearing_only') return rule(() => completeClearingJob({ ...job, landingChargeNgn }).lines);
+      return rule(() => completeAgentJob({ ...job, quote: { currency: row.car_price_currency ?? '', sellingMinor: BigInt(row.car_price_minor ?? '0'),
+        rate: parseRate(row.quote_rate ?? '0'), landingChargeNgn } }).lines);
+    }
   }
 }
 
@@ -191,6 +219,35 @@ export class PostingsController {
       // The tenant's posting lock first (ADR 0017 §7): the history read below is then the ledger this entry commits against.
       await t.client.query("SELECT pg_advisory_xact_lock(hashtextextended('ledger:' || $1, 0))", [req.caller.tenantId]);
       return { status: 201, body: await postEntry(t, req.caller, key ?? '', p.type, p, p.memo ?? MEMOS[p.type], await linesFor(t, p)) };
+    });
+    res.status(out.status);
+    return out.body;
+  }
+
+  /**
+   * A correction (owner 2026-11-17: firm roles only, ADR 0018): the exact mirror of a standing entry, with the same type, dated
+   * in an open month. Each line keeps its original's evidence, so a correction needs no new slip. The database checks the
+   * mirror, refuses a second reversal or the reversal of a reversal, and undoes what the original did to its job (0015).
+   */
+  @Post(':entryId/reversal')
+  @Can('postings.reverse')
+  @Throttle(WRITE_LIMIT)
+  async reverse(@Req() req: { caller: Caller }, @Param('entryId') entryId: string, @Headers('idempotency-key') key: string | undefined, @Body() body: unknown,
+    @Res({ passthrough: true }) res: Status): Promise<Posting> {
+    const entry = input(z.uuid(), entryId);
+    const r = input(CreateReversal, body);
+    const out = await idempotentWrite(this.pool, req.caller, key, { route: 'POST /postings/:entryId/reversal', body: [entry, r] }, async (t) => {
+      await t.client.query("SELECT pg_advisory_xact_lock(hashtextextended('ledger:' || $1, 0))", [req.caller.tenantId]);
+      const original = (await t.client.query<{ source_type: EntryType; memo: string }>('SELECT source_type, memo FROM journal_entries WHERE id = $1', [entry])).rows[0];
+      // another tenant's entry looks exactly like no entry
+      if (!original) throw new NotFoundException();
+      // The document in the request backs only a foreign line that has none (posted before 0017); one that backs nothing is refused, not kept unused.
+      const needsDoc = (l: Line) => l.currency !== 'NGN' && !l.evidenceDocumentId;
+      const lines = await linesWhere(t, 'l.entry_id = $1', entry);
+      if (r.evidenceDocumentId && !lines.some(needsDoc)) throw new UnprocessableEntityException('every foreign line of that entry already has its evidence: send no document');
+      const mirror = lines.map((l) => ({ ...l, debit: l.credit, credit: l.debit, ...(needsDoc(l) && r.evidenceDocumentId && { evidenceDocumentId: r.evidenceDocumentId }) }));
+      const facts = { ...r, reverses: entry }; // kept in postings: the entry it corrects, and why
+      return { status: 201, body: await postEntry(t, req.caller, key ?? '', original.source_type, facts, r.memo ?? `Reversal: ${original.memo}`, mirror, entry) };
     });
     res.status(out.status);
     return out.body;

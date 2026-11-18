@@ -790,4 +790,114 @@ describe('documents and job orders', () => {
       assert.deepEqual(await lines(await pay({ amountMinor: '1' })), [['1150', '100', '0', '100'], ['1010', '0', '100', '1']]);
     });
   });
+
+  // ── POST /postings: supplier credit, completion, reversal (ADR 0017, 0018). Worked by hand, to the kobo, fixture rates, in USD
+  //   so the CNY pool above doesn't touch it. Car P: quoted USD 3,300.00 at FIXTURE_RATE_QUOTE 1,450; landing charge NGN 500,000.00.
+  //   receipt NGN 6,000,000.00 -> 2150. Buy USD 3,000.00 at FIXTURE_RATE_BUY 1,500 = NGN 4,500,000.00; pay the supplier all of it -> 1150.
+  //   supplier refunds NGN 20,000.00 cash -> 1150 NGN 4,480,000.00 (flagged cost_credited).
+  //   completion: selling 3,300.00 x 1,450 = NGN 4,785,000.00; car at quote 3,000.00 x 1,450 = NGN 4,350,000.00
+  //     car markup 4100 = 4,785,000.00 - 4,350,000.00 = NGN 435,000.00 (credit)
+  //     FX 7000 = 4,350,000.00 - 4,500,000.00 = NGN 150,000.00 loss (debit)
+  //     clearing margin 4200 = 500,000.00 - (4,480,000.00 - 4,500,000.00) = NGN 520,000.00 (credit)
+  //     bill 4,785,000.00 + 500,000.00 = NGN 5,285,000.00, all from funds held (2150 debit); NGN 715,000.00 stays held
+  //     Dr 5,285,000.00 + 150,000.00 = Cr 4,480,000.00 + 435,000.00 + 520,000.00 = NGN 5,435,000.00
+  describe('POST /postings: supplier credit, completion, reversal', () => {
+    let car = '';
+    let jobId = '';
+    const date = '2026-02-10';
+    const post = (claims: Record<string, unknown>, path: string, body: unknown, key: string = randomUUID()) => fetch(`${url}${path}`, {
+      method: 'POST', body: JSON.stringify(body), headers: { ...bearer(claims), 'content-type': 'application/json', 'idempotency-key': key } });
+    const accountant = { sub: 'user_staff', fva: [1, 1] };
+    const asAccountant = (path: string, body: unknown, tenant = tenantA) => fetch(`${url}${path}`, { method: 'POST', body: JSON.stringify(body),
+      headers: { ...bearer(accountant, { 'x-tenant-id': tenant }), 'content-type': 'application/json', 'idempotency-key': randomUUID() } });
+    const slip = async () => (await evidence(ownerA, Buffer.from(`%PDF-1.7\n% fixture slip ${randomUUID()}\n%%EOF\n`), { docType: 'receipt' })).id;
+    type Out = { entryId: string; type: string; memo: string; lines: { account: string; debitNgn: string; creditNgn: string }[]; flags: { kind: string }[] };
+    const ok = async (res: Response) => {
+      assert.equal(res.status, 201, await res.clone().text());
+      return (await res.json()) as Out;
+    };
+    const status = async () => (await ownerPool.query<{ status: string }>('SELECT status FROM job_orders WHERE id = $1', [jobId])).rows[0]?.status;
+    const complete = { type: 'job_completion', vehicleId: '', entryDate: date };
+    before(async () => {
+      const job = (await (await send('POST', '/job-orders', ownerA, { customerId: customerA, jobType: 'car_purchase', orderedOn: '2026-02-01',
+        carPrice: { amountMinor: '330000', currency: 'USD' }, quoteRate: { rate: '1450', source: 'manual', note: 'FIXTURE_RATE_QUOTE' }, landingChargeNgn: '50000000' })).json()) as { id: string };
+      jobId = job.id;
+      car = ((await (await send('POST', '/vehicles', ownerA, { vin: 'SALGS2SE5LA000013', make: 'Toyota', model: 'Highlander', year: 2023 })).json()) as { id: string }).id;
+      complete.vehicleId = car;
+      await send('POST', `/job-orders/${jobId}/vehicles`, ownerA, { vehicleId: car, carPriceMinor: '330000', landingChargeNgn: '50000000' });
+      assert.equal((await send('POST', `/job-orders/${jobId}/accept-quote`, ownerA, { documentId: (await evidence(ownerA, Buffer.from('%PDF-1.7\n% quote P\n%%EOF\n'))).id })).status, 200);
+      await ok(await post(ownerA, '/postings', { type: 'customer_receipt', vehicleId: car, amountNgn: '600000000', entryDate: date }));
+      await ok(await post(ownerA, '/postings', { type: 'currency_purchase', currency: 'USD', amountMinor: '300000', rate: { rate: '1500', source: 'bank_receipt' }, entryDate: date, evidenceDocumentId: await slip() }));
+      await ok(await post(ownerA, '/postings', { type: 'pool_payment', vehicleId: car, currency: 'USD', amountMinor: '300000', spot: { rate: '1500', source: 'manual', note: 'FIXTURE spot' }, entryDate: date, evidenceDocumentId: await slip() }));
+    });
+
+    test('worked example: a supplier credit, then the completion the rule and the database both work out, to the kobo', async () => {
+      const credit = (amountNgn: string) => ({ type: 'supplier_credit', vehicleId: car, amountNgn, entryDate: date });
+      const tooMuch = await post(ownerA, '/postings', credit('450000001'));
+      assert.deepEqual([tooMuch.status, ((await tooMuch.json()) as { message: string }).message], [422, 'credit exceeds the job costs recorded for this car']);
+      assert.equal((await post(ownerA, '/postings', { ...credit('100'), supplierId: customerA })).status, 422); // a customer is no supplier
+      const refunded = await ok(await post(ownerA, '/postings', credit('2000000')));
+      assert.deepEqual(refunded.lines.map((l) => [l.account, l.debitNgn, l.creditNgn]), [['1000', '2000000', '0'], ['1150', '0', '2000000']]);
+      assert.deepEqual(refunded.flags.map((f) => f.kind), ['cost_credited']);
+      // The cut is never typed in: a completion carrying figures is refused at the door.
+      assert.equal((await post(ownerA, '/postings', { ...complete, amountNgn: '1' })).status, 400);
+      const done = await ok(await post(ownerA, '/postings', complete));
+      assert.deepEqual([done.type, done.memo, done.flags], ['job_completion', 'Job completed', []]);
+      assert.deepEqual(done.lines.map((l) => [l.account, l.debitNgn, l.creditNgn]), [
+        ['2150', '528500000', '0'], ['1150', '0', '448000000'], ['4100', '0', '43500000'], ['4200', '0', '52000000'], ['7000', '15000000', '0']]);
+      assert.equal(await status(), 'completed');
+      assert.equal((await post(ownerA, '/postings', complete)).status, 422); // once per car
+    });
+
+    test('a reversal is the exact mirror, by firm accountants only; it undoes the completion, once; another tenant\'s entry is no entry', async () => {
+      const done = (await ownerPool.query<{ id: string }>("SELECT id FROM journal_entries WHERE tenant_id = $1 AND source_type = 'job_completion'", [tenantA])).rows[0]?.id ?? '';
+      const path = `/postings/${done}/reversal`;
+      assert.equal((await post(ownerA, path, { entryDate: date })).status, 403); // a correction is our call, not the client's
+      assert.equal((await post(viewerA, path, { entryDate: date })).status, 403);
+      assert.equal((await post({ sub: 'user_staff_a', o: { id: 'org_a' } }, path, { entryDate: date })).status, 403); // client staff record, never correct
+      assert.equal((await fetch(`${url}${path}`, { method: 'POST', body: JSON.stringify({ entryDate: date }),
+        headers: { ...bearer({ sub: 'user_reviewer', fva: [1, 1] }, { 'x-tenant-id': tenantA }), 'content-type': 'application/json', 'idempotency-key': randomUUID() } })).status, 403);
+      assert.equal((await asAccountant(path, { entryDate: date, lines: [] })).status, 400);
+      // An accountant of tenant B only: A's entry is no entry.
+      await ownerPool.query("INSERT INTO firm_staff (clerk_user_id) VALUES ('user_accountant_b')");
+      await ownerPool.query("INSERT INTO firm_access (tenant_id, clerk_user_id, role, granted_by) VALUES ($1, 'user_accountant_b', 'firm_accountant', 'user_admin')", [tenantB]);
+      const fromB = await fetch(`${url}${path}`, { method: 'POST', body: JSON.stringify({ entryDate: date }),
+        headers: { ...bearer({ sub: 'user_accountant_b', fva: [1, 1] }, { 'x-tenant-id': tenantB }), 'content-type': 'application/json', 'idempotency-key': randomUUID() } });
+      assert.equal(fromB.status, 404);
+      assert.deepEqual((await ownerPool.query("SELECT count(*)::int AS n FROM postings WHERE created_by = 'user_accountant_b'")).rows, [{ n: 0 }]);
+      const message = async (res: Response) => [res.status, ((await res.json()) as { message: string }).message];
+      const early = await message(await asAccountant(path, { entryDate: '2026-02-09' }));
+      assert.equal(early[0], 422);
+      assert.match(String(early[1]), /a reversal is dated on or after the entry it reverses \(10\/02\/2026\)/);
+      // A document for a correction whose lines all have theirs backs nothing: refused, not kept unused.
+      assert.deepEqual(await message(await asAccountant(path, { entryDate: date, evidenceDocumentId: await slip() })),
+        [422, 'every foreign line of that entry already has its evidence: send no document']);
+      const reversed = await ok(await asAccountant(path, { entryDate: date }));
+      assert.deepEqual([reversed.type, reversed.memo], ['job_completion', 'Reversal: Job completed']);
+      assert.deepEqual(reversed.lines.map((l) => [l.account, l.debitNgn, l.creditNgn]), [
+        ['2150', '0', '528500000'], ['1150', '448000000', '0'], ['4100', '43500000', '0'], ['4200', '52000000', '0'], ['7000', '0', '15000000']]);
+      assert.equal(await status(), 'quote_accepted');
+      const again = await asAccountant(path, { entryDate: date });
+      assert.deepEqual([again.status, ((await again.json()) as { message: string }).message], [409, 'that entry is already reversed']);
+      assert.equal((await asAccountant(`/postings/${reversed.entryId}/reversal`, { entryDate: date })).status, 422); // a reversal isn't reversed
+      // The correction's source keeps what it corrects; the job completes again, the same way.
+      const source = await ownerPool.query<{ type: string; reverses: string; created_by: string }>(
+        "SELECT p.type, p.facts ->> 'reverses' AS reverses, p.created_by FROM postings p JOIN journal_entries e ON e.source_id = p.id WHERE e.id = $1", [reversed.entryId]);
+      assert.deepEqual(source.rows, [{ type: 'job_completion', reverses: done, created_by: 'user_staff' }]);
+      const audit = await ownerPool.query("SELECT actor FROM audit_log WHERE entity = 'journal_entries' AND entity_id = $1", [reversed.entryId]);
+      assert.deepEqual(audit.rows, [{ actor: 'user_staff' }]);
+      assert.deepEqual((await ok(await post(ownerA, '/postings', complete))).lines.map((l) => l.creditNgn), ['0', '448000000', '43500000', '52000000', '0']);
+      // Undoing the supplier's refund after the completion puts NGN 20,000.00 back on a completed car: it posts, flagged for a reviewer.
+      const credit = (await ownerPool.query<{ id: string }>("SELECT id FROM journal_entries WHERE tenant_id = $1 AND source_type = 'supplier_credit'", [tenantA])).rows[0]?.id ?? '';
+      assert.deepEqual((await ok(await asAccountant(`/postings/${credit}/reversal`, { entryDate: date }))).flags.map((f) => f.kind), ['cost_after_completion']);
+      // A foreign entry keeps its own slip when reversed: no new document needed.
+      const pay = (await ownerPool.query<{ id: string }>("SELECT e.id FROM journal_entries e WHERE e.tenant_id = $1 AND e.source_type = 'currency_purchase' AND e.memo = 'Foreign currency bought' ORDER BY e.id DESC LIMIT 1", [tenantA])).rows[0]?.id ?? '';
+      const docs = async (entry: string) => (await ownerPool.query<{ d: string }>('SELECT evidence_document_id AS d FROM journal_lines WHERE entry_id = $1 ORDER BY id', [entry])).rows.map((r) => r.d);
+      const buyBack = await asAccountant(`/postings/${pay}/reversal`, { entryDate: date });
+      assert.equal(buyBack.status, 422, 'the USD has left the pool: reversing the purchase would overdraw it'); // the database guards the pool
+      const receipt = (await ok(await post(ownerA, '/postings', { type: 'currency_purchase', currency: 'USD', amountMinor: '100', rate: { rate: '1500', source: 'bank_receipt' }, entryDate: date, evidenceDocumentId: await slip() }))).entryId;
+      const undone = await ok(await asAccountant(`/postings/${receipt}/reversal`, { entryDate: date, memo: 'wrong rate on the slip' }));
+      assert.deepEqual([undone.memo, await docs(undone.entryId)], ['wrong rate on the slip', await docs(receipt)]);
+    });
+  });
 });

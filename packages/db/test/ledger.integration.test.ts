@@ -140,6 +140,9 @@ const chainBreaks = (tenant: string) => tx(tenant, async (t) =>
 /** A fresh tenant with the test chart and an open January 2026 period. 1010 (the pool) has no account currency, as in production; 1020 is a CNY account. */
 async function freshTenant(name: string): Promise<{ id: string; period: string }> {
   const id = (await owner<{ id: string }>("INSERT INTO tenants (legal_name, go_live_on) VALUES ($1, '2025-12-01') RETURNING id", [name])).rows[0]?.id ?? '';
+  // The test user keeps these books as a firm accountant: reversals are theirs to post (0018).
+  await owner('INSERT INTO firm_staff (clerk_user_id) VALUES ($1) ON CONFLICT DO NOTHING', [USER]);
+  await owner("INSERT INTO firm_access (tenant_id, clerk_user_id, role, granted_by) VALUES ($1, $2, 'firm_accountant', 'test')", [id, USER]);
   const ids: Record<string, string> = {};
   accounts[id] = ids;
   const period = await tx(id, async (t) => {
@@ -636,6 +639,33 @@ describe('phase 2: posting rules through the database', () => {
     await assert.rejects(reverse(mirror('B')), /does not mirror/);
     await reverse(mirror('A'));
     assert.deepEqual(await poolOf(id), { balanceMinor: 15_000_000n, costNgn: 1_600_000_000n }, 'pool back to CNY 150,000.00 / NGN 16,000,000.00');
+  });
+
+  // Funded pool: CNY 100,000.00 at FIXTURE_RATE_BUY_1 100 (NGN 10,000,000.00) + CNY 50,000.00 at FIXTURE_RATE_BUY_2 120 (NGN 6,000,000.00).
+  // Reverse the second purchase while unspent: pool CNY 100,000.00 / NGN 10,000,000.00. Pay car A CNY 95,000.00 at 100 = NGN 9,500,000.00:
+  // pool CNY 5,000.00 / NGN 500,000.00. Reversing the first purchase now would leave CNY -95,000.00 at NGN -9,500,000.00: refused (0018).
+  test('a currency purchase reverses while its currency is in the pool, never after it was paid out', async () => {
+    const { id, period } = await funded('Purchase reversal');
+    const purchases = await tx(id, async (t) => (await t.client.query<{ id: string }>("SELECT id FROM journal_entries WHERE source_type = 'currency_purchase' ORDER BY id")).rows.map((r) => r.id));
+    const reverse = (entry: string | undefined, lines: LedgerLine[]) => postLines(id, period, lines.map((l) => ({ ...l, debit: l.credit, credit: l.debit })), { reverses: entry ?? '' });
+    const second = buyCurrency({ currency: 'CNY', amountMinor: 5_000_000n, rate: parseRate('120.000000'), rateSource: 'bdc_receipt' });
+    // A correction is the firm's call: the client's own staff can't post one, whatever the API lets through (0018).
+    await owner("INSERT INTO memberships (tenant_id, clerk_user_id, role) VALUES ($1, 'user_client_staff', 'client_staff')", [id]);
+    await assert.rejects(withTenant(apiPool, as(id, 'user_client_staff'), (t) => insertPosting(t.client, id, period, second.map((l) => ({ ...l, debit: l.credit, credit: l.debit })),
+      { reverses: purchases[1] ?? '' })), /a reversal is posted by a firm accountant or admin of this business/);
+    await reverse(purchases[1], second);
+    assert.deepEqual(await poolOf(id), { balanceMinor: 10_000_000n, costNgn: 1_000_000_000n });
+    await postLines(id, period, payFromPool({ pool: await poolOf(id), currency: 'CNY', amountMinor: 9_500_000n, vehicleId: 'A', spot: SPOT_CBN }).lines);
+    assert.deepEqual(await poolOf(id), { balanceMinor: 500_000n, costNgn: 50_000_000n });
+    const first = buyCurrency({ currency: 'CNY', amountMinor: 10_000_000n, rate: parseRate('100.000000'), rateSource: 'bdc_receipt' });
+    await assert.rejects(reverse(purchases[0], first), /the CNY pool would hold -9500000 \(minor units\) at a cost of -950000000 kobo/);
+    // Buy CNY 100,000.00 more at FIXTURE_RATE_BUY_1 100: reversing the first purchase would now leave the pool positive, but car A
+    // was costed at an average that included it, so it is still refused until A's payment is reversed.
+    await postLines(id, period, first);
+    await assert.rejects(reverse(purchases[0], first), /paid out after it, at an average that included it: reverse those payments first/);
+    // Never dated before what it reverses (purchases are dated 2026-01-10).
+    await assert.rejects(postLines(id, period, first.map((l) => ({ ...l, debit: l.credit, credit: l.debit })), { reverses: purchases[0] ?? '', date: '2026-01-09' }),
+      /a reversal is dated on or after the entry it reverses \(10\/01\/2026\)/);
   });
 
   test('a pool payment without the day spot rate is refused', async () => {
@@ -2088,7 +2118,8 @@ describe('tenant access (migration 0009)', () => {
     assert.deepEqual(await resolveAccess(apiPool, 'user_staff', { tenantId: tenantA }, undefined), { tenantId: tenantA, role: 'firm_accountant' });
     assert.equal(await resolveAccess(apiPool, 'user_staff', { tenantId: tenantB }, undefined), null);
     assert.equal(await tx(tenantA, async (t) => (await t.client.query('SELECT 1 FROM memberships WHERE tenant_id = $1', [tenantB])).rowCount), 0);
-    assert.equal(await tx(tenantB, async (t) => (await t.client.query('SELECT 1 FROM firm_access')).rowCount), 0);
+    // B sees none of A's grants (B's own, to the test user, are B's: freshTenant)
+    assert.equal(await tx(tenantB, async (t) => (await t.client.query('SELECT 1 FROM firm_access WHERE tenant_id <> $1', [tenantB])).rowCount), 0);
   });
 
   test('firm staff never hold a client role, whichever row came first, in any tenant', async () => {

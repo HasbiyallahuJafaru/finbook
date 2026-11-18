@@ -171,6 +171,10 @@ export const CreatePosting = z.discriminatedUnion('type', [
   z.strictObject({ type: z.literal('supplier_invoice'), vehicleId: z.uuid(), supplierId: z.uuid(), ...foreign, invoiceRate: RateString, spot: Spot, ...foreignFacts }),
   /** (Part of) a supplier's invoice for one car paid from the pool: the gap against the booked cost is realized FX (7000). */
   z.strictObject({ type: z.literal('supplier_settlement'), vehicleId: z.uuid(), supplierId: z.uuid(), ...foreign, spot: Spot, ...foreignFacts }),
+  /** A supplier's NGN credit note (off what is owed to them for the car) or cash refund (no supplier): the car's job costs come down, flagged for review. */
+  z.strictObject({ type: z.literal('supplier_credit'), vehicleId: z.uuid(), amountNgn: MinorUnits, supplierId: z.uuid().optional(), ...postingFacts }),
+  /** The car's job completes: the cut comes from its accepted quote and its own ledger, never from the request. The accepted quote is its evidence. */
+  z.strictObject({ type: z.literal('job_completion'), vehicleId: z.uuid(), entryDate: isoDate, memo: postingFacts.memo }),
 ]);
 export type CreatePosting = z.infer<typeof CreatePosting>;
 export const Posting = z.object({
@@ -185,5 +189,12 @@ export const Posting = z.object({
 export type Posting = z.infer<typeof Posting>;
 /** Evidence for an entry that posted without it (owner 2026-11-17: evidence pending until attached; a document backing several entries is listed for review). */
 export const AttachEvidence = z.strictObject({ documentId: z.uuid() });
+/**
+ * A correction (owner 2026-11-17: firm roles only): the exact mirror of a standing entry, dated in an open month, on or after the
+ * original. Each line keeps its original's evidence; evidenceDocumentId backs only foreign lines whose original had none (posted
+ * before 0017), and is refused when there are none.
+ */
+export const CreateReversal = z.strictObject({ entryDate: isoDate, memo: postingFacts.memo, evidenceDocumentId: z.uuid().optional() });
+export type CreateReversal = z.infer<typeof CreateReversal>;
 export const EntryEvidence = z.object({ entryId: z.uuid(), documentId: z.uuid(), attachedBy: z.string(), attachedAt: z.string() });
 export type EntryEvidence = z.infer<typeof EntryEvidence>;

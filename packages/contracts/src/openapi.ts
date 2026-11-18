@@ -2,7 +2,7 @@
 import { writeFileSync } from 'node:fs';
 import { z } from 'zod';
 import {
-  AcceptQuote, AddJobVehicle, SignOffFlag, Counterparty, CreateCounterparty, CreateJobOrder, CreatePosting, Posting, AttachEvidence, EntryEvidence, CreateUpload, CreateVehicle, Document, DownloadTicket, IdempotencyKeyHeader, JobOrder,
+  AcceptQuote, AddJobVehicle, SignOffFlag, Counterparty, CreateCounterparty, CreateJobOrder, CreatePosting, CreateReversal, Posting, AttachEvidence, EntryEvidence, CreateUpload, CreateVehicle, Document, DownloadTicket, IdempotencyKeyHeader, JobOrder,
   ListCounterpartiesQuery, ListJobOrdersQuery, ListVehiclesQuery, MeResponse, TenantIdHeader, UploadTicket, Vehicle,
 } from './index.ts';
 
@@ -58,6 +58,9 @@ const doc = {
       responses: { 201: ok('Posted: the lines the rule built from the facts and the ledger, and any flags the entry raised', Posting), ...writeErrors } } },
     '/postings/{entryId}/evidence': { post: { parameters: [tenantHeader, idempotencyHeader, { name: 'entryId', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } }],
       requestBody: body(AttachEvidence), responses: { 201: ok('Attached: the entry is no longer evidence pending', EntryEvidence), ...writeErrors } } },
+    '/postings/{entryId}/reversal': { post: { parameters: [tenantHeader, idempotencyHeader, { name: 'entryId', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } }],
+      description: 'Firm accountants and admins only. Posts the exact mirror of a standing entry, with the same type and each line\'s own evidence.',
+      requestBody: body(CreateReversal), responses: { 201: ok('Reversed', Posting), ...writeErrors } } },
     '/me': { get: { parameters: [tenantHeader], responses: { 200: { description: 'The caller in this tenant', content: { 'application/json': { schema: json(MeResponse) } } }, ...errors } } },
   },
 };
