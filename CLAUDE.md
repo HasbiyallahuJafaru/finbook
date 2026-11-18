@@ -33,7 +33,7 @@ Break any of these and the work is wrong, however good it looks.
 **Money**
 - Amounts are `bigint` minor units (kobo, fen, cents) paired with an ISO currency code. Never `number`, `parseFloat`, `toFixed`, or `Math.round` on money. All money maths goes through `packages/money`.
 - Rates are decimal strings (`NUMERIC(18,6)` in Postgres) handled as bigint scaled by 10^6 in `packages/money` (ADR 0003, no decimal library). Rounding: half-up to the minor unit per line; any remainder becomes an explicit rounding line.
-- Shared costs are allocated in minor units with the remainder on the first car, so allocations always add up exactly to the amount paid.
+- Shared costs are allocated in minor units with the remainder on the first car, so allocations always add up exactly to the amount paid. A share that would round to nothing is a rule refusal, never a nil row.
 
 **Ledger**
 - Every balance, profit and report figure comes from `journal_lines`. Nothing else stores a balance.
@@ -41,19 +41,22 @@ Break any of these and the work is wrong, however good it looks.
 - Posted entries are immutable. Corrections are reversals plus new entries (`reverses_entry_id`). No UPDATE/DELETE on posted rows, ever.
 - Locked periods refuse inserts. Every entry has `source_type`, `source_id`, `created_by` and an idempotency key. Each entry stores a hash chained to the previous entry for its tenant.
 - Every posting rule is a named entry type (`source_type`) with one shape in `entry_shapes`; the database refuses an entry that doesn't fit its type, and a reversal keeps its type. Manual journals name no car and keep off the job, pool, inventory and receivable accounts (ADR 0017).
-- The API posts through `POST /postings`. The request carries facts only (car, amount, date, rates, evidence); the customer, funding, history, pool and payables come from the database, and the API never accepts lines, a customer or an entry type. Each posting's facts are kept in `postings`, and the entry's `source_id` points there (ADR 0018).
+- The API posts through `POST /postings`. The request carries facts only (car, amount, date, rates, evidence); the customer, funding, history, pool and payables come from the database, and the API never accepts lines, a customer or an entry type. Each posting's facts are kept in `postings`, and the entry's `source_id` points there (ADR 0018). The one counterparty a request names is a stock car's buyer (`buyerId`, one of the client's customers); a balance owed is paid by whoever owes it on the car.
+- Reversals (`POST /postings/:entryId/reversal`) are firm accountants' and admins' only, checked in the API and the database. A reversal is the exact mirror, keeps each line's evidence, and is dated on or after its original. A currency purchase can't be reversed while a later pool payment in that currency stands (ADR 0018, migration 0018).
 - Entries are dated from the client's `go_live_on` to today (Lagos time). The first entry in a calendar month opens it; no month opens before go-live or behind a locked month.
 
 **How we book EMM's Shop** (the client's business model; see spec → Vehicle module, ADR 0016)
 - Job types: `car_purchase` and `clearing_only`. Funding is set per job and never changes: `customer_funded` (default, agent accounting: the client's revenue = its cut) or `emm_funded` (rare exception, principal accounting: the car is the client's inventory, needs a reason, flagged until a firm reviewer or admin signs off the treatment).
 - A supplier payment on a customer-funded job that the customer's funds held don't cover posts, and is flagged (`supplier_cost_not_covered`): the client may be financing the car itself, which would make it EMM-funded.
+- Every naira car cost is a `car_cost` with a cost type (per client, `cost_types`) and a split (per car, equal or by value over a container, or manual). The split is kept in `cost_allocations` and re-performed by the database. By value means each car's supplier cost in NGN at pool cost. The car price is never a cost type. A container (`shipments`) closes for good: a late cost on it posts and is flagged, and a car put in the wrong open container is taken out with a reason, never deleted (ADR 0019).
+- A car converted to stock is EMM stock from then on: its costs, pool payments and invoices go to inventory (1200). A stock sale applies the buyer's deposits up to the price; the rest stays theirs on 2100.
 - Customer funds held (2150) come in only as a cash receipt from the job's own customer, and leave only in a completion, a cash refund or a conversion to stock. A deposit is never booked as income (owner, 2026-11-15).
 - The cut is never typed in: it is each car's accepted quote minus its actual cost, split into car markup (4100) and clearing margin (4200), with vehicle revenue always naming its car. Each car on a car purchase has its own quoted price. Costs may post before the quote is accepted (flagged); a job can't complete without an accepted quote document.
 - The RMB selling price is converted at the quote-day rate locked on the job order. The gap against the rate actually paid posts to FX (7000), never into margin.
 
 **FX**
 - NGN is the functional currency. Every foreign line stores `currency`, `amount_minor`, `rate`, `rate_source` and its evidence document. The live rate only pre-fills a form; the user confirms or replaces it. Never hardcode a rate, in code, seeds or tests (tests use fixture rates that are clearly labelled as fixtures).
-- Foreign cash is a weighted-average pool per currency. Month-end revaluation of monetary items goes to 7100 and auto-reverses.
+- Foreign cash is a weighted-average pool per currency, and it never holds less than nothing: no currency below zero, and an empty pool costs exactly zero (0018). Month-end revaluation of monetary items goes to 7100 and auto-reverses.
 
 **Tenancy and security**
 - Every tenant-owned table has `tenant_id` plus an RLS policy. The API sets `SET LOCAL app.tenant_id` inside every transaction. Firm staff reach tenants only through `firm_access`.

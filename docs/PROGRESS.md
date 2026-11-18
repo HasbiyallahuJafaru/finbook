@@ -8,7 +8,7 @@ _Last updated: 2026-11-18 (session: POST /postings batches 3–4, car costs and 
 
 ## Start here (next session)
 
-1. **Where the code is:** `main` and `phase2-revaluation` are both at `5a5de92` (postings batches 1–4, migrations up to 0018), pushed through the pre-push gate. The car-costs slice (0019) is committed on the branch on top, not pushed. Ask the owner before pushing or merging.
+1. **Where the code is:** `main` and `phase2-revaluation` are at the same commit, pushed through the pre-push gate (ADR 0007): postings batches 1–4, car costs and containers, migrations up to 0019. Ask the owner before the next push.
    - **Entry shapes (0015, ADR 0017):**
      - Every posting rule is a named entry type (`source_type`) with one shape in `entry_shapes`; the database refuses an entry that doesn't fit. A reversal keeps its type.
      - A manual journal names no car and keeps off the job, pool, inventory and receivable accounts.
@@ -59,7 +59,7 @@ _Last updated: 2026-11-18 (session: POST /postings batches 3–4, car costs and 
 | --- | --- |
 | 0 Foundations | Done, except owner-blocked items (below). Clerk auth built (guard, permission map, `GET /me`); needs the Clerk app's keys on staging and the membership webhook |
 | 1 Ledger core | **Done.** Gate evidence: local pre-push run (ADR 0007): 10k random entries net to zero, cross-tenant reads return zero rows |
-| 2 Vehicles + FX | **In progress.** Gate approved by the owner (2026-11-15, provisional: the accountant still reviews it and fixes come back here). Ledger slices built (customer-funded flow, spot rates + realized FX, revaluation, EMM-funded), vehicles, job orders, evidence documents, job orders in the ledger with flags and sign-offs (0014), allowed entry shapes with completions re-performed (0015), and `POST /postings` batches 1–2 with the chart seed, books' dates and evidence rules (0016–0017). Posting batches 3–4, then costs/containers and the report basis, to build |
+| 2 Vehicles + FX | **In progress.** Gate approved by the owner (2026-11-15, provisional: the accountant still reviews it and fixes come back here). Ledger slices built (customer-funded flow, spot rates + realized FX, revaluation, EMM-funded), vehicles, job orders, evidence documents, job orders in the ledger with flags and sign-offs (0014), allowed entry shapes with completions re-performed (0015), `POST /postings` batches 1–4 with the chart seed, books' dates, evidence rules and reversals (0016–0018), and car costs, cost types and containers (0019). The gate's worked example against the accountant's spreadsheet and the report basis are next |
 | 3–6 | Not started |
 
 ## Phase 2: now and next
